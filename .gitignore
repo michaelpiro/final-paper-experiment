@@ -10,8 +10,9 @@ __pycache__/
 # Individual dataset files tracked via LFS or zip instead
 # real_datasets/ is now included
 
-# Model checkpoints and results
-experiments/
+# Model checkpoints and results (top-level only, not inside packages)
+/experiments/
+final_paper_experiments/results/
 
 # IDE
 .idea/

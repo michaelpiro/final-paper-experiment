@@ -116,8 +116,15 @@ def train_dsm(model: ScoreNet, data: np.ndarray, sigma: float,
               lr: float = 1e-3, batch_size: int = 32,
               epochs: int = 500, device: str = "cpu",
               print_every: int = 100,
-              weight_decay: float = 0.0) -> ScoreNet:
-    """Train ScoreNet on background samples using DSM loss."""
+              weight_decay: float = 0.0,
+              checkpointer=None) -> ScoreNet:
+    """Train ScoreNet on background samples using DSM loss.
+
+    Parameters
+    ----------
+    checkpointer : optional Checkpointer instance (from final_paper_experiments/checkpointing.py).
+                   If provided, saves periodic and best-loss checkpoints during training.
+    """
     model = model.to(device)
     model.train()
 
@@ -136,11 +143,18 @@ def train_dsm(model: ScoreNet, data: np.ndarray, sigma: float,
             optimizer.step()
             epoch_loss += loss.item()
 
+        avg = epoch_loss / len(loader)
         if epoch == 1 or epoch % print_every == 0 or epoch == epochs:
-            avg = epoch_loss / len(loader)
             print(f"    epoch {epoch:>{len(str(epochs))}}/{epochs}  loss={avg:.5f}")
 
+        if checkpointer is not None:
+            checkpointer.save(epoch, model.cpu(), optimizer, {'loss': avg})
+            checkpointer.save_best_loss(model.cpu(), avg, epoch, optimizer)
+            model = model.to(device)
+
     model.eval()
+    if checkpointer is not None:
+        checkpointer.save_final(model.cpu(), epochs, optimizer)
     return model.cpu()
 
 
@@ -175,10 +189,16 @@ def train_lfi(model: ScoreNet, data: np.ndarray, s: np.ndarray,
               lr: float = 1e-3, batch_size: int = 32,
               epochs: int = 500, device: str = "cpu",
               print_every: int = 100,
-              weight_decay: float = 0.0) -> ScoreNet:
+              weight_decay: float = 0.0,
+              checkpointer=None) -> ScoreNet:
     """
     Train network by maximizing the LFI (LRao paper objective).
     Uses full batch when n < batch_size for stable covariance estimate.
+
+    Parameters
+    ----------
+    checkpointer : optional Checkpointer instance.
+                   Saves periodic and best-loss checkpoints during training.
     """
     model   = model.to(device)
     model.train()
@@ -199,11 +219,18 @@ def train_lfi(model: ScoreNet, data: np.ndarray, s: np.ndarray,
             optimizer.step()
             epoch_loss += loss.item()
 
+        avg = epoch_loss / len(loader)
         if epoch == 1 or epoch % print_every == 0 or epoch == epochs:
-            avg = epoch_loss / len(loader)
             print(f"    epoch {epoch:>{len(str(epochs))}}/{epochs}  LFI={-avg:.5f}")
 
+        if checkpointer is not None:
+            checkpointer.save(epoch, model.cpu(), optimizer, {'lfi': -avg})
+            checkpointer.save_best_loss(model.cpu(), avg, epoch, optimizer)
+            model = model.to(device)
+
     model.eval()
+    if checkpointer is not None:
+        checkpointer.save_final(model.cpu(), epochs, optimizer)
     return model.cpu()
 
 

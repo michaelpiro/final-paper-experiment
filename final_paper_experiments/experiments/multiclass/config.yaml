@@ -1,0 +1,46 @@
+# Multi-class IID experiment configuration
+# Background = proportional mix of all non-target classes.
+# Runs once per target class (or a selected subset).
+
+dataset:    real_datasets/pavia-u.mat
+normalization: global         # or per_band
+
+pca_dim: 5
+n_train_list: [200, 500, 1000, 2000, 3000]
+test_size:        400
+amplitude:        0.15
+target_fraction:  0.1
+
+target_models: [additive, replacement]
+
+# target_classes: list of class IDs to use as target, one run per entry.
+# Set to 'all' to loop over every labeled class.
+target_classes: all
+
+# Classes to always exclude from background (e.g. unlabeled class 0)
+exclude_classes: [0]
+
+dsm_sigma: auto
+dsm_sigma_rho: 0.01
+hidden_dims:  [64, 64]
+activation:   silu
+
+epochs:           4000
+checkpoint_every: 100
+lr:               0.0005
+weight_decay:     0.0001
+batch_size:       256
+lfi_delta_theta:  0.01
+
+gmm_K: 3
+gmm_theta_max: 2.0
+gmm_theta_steps: 50
+
+run_lrao_mlp:     false
+lrao_mlp_hidden:  [64, 64]
+lrao_mlp_epochs:  2000
+
+num_seeds:  1
+base_seed:  42
+
+results_dir: final_paper_experiments/results
