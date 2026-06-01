@@ -184,31 +184,37 @@ def run_single(cfg: dict, norm_mode: str, seed: int, no_display: bool = True):
             print(f"  σ (fixed) = {sigma:.5f}")
 
         # --- Train DSM ---
+        dsm_epochs  = cfg.get('dsm_epochs', cfg.get('epochs', 4000))
         dsm_run_dir = os.path.join(run_dir, f'n{n_train}', 'dsm')
-        ckpt_dsm = Checkpointer(dsm_run_dir, save_every=cfg['checkpoint_every'])
-        print(f"\n  Training DSM (σ={sigma:.5f}, epochs={cfg['epochs']}) ...")
+        ckpt_dsm    = Checkpointer(dsm_run_dir, save_every=cfg['checkpoint_every'])
+        print(f"\n  Training DSM (σ={sigma:.5f}, epochs={dsm_epochs}) ...")
         dsm_model = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
         dsm_model = train_dsm(
             dsm_model, train_data, sigma,
             lr=cfg['lr'], batch_size=cfg['batch_size'],
-            epochs=cfg['epochs'], weight_decay=cfg['weight_decay'],
-            print_every=cfg['epochs'] // 5,
+            epochs=dsm_epochs, weight_decay=cfg['weight_decay'],
+            print_every=max(1, dsm_epochs // 5),
             checkpointer=ckpt_dsm,
         )
 
         # --- Train LRao-IID ---
-        lrao_run_dir = os.path.join(run_dir, f'n{n_train}', 'lrao_iid')
-        ckpt_lrao = Checkpointer(lrao_run_dir, save_every=cfg['checkpoint_every'])
-        print(f"\n  Training LRao-IID (epochs={cfg['epochs']}) ...")
-        lrao_model = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
-        lrao_model = train_lfi(
-            lrao_model, train_data, s,
-            delta_theta=cfg.get('lfi_delta_theta', 0.01),
-            lr=cfg['lr'], batch_size=cfg['batch_size'],
-            epochs=cfg['epochs'], weight_decay=cfg['weight_decay'],
-            print_every=cfg['epochs'] // 5,
-            checkpointer=ckpt_lrao,
-        )
+        lrao_model  = None
+        lrao_epochs = cfg.get('lrao_epochs', cfg.get('epochs', 4000))
+        if cfg.get('run_lrao', True):
+            lrao_run_dir = os.path.join(run_dir, f'n{n_train}', 'lrao_iid')
+            ckpt_lrao    = Checkpointer(lrao_run_dir, save_every=cfg['checkpoint_every'])
+            print(f"\n  Training LRao-IID (epochs={lrao_epochs}) ...")
+            lrao_model = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
+            lrao_model = train_lfi(
+                lrao_model, train_data, s,
+                delta_theta=cfg.get('lfi_delta_theta', 0.01),
+                lr=cfg['lr'], batch_size=cfg['batch_size'],
+                epochs=lrao_epochs, weight_decay=cfg['weight_decay'],
+                print_every=max(1, lrao_epochs // 5),
+                checkpointer=ckpt_lrao,
+            )
+        else:
+            print(f"\n  Skipping LRao-IID  (run_lrao=false)")
 
         # --- Optionally train LRao-MLP ---
         lrao_mlp_model = None
@@ -239,22 +245,24 @@ def run_single(cfg: dict, norm_mode: str, seed: int, no_display: bool = True):
             scores_dict = {}
 
             if tm == 'additive':
-                scores_dict['AMF']        = amf(test_data, train_data, s)
-                scores_dict['Reg-AMF']    = reg_amf(test_data, train_data, s, sigma)
-                scores_dict['DSM']        = dsm_additive(test_data, train_data, dsm_model, s)
-                scores_dict['LRao-IID']   = lrao_iid(test_data, train_data, lrao_model, s)
-                scores_dict['GMM-GLRT']   = gmm_glrt(test_data, train_data, s, K=cfg['gmm_K'])
-                scores_dict['DLTD']       = dltd(test_data, train_data, s, K=cfg['gmm_K'])
-                scores_dict['SMGLRT']     = smglrt(test_data, train_data, s, K=cfg['gmm_K'])
+                scores_dict['AMF']      = amf(test_data, train_data, s)
+                scores_dict['Reg-AMF']  = reg_amf(test_data, train_data, s, sigma)
+                scores_dict['DSM']      = dsm_additive(test_data, train_data, dsm_model, s)
+                scores_dict['GMM-GLRT'] = gmm_glrt(test_data, train_data, s, K=cfg['gmm_K'])
+                scores_dict['DLTD']     = dltd(test_data, train_data, s, K=cfg['gmm_K'])
+                scores_dict['SMGLRT']   = smglrt(test_data, train_data, s, K=cfg['gmm_K'])
+                if lrao_model is not None:
+                    scores_dict['LRao-IID'] = lrao_iid(test_data, train_data, lrao_model, s)
                 if lrao_mlp_model is not None:
                     scores_dict['LRao-MLP'] = detect_lrao_mlp(
                         test_data, train_data, lrao_mlp_model, s)
             else:  # replacement
-                scores_dict['AMF-rep']    = amf_replacement(test_data, train_data, s)
-                scores_dict['DSM-rep']    = dsm_replacement(test_data, train_data, dsm_model, s)
-                scores_dict['LRao-IID']   = lrao_iid(test_data, train_data, lrao_model, s)
-                scores_dict['DLTD']       = dltd(test_data, train_data, s, K=cfg['gmm_K'])
-                scores_dict['SMGLRT']     = smglrt(test_data, train_data, s, K=cfg['gmm_K'])
+                scores_dict['AMF-rep']  = amf_replacement(test_data, train_data, s)
+                scores_dict['DSM-rep']  = dsm_replacement(test_data, train_data, dsm_model, s)
+                scores_dict['DLTD']     = dltd(test_data, train_data, s, K=cfg['gmm_K'])
+                scores_dict['SMGLRT']   = smglrt(test_data, train_data, s, K=cfg['gmm_K'])
+                if lrao_model is not None:
+                    scores_dict['LRao-IID'] = lrao_iid(test_data, train_data, lrao_model, s)
 
             aucs = {det: _auc(labels, sc) for det, sc in scores_dict.items()}
             all_metrics[tm][n_train] = aucs
@@ -296,33 +304,37 @@ def run_single(cfg: dict, norm_mode: str, seed: int, no_display: bool = True):
         best_dsm.load_state_dict(ckpt['state_dict'])
     best_dsm.eval()
 
-    best_lrao = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
-    best_lrao_dir = os.path.join(run_dir, f'n{n_max}', 'lrao_iid', 'checkpoints')
-    if os.path.exists(os.path.join(best_lrao_dir, 'best_loss.pt')):
-        ckpt = torch.load(os.path.join(best_lrao_dir, 'best_loss.pt'), weights_only=True)
-        best_lrao.load_state_dict(ckpt['state_dict'])
-    best_lrao.eval()
+    best_lrao = None
+    if cfg.get('run_lrao', True):
+        best_lrao = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
+        best_lrao_dir = os.path.join(run_dir, f'n{n_max}', 'lrao_iid', 'checkpoints')
+        if os.path.exists(os.path.join(best_lrao_dir, 'best_loss.pt')):
+            ckpt = torch.load(os.path.join(best_lrao_dir, 'best_loss.pt'), weights_only=True)
+            best_lrao.load_state_dict(ckpt['state_dict'])
+        best_lrao.eval()
 
     for tm in target_models:
         test_data, labels = test_sets[tm]
 
         if tm == 'additive':
             roc_res = {
-                'AMF':      _roc(labels, amf(test_data, train_max, s)),
-                'Reg-AMF':  _roc(labels, reg_amf(test_data, train_max, s, sigma)),
-                'DSM':      _roc(labels, dsm_additive(test_data, train_max, best_dsm, s)),
-                'LRao-IID': _roc(labels, lrao_iid(test_data, train_max, best_lrao, s)),
-                'DLTD':     _roc(labels, dltd(test_data, train_max, s, K=cfg['gmm_K'])),
-                'SMGLRT':   _roc(labels, smglrt(test_data, train_max, s, K=cfg['gmm_K'])),
+                'AMF':     _roc(labels, amf(test_data, train_max, s)),
+                'Reg-AMF': _roc(labels, reg_amf(test_data, train_max, s, sigma)),
+                'DSM':     _roc(labels, dsm_additive(test_data, train_max, best_dsm, s)),
+                'DLTD':    _roc(labels, dltd(test_data, train_max, s, K=cfg['gmm_K'])),
+                'SMGLRT':  _roc(labels, smglrt(test_data, train_max, s, K=cfg['gmm_K'])),
             }
+            if best_lrao is not None:
+                roc_res['LRao-IID'] = _roc(labels, lrao_iid(test_data, train_max, best_lrao, s))
         else:
             roc_res = {
-                'AMF-rep':  _roc(labels, amf_replacement(test_data, train_max, s)),
-                'DSM-rep':  _roc(labels, dsm_replacement(test_data, train_max, best_dsm, s)),
-                'LRao-IID': _roc(labels, lrao_iid(test_data, train_max, best_lrao, s)),
-                'DLTD':     _roc(labels, dltd(test_data, train_max, s, K=cfg['gmm_K'])),
-                'SMGLRT':   _roc(labels, smglrt(test_data, train_max, s, K=cfg['gmm_K'])),
+                'AMF-rep': _roc(labels, amf_replacement(test_data, train_max, s)),
+                'DSM-rep': _roc(labels, dsm_replacement(test_data, train_max, best_dsm, s)),
+                'DLTD':    _roc(labels, dltd(test_data, train_max, s, K=cfg['gmm_K'])),
+                'SMGLRT':  _roc(labels, smglrt(test_data, train_max, s, K=cfg['gmm_K'])),
             }
+            if best_lrao is not None:
+                roc_res['LRao-IID'] = _roc(labels, lrao_iid(test_data, train_max, best_lrao, s))
 
         roc_path = os.path.join(fig_dir, f'roc_{tm}.pdf')
         plot_roc_curves(roc_res, roc_path)

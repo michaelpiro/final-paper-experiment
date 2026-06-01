@@ -6,19 +6,19 @@
 # --- Dataset ---
 dataset:    real_datasets/pavia-u.mat
 bkg_cls:    2
-target_cls: 9
+target_cls: 1
 
 # --- Normalization: 'global', 'per_band', or ['global', 'per_band'] to run both ---
-normalization: global
+normalization: per_band
 
 # --- PCA ---
 pca_dim: 5
 
 # --- Training samples grid (AUC vs n plot) ---
-n_train_list: [100, 200, 500, 1000, 2000, 3000]
+n_train_list: [100, 200, 500, 1000, 2000, 3000, 4000]
 
 # --- Test set ---
-test_size:        400     # number of background pixels in test set
+test_size:        2000     # number of background pixels in test set
 amplitude:        0.15    # target planting amplitude θ
 target_fraction:  0.1     # fraction of test pixels receiving planted target
 
@@ -34,24 +34,26 @@ hidden_dims:  [64, 64]
 activation:   silu
 
 # --- Training ---
-epochs:           4000
+dsm_epochs:       5000    # epochs for DSM (score network)
+lrao_epochs:      2000    # epochs for LRao-IID (LFI network)
 checkpoint_every: 100
-lr:               0.0005
+lr:               0.001
 weight_decay:     0.0001
 batch_size:       256
 
 # --- LRao ---
+run_lrao:         true    # set false to skip LRao-IID entirely (faster)
 lfi_delta_theta:  0.01    # finite-difference step for LFI Jacobian
 
 # --- GMM (for GMM-GLRT, DLTD, SMGLRT) ---
-gmm_K:         3
+gmm_K:         1
 gmm_theta_max: 2.0
 gmm_theta_steps: 50
 
 # --- LRao-MLP (adapted CNN-LRao) ---
 run_lrao_mlp:      false
 lrao_mlp_hidden:   [64, 64]
-lrao_mlp_epochs:   2000
+lrao_mlp_epochs:   1000
 
 # --- Reproducibility ---
 num_seeds:    1           # number of random seeds (set >1 for error bars)

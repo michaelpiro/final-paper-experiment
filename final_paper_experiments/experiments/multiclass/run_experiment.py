@@ -131,25 +131,29 @@ def run_one_target(cfg, all_flat, gt_flat, pca,
                  if cfg['dsm_sigma'] == 'auto' else float(cfg['dsm_sigma']))
 
         # Train DSM
-        ckpt_dsm = Checkpointer(
+        dsm_epochs = cfg.get('dsm_epochs', cfg.get('epochs', 4000))
+        ckpt_dsm   = Checkpointer(
             os.path.join(run_dir, f'n{n_train}', 'dsm'), cfg['checkpoint_every'])
         dsm_model = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
         dsm_model = train_dsm(dsm_model, train_data, sigma,
                               lr=cfg['lr'], batch_size=cfg['batch_size'],
-                              epochs=cfg['epochs'], weight_decay=cfg['weight_decay'],
-                              print_every=cfg['epochs'] // 5,
+                              epochs=dsm_epochs, weight_decay=cfg['weight_decay'],
+                              print_every=max(1, dsm_epochs // 5),
                               checkpointer=ckpt_dsm)
 
         # Train LRao-IID
-        ckpt_lrao = Checkpointer(
-            os.path.join(run_dir, f'n{n_train}', 'lrao_iid'), cfg['checkpoint_every'])
-        lrao_model = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
-        lrao_model = train_lfi(lrao_model, train_data, s,
-                               delta_theta=cfg.get('lfi_delta_theta', 0.01),
-                               lr=cfg['lr'], batch_size=cfg['batch_size'],
-                               epochs=cfg['epochs'], weight_decay=cfg['weight_decay'],
-                               print_every=cfg['epochs'] // 5,
-                               checkpointer=ckpt_lrao)
+        lrao_model  = None
+        lrao_epochs = cfg.get('lrao_epochs', cfg.get('epochs', 4000))
+        if cfg.get('run_lrao', True):
+            ckpt_lrao  = Checkpointer(
+                os.path.join(run_dir, f'n{n_train}', 'lrao_iid'), cfg['checkpoint_every'])
+            lrao_model = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
+            lrao_model = train_lfi(lrao_model, train_data, s,
+                                   delta_theta=cfg.get('lfi_delta_theta', 0.01),
+                                   lr=cfg['lr'], batch_size=cfg['batch_size'],
+                                   epochs=lrao_epochs, weight_decay=cfg['weight_decay'],
+                                   print_every=max(1, lrao_epochs // 5),
+                                   checkpointer=ckpt_lrao)
 
         for tm in cfg['target_models']:
             test_data, labels = test_sets[tm]
@@ -158,16 +162,18 @@ def run_one_target(cfg, all_flat, gt_flat, pca,
                 scores['AMF']      = amf(test_data, train_data, s)
                 scores['Reg-AMF']  = reg_amf(test_data, train_data, s, sigma)
                 scores['DSM']      = dsm_additive(test_data, train_data, dsm_model, s)
-                scores['LRao-IID'] = lrao_iid(test_data, train_data, lrao_model, s)
                 scores['GMM-GLRT'] = gmm_glrt(test_data, train_data, s, K=cfg['gmm_K'])
                 scores['DLTD']     = dltd(test_data, train_data, s, K=cfg['gmm_K'])
                 scores['SMGLRT']   = smglrt(test_data, train_data, s, K=cfg['gmm_K'])
+                if lrao_model is not None:
+                    scores['LRao-IID'] = lrao_iid(test_data, train_data, lrao_model, s)
             else:
                 scores['AMF-rep']  = amf_replacement(test_data, train_data, s)
                 scores['DSM-rep']  = dsm_replacement(test_data, train_data, dsm_model, s)
-                scores['LRao-IID'] = lrao_iid(test_data, train_data, lrao_model, s)
                 scores['DLTD']     = dltd(test_data, train_data, s, K=cfg['gmm_K'])
                 scores['SMGLRT']   = smglrt(test_data, train_data, s, K=cfg['gmm_K'])
+                if lrao_model is not None:
+                    scores['LRao-IID'] = lrao_iid(test_data, train_data, lrao_model, s)
 
             aucs = {det: _auc(labels, sc) for det, sc in scores.items()}
             all_metrics[tm][n_train] = aucs
