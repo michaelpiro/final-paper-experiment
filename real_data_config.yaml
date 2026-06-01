@@ -1,0 +1,13 @@
+pca_dim: 5
+total_samples: 3000        # total background samples to use
+test_fraction: 0.2         # fraction held out for test
+hidden_dims: [64,64]                     # nonlinear MLP for DSM
+sigma_values: [0.008]   # sigmas for DSM and Reg.AMF
+amplitude: 0.15              # target planting amplitude θ
+target_fraction: 0.1        # fraction of test pixels that receive planted target
+base_epochs: 4000
+lr: 0.0005
+weight_decay: 0.0001
+delta_theta: 0.01        # step size for LFI central-difference Jacobian (LRao paper)
+batch_size: 256
+results_dir: experiments/real_data_amp0.15_sigma0.008_hidden_dims_64_64

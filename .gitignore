@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Datasets (too large for GitHub)
+real_datasets/
+
+# Model checkpoints and results
+experiments/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store

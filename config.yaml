@@ -1,0 +1,18 @@
+model:
+  hidden_dims: [ ]        # empty = linear/affine (Theorem 1 regime for Gaussian data)
+  activation: silu
+
+training:
+  sigma_values: [0.5, 1.0 ]   # one ScoreNet trained per sigma
+  lr: 0.0005
+  batch_size: 32
+  base_epochs: 1000       # epochs for all n values (fixed, no scaling)
+
+experiment:
+  n_seeds: 3
+  pca_dim: 20
+  n_values: [ 20, 30, 40, 60, 80, 100, 100, 150, 200 ]
+  amplitude: 0.3         # target amplitude θ (used in test data and Oracle detector)
+  n_test: 400            # total test samples
+  target_fraction: 0.1   # fraction of test samples that contain the target
+  results_dir: experiments/gaussian_iid
