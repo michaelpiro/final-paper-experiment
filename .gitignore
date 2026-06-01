@@ -7,8 +7,8 @@ __pycache__/
 .Python
 *.egg-info/
 
-# Datasets (too large for GitHub)
-real_datasets/
+# Individual dataset files tracked via LFS or zip instead
+# real_datasets/ is now included
 
 # Model checkpoints and results
 experiments/
