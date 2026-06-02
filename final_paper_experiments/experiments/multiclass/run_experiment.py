@@ -130,16 +130,45 @@ def run_one_target(cfg, all_flat, gt_flat, pca,
         sigma = (compute_sigma_from_data(train_data, cfg.get('dsm_sigma_rho', 0.01))
                  if cfg['dsm_sigma'] == 'auto' else float(cfg['dsm_sigma']))
 
-        # Train DSM
-        dsm_epochs = cfg.get('dsm_epochs', cfg.get('epochs', 4000))
-        ckpt_dsm   = Checkpointer(
-            os.path.join(run_dir, f'n{n_train}', 'dsm'), cfg['checkpoint_every'])
-        dsm_model = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
-        dsm_model = train_dsm(dsm_model, train_data, sigma,
-                              lr=cfg['lr'], batch_size=cfg['batch_size'],
-                              epochs=dsm_epochs, weight_decay=cfg['weight_decay'],
-                              print_every=max(1, dsm_epochs // 5),
-                              checkpointer=ckpt_dsm)
+        # Train (or load) DSM
+        rho = cfg.get('dsm_sigma_rho', 0.01)
+        dsm_model  = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
+        dsm_loaded = False
+
+        pretrained_dir = cfg.get('pretrained_dir', None)
+        if pretrained_dir:
+            from final_paper_experiments.experiments.pretrain.run_pretrain import (
+                pretrain_subdir, dsm_checkpoint_dir)
+            sub = pretrain_subdir(pretrained_dir,
+                                   cfg.get('normalization', 'per_band')
+                                   if isinstance(cfg.get('normalization'), str)
+                                   else cfg['normalization'][0],
+                                   cfg['pca_dim'])
+            for fname in ('best_loss.pt', 'final.pt'):
+                ckpt_path = os.path.join(
+                    dsm_checkpoint_dir(sub, target_cls, n_train, rho),
+                    'checkpoints', fname)
+                if os.path.exists(ckpt_path):
+                    import torch
+                    ckpt = torch.load(ckpt_path, weights_only=True)
+                    dsm_model.load_state_dict(ckpt['state_dict'])
+                    print(f"\n  Loaded pre-trained DSM  "
+                          f"(cls{target_cls}, n={n_train}, rho={rho})")
+                    dsm_loaded = True
+                    break
+            if not dsm_loaded:
+                print(f"\n  WARNING: pretrained DSM not found "
+                      f"(cls{target_cls}, n={n_train}, rho={rho}). Training from scratch.")
+
+        if not dsm_loaded:
+            dsm_epochs = cfg.get('dsm_epochs', cfg.get('epochs', 4000))
+            ckpt_dsm   = Checkpointer(
+                os.path.join(run_dir, f'n{n_train}', 'dsm'), cfg['checkpoint_every'])
+            dsm_model = train_dsm(dsm_model, train_data, sigma,
+                                  lr=cfg['lr'], batch_size=cfg['batch_size'],
+                                  epochs=dsm_epochs, weight_decay=cfg['weight_decay'],
+                                  print_every=max(1, dsm_epochs // 5),
+                                  checkpointer=ckpt_dsm)
 
         # Train LRao-IID
         lrao_model  = None

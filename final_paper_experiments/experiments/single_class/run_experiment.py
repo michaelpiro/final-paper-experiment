@@ -211,20 +211,23 @@ def run_single(cfg: dict, norm_mode: str, seed: int, no_display: bool = True):
         dsm_loaded = False
 
         if pretrained_dir:
+            rho = cfg.get('dsm_sigma_rho', 0.01)
             sub = pretrain_subdir(pretrained_dir, norm_mode, cfg['pca_dim'])
             for fname in ('best_loss.pt', 'final.pt'):
                 ckpt_path = os.path.join(
-                    dsm_checkpoint_dir(sub, cfg['bkg_cls'], n_train),
+                    dsm_checkpoint_dir(sub, cfg['bkg_cls'], n_train, rho),
                     'checkpoints', fname)
                 if os.path.exists(ckpt_path):
                     ckpt = torch.load(ckpt_path, weights_only=True)
                     dsm_model.load_state_dict(ckpt['state_dict'])
-                    print(f"\n  Loaded pre-trained DSM  (cls{cfg['bkg_cls']}, n={n_train})")
+                    print(f"\n  Loaded pre-trained DSM  "
+                          f"(cls{cfg['bkg_cls']}, n={n_train}, rho={rho})")
                     dsm_loaded = True
                     break
             if not dsm_loaded:
                 print(f"\n  WARNING: pretrained DSM not found for "
-                      f"cls{cfg['bkg_cls']}, n={n_train}. Training from scratch.")
+                      f"cls{cfg['bkg_cls']}, n={n_train}, rho={rho}. "
+                      f"Training from scratch.")
 
         if not dsm_loaded:
             dsm_epochs  = cfg.get('dsm_epochs', cfg.get('epochs', 4000))

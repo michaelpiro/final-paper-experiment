@@ -43,8 +43,19 @@ def pretrain_subdir(pretrained_dir: str, norm_mode: str, pca_dim: int) -> str:
     return os.path.join(pretrained_dir, f'{norm_mode}_{pca_dim}d')
 
 
-def dsm_checkpoint_dir(base: str, cls_id: int, n: int) -> str:
-    return os.path.join(base, f'cls{cls_id}', f'n{n}', 'dsm')
+def rho_str(rho: float) -> str:
+    """Canonical string for a rho value, e.g. 0.01 → 'rho0.01', 0.005 → 'rho0.005'."""
+    # Strip trailing zeros after decimal so 0.010 → 'rho0.01', 0.100 → 'rho0.1'
+    return f'rho{rho:.10f}'.rstrip('0').rstrip('.')
+
+
+def dsm_checkpoint_dir(base: str, cls_id: int, n: int, rho: float) -> str:
+    """
+    Path structure:  base / cls{C} / n{n} / rho{rho} / dsm
+    Preprocessing artifacts (PCA, norm params) live in base/ and are rho-independent.
+    Only DSM checkpoints are rho-specific.
+    """
+    return os.path.join(base, f'cls{cls_id}', f'n{n}', rho_str(rho), 'dsm')
 
 
 def main():
@@ -117,10 +128,15 @@ def main():
 
     # ------------------------------------------------------------------
     # Step 4: Train DSM for each class × each n_train
+    # rho is encoded in the checkpoint path so different rho values
+    # coexist without overwriting each other.
     # ------------------------------------------------------------------
     n_train_list  = cfg['n_train_list']
     dsm_epochs    = cfg['dsm_epochs']
     base_seed     = cfg.get('base_seed', 42)
+    rho           = cfg.get('dsm_sigma_rho', 0.01)
+
+    print(f'\n[4] Training DSM  (rho={rho}, epochs={dsm_epochs})')
 
     total_runs = len(target_classes) * len(n_train_list)
     run_count  = 0
@@ -130,9 +146,9 @@ def main():
         cls_pca = class_pixels_pca[cls_id]
         n_avail = len(cls_pca)
         print(f'\n{"─"*50}')
-        print(f'Class {cls_id}  ({n_avail} pixels in PCA space)')
+        print(f'Class {cls_id}  ({n_avail} pixels)  [rho={rho}]')
 
-        # Fixed shuffle for this class
+        # Fixed shuffle for this class (seed independent of rho)
         rng = np.random.default_rng(base_seed + cls_id)
         idx = np.arange(n_avail)
         rng.shuffle(idx)
@@ -145,20 +161,21 @@ def main():
                 print(f'  n={n_train:>5}  SKIP (only {n_avail} pixels available)')
                 continue
 
-            ckpt_dir = dsm_checkpoint_dir(save_dir, cls_id, n_train)
+            # rho is part of the checkpoint path
+            ckpt_dir = dsm_checkpoint_dir(save_dir, cls_id, n_train, rho)
 
             # Skip if already trained
             final_path = os.path.join(ckpt_dir, 'checkpoints', 'final.pt')
             if os.path.exists(final_path):
-                print(f'  n={n_train:>5}  already trained — skipping')
+                print(f'  n={n_train:>5}  [{rho_str(rho)}]  already trained — skipping')
                 continue
 
             train_data = cls_pca_shuffled[:n_train]
-            sigma = (compute_sigma_from_data(train_data, cfg.get('dsm_sigma_rho', 0.01))
+            sigma = (compute_sigma_from_data(train_data, rho)
                      if cfg['dsm_sigma'] == 'auto' else float(cfg['dsm_sigma']))
 
             t0 = time.time()
-            print(f'  n={n_train:>5}  σ={sigma:.5f}  [{run_count}/{total_runs}] training ...',
+            print(f'  n={n_train:>5}  σ={sigma:.5f}  [{run_count}/{total_runs}] ...',
                   end='', flush=True)
 
             ckpt = Checkpointer(ckpt_dir, save_every=cfg['checkpoint_every'])
