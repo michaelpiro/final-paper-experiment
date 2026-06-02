@@ -1,18 +1,21 @@
 """
 Single-class IID experiment.
 
-Pipeline:
-  1. Load + normalize hyperspectral image
-  2. PCA to pca_dim dimensions
-  3. Compute target signature
-  4. Compute σ from data (or use fixed value)
-  5. For each n_train in n_train_list:
-       a. Split train / val / test
-       b. Train DSM model (+ LRao-IID, optionally LRao-MLP)
-       c. Run all detectors for additive AND replacement models
-       d. Compute AUC, save metrics
-  6. Generate paper-quality figures: ROC, AUC-vs-n, FA-perf
-  7. Copy comparison figures to results/comparisons/
+Pipeline (always in this order):
+  1. Normalize full image  [or load pre-saved params if pretrained_dir is set]
+  2. PCA on ALL pixels      [captures full image context]
+  3. Compute target signature s = mean(tgt_pca) / ||mean(tgt_pca)||
+  4. For each n_train in n_train_list:
+       a. Sample n_train background pixels
+       b. Load pre-trained DSM  OR  train DSM from scratch
+       c. Optionally train LRao-IID from scratch
+       d. Run all detectors for additive AND replacement test sets
+       e. Save metrics
+  5. Generate figures: ROC, AUC-vs-n, FA-perf
+
+Pre-trained DSM mode (recommended after running run_pretrain.py):
+  Set pretrained_dir in config — DSM is loaded from disk instead of trained.
+  Only LRao-IID is trained from scratch (if run_lrao: true).
 
 Usage:
     python -m final_paper_experiments.experiments.single_class.run_experiment \
@@ -43,6 +46,10 @@ if _ROOT not in sys.path:
 from final_paper_experiments.data_utils import (
     load_and_normalize, pca_reduce, compute_target_signature,
     compute_sigma_from_data, split_background, plant_targets,
+    load_preprocessing,
+)
+from final_paper_experiments.experiments.pretrain.run_pretrain import (
+    pretrain_subdir, dsm_checkpoint_dir,
 )
 from final_paper_experiments.checkpointing import Checkpointer
 from final_paper_experiments.plotting import (
@@ -108,27 +115,43 @@ def run_single(cfg: dict, norm_mode: str, seed: int, no_display: bool = True):
     print(f"{'='*60}")
 
     # ------------------------------------------------------------------
-    # 1. Load + normalize
+    # 1+2. Normalize full image → PCA on all pixels
     # ------------------------------------------------------------------
-    print(f"\n[1] Loading {cfg['dataset']}  (normalization={norm_mode})")
-    data, gt = load_and_normalize(cfg['dataset'], mode=norm_mode)
-    H, W, B  = data.shape
-    all_flat = data.reshape(-1, B)
-    gt_flat  = gt.flatten()
+    pretrained_dir = cfg.get('pretrained_dir', None)
 
-    bkg_pixels = all_flat[gt_flat == cfg['bkg_cls']].copy()
-    tgt_pixels = all_flat[gt_flat == cfg['target_cls']].copy()
-    print(f"  Background: class {cfg['bkg_cls']} ({len(bkg_pixels)} pixels)")
-    print(f"  Target:     class {cfg['target_cls']} ({len(tgt_pixels)} pixels)")
+    if pretrained_dir:
+        # ── Load pre-saved preprocessing artifacts ─────────────────────
+        sub = pretrain_subdir(pretrained_dir, norm_mode, cfg['pca_dim'])
+        print(f"\n[1] Loading pre-trained preprocessing from {sub}")
+        pca, _norm, _vmin, _ranges, gt_flat, class_pca = load_preprocessing(sub)
 
-    # ------------------------------------------------------------------
-    # 2. PCA
-    # ------------------------------------------------------------------
-    print(f"\n[2] PCA → {cfg['pca_dim']} dims (fit on all pixels)")
-    pca, bkg_pca, _, tgt_pca = pca_reduce(
-        all_flat, bkg_pixels, bkg_pixels,   # test placeholder
-        tgt_pixels, cfg['pca_dim']
-    )
+        bkg_pca = class_pca.get(cfg['bkg_cls'])
+        tgt_pca = class_pca.get(cfg['target_cls'])
+        if bkg_pca is None:
+            raise ValueError(f"Class {cfg['bkg_cls']} not found in pretrained dir")
+        if tgt_pca is None:
+            raise ValueError(f"Class {cfg['target_cls']} not found in pretrained dir")
+
+        print(f"  Background: class {cfg['bkg_cls']} ({len(bkg_pca)} pixels)")
+        print(f"  Target:     class {cfg['target_cls']} ({len(tgt_pca)} pixels)")
+        print(f"  [2] PCA already loaded ({cfg['pca_dim']}D)")
+    else:
+        # ── Compute fresh ───────────────────────────────────────────────
+        print(f"\n[1] Loading {cfg['dataset']}  (normalization={norm_mode})")
+        data, gt = load_and_normalize(cfg['dataset'], mode=norm_mode)
+        H, W, B  = data.shape
+        all_flat = data.reshape(-1, B)
+        gt_flat  = gt.flatten()
+
+        bkg_pixels = all_flat[gt_flat == cfg['bkg_cls']].copy()
+        tgt_pixels = all_flat[gt_flat == cfg['target_cls']].copy()
+        print(f"  Background: class {cfg['bkg_cls']} ({len(bkg_pixels)} pixels)")
+        print(f"  Target:     class {cfg['target_cls']} ({len(tgt_pixels)} pixels)")
+
+        print(f"\n[2] PCA → {cfg['pca_dim']} dims (fit on all pixels)")
+        pca, bkg_pca, _, tgt_pca = pca_reduce(
+            all_flat, bkg_pixels, bkg_pixels, tgt_pixels, cfg['pca_dim'])
+
     s = compute_target_signature(tgt_pca)
     print(f"  ||s|| = {np.linalg.norm(s):.4f}")
 
@@ -183,19 +206,38 @@ def run_single(cfg: dict, norm_mode: str, seed: int, no_display: bool = True):
             sigma = float(cfg['dsm_sigma'])
             print(f"  σ (fixed) = {sigma:.5f}")
 
-        # --- Train DSM ---
-        dsm_epochs  = cfg.get('dsm_epochs', cfg.get('epochs', 4000))
-        dsm_run_dir = os.path.join(run_dir, f'n{n_train}', 'dsm')
-        ckpt_dsm    = Checkpointer(dsm_run_dir, save_every=cfg['checkpoint_every'])
-        print(f"\n  Training DSM (σ={sigma:.5f}, epochs={dsm_epochs}) ...")
+        # --- Train (or load) DSM ---
         dsm_model = ScoreNet(cfg['pca_dim'], cfg['hidden_dims'], cfg['activation'])
-        dsm_model = train_dsm(
-            dsm_model, train_data, sigma,
-            lr=cfg['lr'], batch_size=cfg['batch_size'],
-            epochs=dsm_epochs, weight_decay=cfg['weight_decay'],
-            print_every=max(1, dsm_epochs // 5),
-            checkpointer=ckpt_dsm,
-        )
+        dsm_loaded = False
+
+        if pretrained_dir:
+            sub = pretrain_subdir(pretrained_dir, norm_mode, cfg['pca_dim'])
+            for fname in ('best_loss.pt', 'final.pt'):
+                ckpt_path = os.path.join(
+                    dsm_checkpoint_dir(sub, cfg['bkg_cls'], n_train),
+                    'checkpoints', fname)
+                if os.path.exists(ckpt_path):
+                    ckpt = torch.load(ckpt_path, weights_only=True)
+                    dsm_model.load_state_dict(ckpt['state_dict'])
+                    print(f"\n  Loaded pre-trained DSM  (cls{cfg['bkg_cls']}, n={n_train})")
+                    dsm_loaded = True
+                    break
+            if not dsm_loaded:
+                print(f"\n  WARNING: pretrained DSM not found for "
+                      f"cls{cfg['bkg_cls']}, n={n_train}. Training from scratch.")
+
+        if not dsm_loaded:
+            dsm_epochs  = cfg.get('dsm_epochs', cfg.get('epochs', 4000))
+            dsm_run_dir = os.path.join(run_dir, f'n{n_train}', 'dsm')
+            ckpt_dsm    = Checkpointer(dsm_run_dir, save_every=cfg['checkpoint_every'])
+            print(f"\n  Training DSM (σ={sigma:.5f}, epochs={dsm_epochs}) ...")
+            dsm_model = train_dsm(
+                dsm_model, train_data, sigma,
+                lr=cfg['lr'], batch_size=cfg['batch_size'],
+                epochs=dsm_epochs, weight_decay=cfg['weight_decay'],
+                print_every=max(1, dsm_epochs // 5),
+                checkpointer=ckpt_dsm,
+            )
 
         # --- Train LRao-IID ---
         lrao_model  = None

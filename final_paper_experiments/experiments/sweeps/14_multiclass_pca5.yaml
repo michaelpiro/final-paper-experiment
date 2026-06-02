@@ -16,7 +16,7 @@ gmm_K:            1
 gmm_theta_max:    2.0
 gmm_theta_steps:  50
 target_models:    [additive, replacement]
-n_train_list:     [500, 2000, 4000]
+n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000, 3000, 4000]
 test_size:        1000
 amplitude:        0.15
 target_fraction:  0.1

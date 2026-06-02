@@ -15,7 +15,7 @@ normalization: per_band
 pca_dim: 5
 
 # --- Training samples grid (AUC vs n plot) ---
-n_train_list: [100, 200, 500, 1000, 2000, 3000, 4000]
+n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000, 3000, 4000]
 
 # --- Test set ---
 test_size:        2000     # number of background pixels in test set
@@ -58,6 +58,12 @@ lrao_mlp_epochs:   1000
 # --- Reproducibility ---
 num_seeds:    1           # number of random seeds (set >1 for error bars)
 base_seed:    42
+
+# --- Pre-trained DSM (optional) ---
+# If set, DSM is loaded from disk instead of trained — only LRao is trained.
+# Run experiments/pretrain/run_pretrain.py first to populate this directory.
+# Set to null to always train from scratch.
+pretrained_dir: null    # e.g. final_paper_experiments/pretrained
 
 # --- Results ---
 results_dir:  final_paper_experiments/results

@@ -1,0 +1,46 @@
+# Pre-training configuration
+# Trains one DSM model per (class, n_train) combination.
+# Run once; all subsequent experiments load from pretrained_dir.
+#
+# Usage:
+#   python -m final_paper_experiments.experiments.pretrain.run_pretrain \
+#       --config final_paper_experiments/experiments/pretrain/config.yaml
+
+# --- Dataset ---
+dataset:    real_datasets/pavia-u.mat
+
+# --- Normalization mode to pre-process with ---
+normalization: per_band      # 'global' or 'per_band'
+
+# --- PCA ---
+pca_dim: 5
+
+# --- Which classes to pre-train DSM for ---
+# 'all' trains one model per labeled class; or give a list e.g. [1,2,3,5,9]
+classes:         all
+exclude_classes: [0]         # always skip the unlabeled class
+
+# --- Sample sizes to pre-train at ---
+# These must cover every n_train you will ever use in experiments.
+n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000, 3000, 4000]
+
+# --- ScoreNet architecture (must match experiment configs) ---
+hidden_dims: [64, 64]
+activation:  silu
+
+# --- DSM training ---
+dsm_epochs:       5000
+checkpoint_every: 500       # save less frequently than experiments
+lr:               0.0005
+weight_decay:     0.0001
+batch_size:       256
+
+# --- DSM noise level ---
+dsm_sigma:     auto
+dsm_sigma_rho: 0.01
+
+# --- Reproducibility ---
+base_seed: 42               # pixel sampling seed per (class, n)
+
+# --- Output ---
+pretrained_dir: final_paper_experiments/pretrained

@@ -52,24 +52,68 @@ matplotlib.rcParams.update({
     'ps.fonttype':        42,
 })
 
-# Colorblind-friendly, distinct palette
-_COLORS = [
-    '#1f77b4',  # blue
-    '#e6550d',  # orange-red
-    '#2ca02c',  # green
-    '#9467bd',  # purple
-    '#8c564b',  # brown
-    '#d62728',  # red
-    '#e377c2',  # pink
-    '#17becf',  # cyan
-    '#bcbd22',  # olive
-    '#7f7f7f',  # grey
-]
-_MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X', 'h', '*', 'p']
+# ---------------------------------------------------------------------------
+# Global detector color/marker map — same algorithm = same color in every figure
+# ---------------------------------------------------------------------------
 
+# Gaussian baselines: blue family
+# Score-based (ours): red family
+# LRao (ours): green
+# GMM-family: purple/orange/brown
 
-def _color(i):  return _COLORS[i % len(_COLORS)]
-def _marker(i): return _MARKERS[i % len(_MARKERS)]
+DETECTOR_COLORS = {
+    # Gaussian baselines
+    'AMF':        '#1f77b4',   # blue
+    'Reg-AMF':    '#6baed6',   # light blue
+    'AMF-rep':    '#08306b',   # dark blue
+    # Score-based (our methods)
+    'DSM':        '#d62728',   # red
+    'DSM-rep':    '#fc8d59',   # salmon/orange-red
+    # LRao (our method)
+    'LRao-IID':   '#2ca02c',   # green
+    # GMM-family baselines
+    'GMM-GLRT':   '#9467bd',   # purple
+    'DLTD':       '#e6550d',   # orange
+    'SMGLRT':     '#8c564b',   # brown
+}
+
+DETECTOR_MARKERS = {
+    'AMF':        'o',
+    'Reg-AMF':    's',
+    'AMF-rep':    'o',
+    'DSM':        '^',
+    'DSM-rep':    '^',
+    'LRao-IID':   'D',
+    'GMM-GLRT':   'v',
+    'DLTD':       'P',
+    'SMGLRT':     'X',
+}
+
+# Fallback palette for unknown detector names
+_FALLBACK_COLORS  = ['#7f7f7f', '#bcbd22', '#17becf', '#e377c2']
+_FALLBACK_MARKERS = ['h', 'p', '*', '8']
+_extra_idx = {}   # tracks assignment for unknown names
+
+def _color(det_or_idx):
+    """Return color for a detector name (str) or integer index."""
+    if isinstance(det_or_idx, str):
+        if det_or_idx in DETECTOR_COLORS:
+            return DETECTOR_COLORS[det_or_idx]
+        # Assign a stable fallback for unknown names
+        if det_or_idx not in _extra_idx:
+            _extra_idx[det_or_idx] = len(_extra_idx)
+        return _FALLBACK_COLORS[_extra_idx[det_or_idx] % len(_FALLBACK_COLORS)]
+    return _FALLBACK_COLORS[det_or_idx % len(_FALLBACK_COLORS)]
+
+def _marker(det_or_idx):
+    """Return marker for a detector name (str) or integer index."""
+    if isinstance(det_or_idx, str):
+        if det_or_idx in DETECTOR_MARKERS:
+            return DETECTOR_MARKERS[det_or_idx]
+        if det_or_idx not in _extra_idx:
+            _extra_idx[det_or_idx] = len(_extra_idx)
+        return _FALLBACK_MARKERS[_extra_idx[det_or_idx] % len(_FALLBACK_MARKERS)]
+    return _FALLBACK_MARKERS[det_or_idx % len(_FALLBACK_MARKERS)]
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +129,8 @@ def plot_roc_curves(results: dict, save_path: str, title: str = ''):
     """
     fig, ax = plt.subplots(figsize=(4.0, 3.2))
 
-    for i, (label, (fpr, tpr, auc)) in enumerate(results.items()):
-        ax.plot(fpr, tpr, color=_color(i), linewidth=1.6,
+    for label, (fpr, tpr, auc) in results.items():
+        ax.plot(fpr, tpr, color=_color(label), linewidth=1.6,
                 label=f'{label}  ({auc:.3f})')
 
     # Diagonal chance line
@@ -147,7 +191,7 @@ def plot_false_alarm_perf(results: dict, save_path: str,
     for i, label in enumerate(labels):
         offset = (i - n_det / 2 + 0.5) * width
         ax.bar(x + offset, dr[i], width, label=label,
-               color=_color(i), alpha=0.88, edgecolor='white', linewidth=0.4)
+               color=_color(label), alpha=0.88, edgecolor='white', linewidth=0.4)
 
     fa_labels = ['0.1%', '1%', '5%', '10%']
     ax.set_xticks(x)
@@ -184,10 +228,10 @@ def plot_auc_vs_n(results: dict, n_values: list, save_path: str):
     # Wider figure to give room for outside legend
     fig, ax = plt.subplots(figsize=(4.8, 3.2))
 
-    for i, (label, aucs) in enumerate(results.items()):
+    for label, aucs in results.items():
         aucs = np.array(aucs)
-        c    = _color(i)
-        m    = _marker(i)
+        c    = _color(label)
+        m    = _marker(label)
         if aucs.ndim == 1:
             ax.plot(n_values, aucs, color=c, marker=m,
                     markersize=4, linewidth=1.6, label=label)
@@ -251,7 +295,7 @@ def plot_auc_per_class(results: dict, save_path: str, title: str = ''):
         aucs   = [results[label][c] for c in class_ids]
         offset = (i - n_det / 2 + 0.5) * width
         ax.bar(x + offset, aucs, width, label=label,
-               color=_color(i), alpha=0.88, edgecolor='white', linewidth=0.4)
+               color=_color(label), alpha=0.88, edgecolor='white', linewidth=0.4)
 
     ax.set_xticks(x)
     ax.set_xticklabels([f'cls {c}' for c in class_ids], rotation=45, ha='right')

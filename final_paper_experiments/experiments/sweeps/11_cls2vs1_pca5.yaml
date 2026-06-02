@@ -27,7 +27,7 @@ hidden_dims:   [64, 64]
 activation:    silu
 dsm_epochs:    5000
 lrao_epochs:   2000
-n_train_list:  [200, 500, 1000, 2000, 4000]
+n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000, 3000, 4000]
 amplitude:     0.15
 num_seeds:     1
 base_seed:     42

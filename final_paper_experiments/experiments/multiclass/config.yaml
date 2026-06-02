@@ -6,7 +6,7 @@ dataset:    real_datasets/pavia-u.mat
 normalization: global         # or per_band
 
 pca_dim: 5
-n_train_list: [200, 500, 1000, 2000, 3000]
+n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000, 3000, 4000]
 test_size:        400
 amplitude:        0.15
 target_fraction:  0.1
@@ -45,5 +45,8 @@ lrao_mlp_epochs:  2000
 
 num_seeds:  1
 base_seed:  42
+
+# Pre-trained DSM (optional) — set after running run_pretrain.py
+pretrained_dir: null    # e.g. final_paper_experiments/pretrained
 
 results_dir: final_paper_experiments/results

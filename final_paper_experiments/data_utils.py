@@ -1,9 +1,17 @@
 """
 data_utils.py — Data loading, normalization, PCA, sigma selection, and target planting.
 
+Pipeline (always this order):
+  1. load_and_normalize(path, mode)      → (H,W,B) image normalized to [0,1]
+  2. pca_reduce(all_flat, ...)            → PCA fit on ALL image pixels, then transform
+  3. compute_target_signature(tgt_pca)   → unit-norm mean in PCA space
+  4. plant_targets(test_bkg_pca, s, ...) → plant in PCA space (after norm+PCA)
+
 All functions used by both single_class and multiclass experiments.
 """
 
+import os
+import pickle
 import numpy as np
 import scipy.io
 from sklearn.decomposition import PCA
@@ -203,3 +211,70 @@ def plant_targets(test_bkg: np.ndarray,
         raise ValueError(f"Unknown target model: {model!r}. Use 'additive' or 'replacement'.")
 
     return test_data, labels, tgt_idx
+
+
+# ---------------------------------------------------------------------------
+# Pre-processing save / load  (used by pretrain + fast experiment)
+# ---------------------------------------------------------------------------
+
+def save_preprocessing(save_dir: str,
+                        pca: PCA,
+                        norm_mode: str,
+                        vmin: np.ndarray,
+                        ranges: np.ndarray,
+                        gt_flat: np.ndarray,
+                        class_pixels_pca: dict):
+    """
+    Save everything needed to reconstruct the normalized-PCA representation.
+
+    Parameters
+    ----------
+    save_dir          : directory to write into
+    pca               : fitted sklearn PCA object
+    norm_mode         : 'global' or 'per_band'
+    vmin, ranges      : normalization parameters (per-band arrays)
+    gt_flat           : (N,) ground-truth labels for all pixels
+    class_pixels_pca  : {class_id: (n_pixels, pca_dim) array}
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    np.savez(os.path.join(save_dir, 'norm_params.npz'),
+             norm_mode=np.array([norm_mode]),
+             vmin=vmin, ranges=ranges)
+    with open(os.path.join(save_dir, 'pca.pkl'), 'wb') as f:
+        pickle.dump(pca, f)
+    np.save(os.path.join(save_dir, 'gt_flat.npy'), gt_flat)
+    for cls_id, pixels in class_pixels_pca.items():
+        np.save(os.path.join(save_dir, f'cls{cls_id}_pca.npy'), pixels)
+
+
+def load_preprocessing(save_dir: str):
+    """
+    Load pre-saved normalization + PCA artifacts.
+
+    Returns
+    -------
+    pca, norm_mode, vmin, ranges, gt_flat, class_pixels_pca
+    """
+    params = np.load(os.path.join(save_dir, 'norm_params.npz'), allow_pickle=True)
+    norm_mode = str(params['norm_mode'][0])
+    vmin      = params['vmin']
+    ranges    = params['ranges']
+    with open(os.path.join(save_dir, 'pca.pkl'), 'rb') as f:
+        pca = pickle.load(f)
+    gt_flat = np.load(os.path.join(save_dir, 'gt_flat.npy'))
+
+    # Load all available per-class PCA arrays
+    class_pixels_pca = {}
+    for fname in os.listdir(save_dir):
+        if fname.startswith('cls') and fname.endswith('_pca.npy'):
+            cls_id = int(fname[3:-8])
+            class_pixels_pca[cls_id] = np.load(os.path.join(save_dir, fname))
+
+    return pca, norm_mode, vmin, ranges, gt_flat, class_pixels_pca
+
+
+def normalize_with_params(data: np.ndarray,
+                           vmin: np.ndarray,
+                           ranges: np.ndarray) -> np.ndarray:
+    """Apply pre-computed normalization parameters to raw data."""
+    return (data - vmin) / ranges
