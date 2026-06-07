@@ -7,19 +7,30 @@ __pycache__/
 .Python
 *.egg-info/
 
-# Individual dataset files tracked via LFS or zip instead
-# real_datasets/ is now included
+# Dataset (download separately — see data/README.md)
+data/*.mat
+real_datasets/
 
-# Model checkpoints and results (top-level only, not inside packages)
-/experiments/
+# Results and model checkpoints (generated at runtime)
+results/
+experiments/honest_pipeline/results/
+experiments/spatial/results/
 final_paper_experiments/results/
+final_paper_experiments/pretrained/
+**/checkpoints/
+**/*.pt
 
-# Training logs (generated at runtime)
+# Training logs
 logs/
 
-# IDE
+# Scratch / temp files
+temp.py
+paper.txt
+0$.
+CLAUDE.md
+iid_core.py
+
+# IDE / OS
 .idea/
 .vscode/
-
-# OS
 .DS_Store

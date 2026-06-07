@@ -1,0 +1,79 @@
+# =========================================================================
+# THANTD baseline vs spatial models (Pavia-U)
+# =========================================================================
+# Trains THANTD (Liu et al. 2025) alongside CF-Attn / NeighborMLP / DSM
+# on the same train/test rectangles + dominant-class offset signature.
+#
+# Usage:
+#   .venv/bin/python -u experiments/spatial/run_thantd.py
+
+dataset:     data/pavia-u.mat
+norm_mode:   global_max
+results_dir: experiments/spatial/results
+
+# ----- spatial rectangles (same as neighbor_mlp.yaml) -----
+train_box:   [323, 426, 11, 167]
+test_box:    [443, 529, 87, 291]
+
+# ----- dominant-class offset signature -----
+sig_dom_weight:  0.9
+sig_mean_weight: 0.1
+
+# ----- planted target -----
+amplitude:        0.15
+target_fraction:  0.10
+train_n:          4000
+test_n:           4000
+
+# ----- PCA / neighborhood (for spatial models) -----
+latent_dim: 5
+k:          5
+
+# ----- THANTD (operates on RAW full-D pixels) -----
+thantd_m:        7         # adjacent-band window size
+thantd_d:        64        # embedding dim
+thantd_heads:    4         # MSA heads
+thantd_epochs:   300
+thantd_batch:    64
+thantd_lr:       1.0e-4
+thantd_margin:   0.3
+thantd_lambda:   0.5       # ETB-Loss weight (lam·triplet + (1-lam)·BCE)
+thantd_alpha:    0.5       # α: fraction of low-CEM pixels used as bkg pool (paper)
+thantd_n_pairs:  2048      # number of (anchor, pos, neg) triplets per epoch
+# --- Adaptation: secondary data mode ---
+# If true, skip CEM and use the train_box pixels directly as the background pool.
+# Set to true when training from target-free secondary data (no full-image CEM).
+thantd_use_secondary: false
+
+# ----- CF-Attention model -----
+cfattn_h:       64
+cfattn_K:       9
+cfattn_eps:     1.0e-4
+cfattn_epochs:  300
+cfattn_lr:      3.0e-4
+lam_ent:        0.05
+lam_div:        0.05
+lam_cov:        1.0e-5
+
+# ----- NeighborMLP -----
+nmlp_d_lat:    32
+nmlp_K:        8
+nmlp_hidden:   128
+nmlp_n_layers: 3
+nmlp_epochs:   300
+nmlp_lr:       3.0e-4
+nmlp_batch:    256
+
+# ----- DSM (global baseline) -----
+dsm_hidden:    [64, 64]
+dsm_epochs:    1000
+dsm_lr:        5.0e-4
+
+# ----- shared -----
+activation:    silu
+dsm_sigma_rho: 0.01
+batch_size:    256
+weight_decay:  1.0e-4
+
+# ----- reproducibility -----
+seed: 42

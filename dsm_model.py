@@ -103,13 +103,32 @@ class ScoreNet(nn.Module):
 
 
 
-def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma: float) -> torch.Tensor:
-    """DSM objective: E[||ψ_η(w̃) - (w - w̃)/σ²||²] where w̃ = w + ε, ε ~ N(0,σ²I)."""
-    eps = torch.randn_like(batch) * sigma
+def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma,
+             weighted: bool = False) -> torch.Tensor:
+    """DSM objective: E[||ψ_η(w̃) - (w - w̃)/Σ_n||²] where w̃ = w + ε, ε ~ N(0,Σ_n).
+
+    Parameters
+    ----------
+    sigma : float OR (d,) array/tensor.
+        Scalar  → isotropic noise Σ_n = σ²I  (the original DSM).
+        Vector  → diagonal noise Σ_n = diag(σ_1²,…,σ_d²); each band b is
+                  corrupted with its own std σ_b and denoised with target
+                  -ε_b/σ_b².  Broadcasts over the batch.
+    weighted : if True, weight each band's squared error by σ_b² (Vincent
+        preconditioning).  This rebalances fitting effort across bands so a
+        tiny-σ band does not numerically dominate the loss.  For SCALAR σ it
+        is just a global constant (does not change the learned score); for a
+        DIAGONAL σ it is the principled, well-conditioned form.
+    """
+    if not torch.is_tensor(sigma):
+        sigma = torch.as_tensor(sigma, dtype=batch.dtype, device=batch.device)
+    eps = torch.randn_like(batch) * sigma          # (B,d), per-band std
     w_tilde = batch + eps
-    target = -eps / (sigma ** 2)   # (w - w̃)/σ² = -ε/σ²
-    score_pred = model(w_tilde)
-    return ((score_pred - target) ** 2).sum(dim=-1).mean()
+    target = -eps / (sigma ** 2)                    # (w - w̃)/Σ_n = -ε/σ_b²
+    se = (model(w_tilde) - target) ** 2             # (B,d)
+    if weighted:
+        se = se * (sigma ** 2)                      # precondition per band
+    return se.sum(dim=-1).mean()
 
 
 def train_dsm(model: ScoreNet, data: np.ndarray, sigma: float,
@@ -308,6 +327,156 @@ def compute_lfi_detector_scores(model: ScoreNet, train_data: np.ndarray,
     scores  = (psi_te - mu_psi) @ (Sigma_inv @ g) / denom
     return scores
 
+
+# ---------------------------------------------------------------------------
+# Mode-2 LFI: signal-agnostic training (Zschetzsche et al. B4-B5)
+# ---------------------------------------------------------------------------
+
+def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
+                   delta_theta: float = 0.01,
+                   sigma_cutoff: float = 1e-3,
+                   detach_sigma: bool = False) -> torch.Tensor:
+    """
+    Signal-agnostic LFI loss: maximize tr(J*) = tr(G^T Sigma^{-1} G).
+
+    G[:,j] = E[(Psi(w+e_j*dt) - Psi(w-e_j*dt)) / (2*dt)]  for each basis dir e_j.
+
+    By the chain rule (Zschetzsche SI B4-B5), for any signal H:
+        J = H^T J* H   (projected at inference, no retraining needed).
+
+    At optimum Psi*(x) = score function ∇_x log p_w(x).
+    """
+    n, d = batch.shape
+    device = batch.device
+
+    # Output covariance. By default detached from gradient (our choice — see notes).
+    # If detach_sigma=False, matches the original LRao code (CNN_LRao_functions.py
+    # lfi_diag_autocorr) where gradient flows through Sigma as well.
+    if detach_sigma:
+        ctx = torch.no_grad()
+    else:
+        import contextlib
+        ctx = contextlib.nullcontext()
+    with ctx:
+        psi_0    = model(batch)                      # (n, d_out)
+        d_out    = psi_0.shape[1]
+        mu_psi   = psi_0.mean(dim=0)
+        centered = psi_0 - mu_psi
+        Sigma    = (centered.T @ centered) / max(n - 1, 1)
+        # Truncated pseudo-inverse (Zschetzsche et al. lfi_diag_autocorr)
+        U, S, Vh  = torch.linalg.svd(Sigma)
+        cutoff    = sigma_cutoff * S[0]
+        S_inv     = torch.where(S > cutoff, 1.0 / S, torch.zeros_like(S))
+        Sigma_inv = Vh.T @ torch.diag(S_inv) @ U.T
+
+    # Full Jacobian G = E[∂Ψ(x)/∂x] via vmap+jacrev — one vectorised backward pass
+    # instead of 2d sequential forward passes. G shape: (d_out, d).
+    from torch.func import jacrev, vmap
+    def _model_1d(x1d):                              # x1d: (d,) → (d_out,)
+        return model(x1d.unsqueeze(0)).squeeze(0)
+    def _single_jac(x):                              # x: (d,) → (d_out, d)
+        return jacrev(_model_1d)(x)
+    J_all = vmap(_single_jac)(batch)                 # (n, d_out, d)
+    G     = J_all.mean(dim=0)                        # (d_out, d)
+
+    # cost = -tr(J*) = -tr(G^T Sigma^{-1} G)
+    J_star = G.T @ Sigma_inv @ G                     # (d, d)
+    return -J_star.trace()
+
+
+def train_lfi_mode2(model: ScoreNet, data: np.ndarray,
+                    delta_theta: float = 0.01,
+                    lr: float = 1e-3, batch_size: int = 256,
+                    epochs: int = 5000, device: str = "cpu",
+                    print_every: int = 500,
+                    weight_decay: float = 1e-4,
+                    sigma_cutoff: float = 1e-3,
+                    detach_sigma: bool = False,
+                    checkpointer=None) -> ScoreNet:
+    """
+    Train by maximizing tr(J*): NO target signature s needed.
+    Same hyperparameter interface as train_dsm.
+    """
+    model   = model.to(device)
+    model.train()
+    X       = torch.tensor(data, dtype=torch.float32, device=device)
+    dataset = TensorDataset(X)
+    loader  = DataLoader(dataset, batch_size=min(batch_size, len(data)),
+                         shuffle=True, drop_last=False)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr,
+                                 weight_decay=weight_decay)
+
+    for epoch in range(1, epochs + 1):
+        epoch_loss = 0.0
+        for (batch,) in loader:
+            optimizer.zero_grad()
+            loss = lfi_loss_mode2(model, batch, delta_theta, sigma_cutoff,
+                                  detach_sigma=detach_sigma)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        avg = epoch_loss / len(loader)
+        if epoch == 1 or epoch % print_every == 0 or epoch == epochs:
+            print(f"    epoch {epoch:>{len(str(epochs))}}/{epochs}  tr(J*)={-avg:.5f}")
+
+        if checkpointer is not None:
+            checkpointer.save(epoch, model.cpu(), optimizer, {'lfi_m2': -avg})
+            checkpointer.save_best_loss(model.cpu(), avg, epoch, optimizer)
+            model = model.to(device)
+
+    model.eval()
+    if checkpointer is not None:
+        checkpointer.save_final(model.cpu(), epochs, optimizer)
+    return model.cpu()
+
+
+@torch.no_grad()
+def compute_lfi_detector_scores_mode2(model: ScoreNet, train_data: np.ndarray,
+                                       test_data: np.ndarray, s: np.ndarray,
+                                       delta_theta: float = 0.01,
+                                       sigma_cutoff: float = 1e-3) -> np.ndarray:
+    """
+    Mode-2 LLMP detector. Signal s enters only here (not during training).
+
+    Chain rule (B5): g_s = G @ s,  J_s = g_s^T Sigma^{-1} g_s
+    T(y) = g_s^T Sigma^{-1} (Psi(y) - mu) / sqrt(J_s)
+    """
+    model.eval()
+    d    = train_data.shape[1]
+    X_tr = torch.tensor(train_data, dtype=torch.float32)
+    X_te = torch.tensor(test_data,  dtype=torch.float32)
+    I_d  = torch.eye(d)
+
+    psi_tr = model(X_tr).numpy()                     # (n, d_out)
+    d_out  = psi_tr.shape[1]
+    mu     = psi_tr.mean(axis=0)
+    centered = psi_tr - mu
+    n = len(train_data)
+    Sigma     = centered.T @ centered / max(n - 1, 1)
+    # Truncated pseudo-inverse (matches lfi_loss_mode2 and original LRao code).
+    U, S, Vh  = np.linalg.svd(Sigma)
+    cutoff    = sigma_cutoff * S[0]
+    S_inv     = np.where(S > cutoff, 1.0 / S, 0.0)
+    Sigma_inv = Vh.T @ np.diag(S_inv) @ U.T
+
+    # Full Jacobian G: (d_out, d)
+    G = np.zeros((d_out, d))
+    for j in range(d):
+        psi_plus  = model(X_tr + delta_theta * I_d[j]).numpy()
+        psi_minus = model(X_tr - delta_theta * I_d[j]).numpy()
+        G[:, j]   = ((psi_plus - psi_minus) / (2.0 * delta_theta)).mean(axis=0)
+
+    # Project onto signal direction
+    g_s   = G @ s                                    # (d_out,)
+    J_s   = float(g_s @ Sigma_inv @ g_s)
+    denom = np.sqrt(max(J_s, 1e-12))
+
+    psi_te = model(X_te).numpy()
+    return (psi_te - mu) @ (Sigma_inv @ g_s) / denom
+
+
+# ---------------------------------------------------------------------------
 
 def _model_lfi_stats(model: ScoreNet, train_data: np.ndarray, s: np.ndarray,
                      delta_theta: float = 0.01):

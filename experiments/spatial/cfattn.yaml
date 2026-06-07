@@ -1,0 +1,42 @@
+dataset: data/pavia-u.mat
+norm_mode: global_max
+results_dir: experiments/spatial/results
+target_cls: 5
+train_box:
+- 327
+- 534
+- 17
+- 157
+test_box:
+- 251
+- 320
+- 21
+- 154
+amplitude: 0.15
+target_fraction: 0.1
+train_n: 4000
+test_n: 4000
+latent_dim: 5
+k: 5
+cfattn_h: 64
+cfattn_K: 9
+cfattn_eps: 0.0001
+cfattn_epochs: 500
+cfattn_lr: 0.0003
+cfattn_batch: 256
+lam_ent: 0.05
+lam_div: 0.05
+lam_cov: 1.0e-05
+dsm_hidden:
+- 64
+- 64
+activation: silu
+dsm_epochs: 2000
+dsm_lr: 0.0005
+dsm_sigma_rho: 0.01
+batch_size: 256
+weight_decay: 0.0001
+gmm_K: 9
+gmm_theta_max: 1.0
+gmm_theta_steps: 50
+seed: 42

@@ -1,0 +1,72 @@
+# =========================================================================
+# NeighborMLPDenoiser spatial experiment — comparison with CF-Attn + DSM
+# =========================================================================
+# Same train/test boxes and target as the CF-Attn experiment, for
+# direct comparison. Run pick_boxes.py to update the boxes.
+#
+# Usage:
+#   .venv/bin/python experiments/spatial/pick_boxes.py --config experiments/spatial/neighbor_mlp.yaml
+#   .venv/bin/python -u experiments/spatial/run_neighbor_mlp.py
+
+dataset:     data/pavia-u.mat
+norm_mode:   global_max
+results_dir: experiments/spatial/results
+
+# ----- spatial rectangles (same as cfattn.yaml for fair comparison) -----
+train_box:   [323, 426, 11, 167]
+test_box:    [443, 529, 87, 291]
+
+# ----- target signature (dominant-class offset) -----
+sig_dom_weight:  0.9
+sig_mean_weight: 0.1
+
+# ----- planted target -----
+amplitude:        0.15
+target_fraction:  0.10
+train_n:          4000
+test_n:           4000
+
+# ----- dimensionality reduction -----
+latent_dim: 5
+
+# ----- spatial neighborhood -----
+k: 5                         # window size: M = k*k-1 = 24 neighbors
+
+# ----- NeighborMLP model -----
+nmlp_d_lat:   32             # shared encoder output dim
+nmlp_K:       8              # number of latent-nearest neighbors to select
+nmlp_hidden:  128            # MLP width (phi and f)
+nmlp_n_layers: 3             # layers per MLP
+nmlp_epochs:  300
+nmlp_lr:      3.0e-4
+nmlp_batch:   256
+
+# ----- CF-Attention model (for comparison) -----
+cfattn_h:       64
+cfattn_K:       9
+cfattn_eps:     1.0e-4
+cfattn_epochs:  300
+cfattn_lr:      3.0e-4
+cfattn_batch:   256
+lam_ent:        0.05
+lam_div:        0.05
+lam_cov:        1.0e-5
+
+# ----- DSM baseline -----
+dsm_hidden:    [64, 64]
+dsm_epochs:    1000
+dsm_lr:        5.0e-4
+
+# ----- shared -----
+activation:    silu
+dsm_sigma_rho: 0.01
+batch_size:    256
+weight_decay:  1.0e-4
+
+# ----- GMM baselines -----
+gmm_K:           9
+gmm_theta_max:   0.5
+gmm_theta_steps: 50
+
+# ----- reproducibility -----
+seed: 42

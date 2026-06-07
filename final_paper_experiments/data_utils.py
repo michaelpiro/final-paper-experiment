@@ -30,12 +30,14 @@ def load_and_normalize(path: str, mode: str = 'global'):
     path : str
         Path to .mat file containing 'data' (H×W×B) and 'map' (H×W).
     mode : str
-        'global'   — subtract global min, divide by global range.
-        'per_band' — per-band min/max normalization (each band independently).
+        'global'        — subtract global min, divide by global range.
+        'per_band'      — per-band min/max normalization (each band independently).
+        'per_band_max'  — divide each band by its maximum only (zero stays zero).
+        'none'          — no normalization; return raw sensor values as float64.
 
     Returns
     -------
-    data : np.ndarray  (H, W, B)  float64, values in [0, 1]
+    data : np.ndarray  (H, W, B)  float64
     gt   : np.ndarray  (H, W)     int
     """
     mat  = scipy.io.loadmat(path)
@@ -49,8 +51,17 @@ def load_and_normalize(path: str, mode: str = 'global'):
         lo = data.min(axis=(0, 1), keepdims=True)   # (1, 1, B)
         hi = data.max(axis=(0, 1), keepdims=True)
         data = (data - lo) / (hi - lo + 1e-12)
+    elif mode == 'per_band_max':
+        hi = data.max(axis=(0, 1), keepdims=True)   # (1, 1, B)
+        data = data / (hi + 1e-12)                  # zero stays zero
+    elif mode == 'global_max':
+        hi = data.max()                             # scalar
+        data = data / (hi + 1e-12)                  # zero stays zero
+    elif mode == 'none':
+        pass   # return raw values unchanged
     else:
-        raise ValueError(f"Unknown normalization mode: {mode!r}. Use 'global' or 'per_band'.")
+        raise ValueError(f"Unknown normalization mode: {mode!r}. "
+                         f"Use 'global', 'per_band', 'per_band_max', or 'none'.")
 
     return data, gt
 
@@ -129,6 +140,28 @@ def compute_sigma_from_data(train_data: np.ndarray, rho: float = 0.01) -> float:
     """
     s2 = np.mean(np.var(train_data, axis=0))   # (1/d) tr(Σ̂)
     return float(np.sqrt(rho * s2))
+
+
+def compute_sigma_diag_from_data(train_data: np.ndarray,
+                                 rho: float = 0.01) -> np.ndarray:
+    """Data-driven *diagonal* DSM noise level: σ_b = sqrt(ρ · Var(x_b)).
+
+    The per-band generalization of compute_sigma_from_data: instead of using
+    one pooled scale (the average band variance), each band gets noise
+    proportional to its OWN std.  The scalar rule is exactly this with every
+    band's variance replaced by the mean.
+
+    Parameters
+    ----------
+    train_data : (n, d)
+    rho        : noise-to-signal ratio (default 0.01 → σ_b = 10% of band std)
+
+    Returns
+    -------
+    sigma : (d,) float32 array of per-band noise stds.
+    """
+    var = np.var(train_data, axis=0)            # (d,)
+    return np.sqrt(rho * var).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
