@@ -9,7 +9,7 @@ results_dir: experiments/honest_pipeline/results
 run_name:    iid_multi_rho
 
 target_models: [ additive ]
-device:        auto          # auto | cuda | cpu  (auto = GPU on Colab)
+device:        cpu           # tiny MLPs: CPU beats GPU (kernel-launch overhead)
 
 score_norm:      per_band_std
 target_cls:      1
@@ -29,8 +29,8 @@ rho_list: [ 0.0001, 0.0005, 0.001, 0.002, 0.003, 0.005, 0.008, 0.01,
 
 hidden_dims:      [ 64, 64 ]
 activation:       silu
-dsm_epochs:       2000
-lrao_epochs:      500
+dsm_epochs:       1500
+lrao_epochs:      50      # LRao overfits beyond ~50 ep (also 10x faster)
 lfi_delta_theta:  0.001
 lfi_sigma_cutoff: 0.00001
 lr:               0.001

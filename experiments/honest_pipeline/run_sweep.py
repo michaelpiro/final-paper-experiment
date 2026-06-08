@@ -748,7 +748,12 @@ def main():
 
     global DEVICE
     DEVICE = _resolve_device(cfg)
-    print(f"Device: {DEVICE}", flush=True)
+    if DEVICE.type == 'cpu':
+        try:
+            torch.set_num_threads(os.cpu_count() or 1)
+        except Exception:
+            pass
+    print(f"Device: {DEVICE}  (torch threads={torch.get_num_threads()})", flush=True)
 
     tms = _target_models(cfg)
     ts  = datetime.now().strftime('%Y%m%d_%H%M%S')
