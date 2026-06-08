@@ -93,6 +93,7 @@ def dsm_additive(test_data: np.ndarray, train_data: np.ndarray,
         C_psi = np.array([[float(C_psi)]])
     z_test  = compute_scores(model, test_data)         # (n_test, d)
     norm    = np.sqrt(max(float(s @ C_psi @ s), 1e-12))
+    # return -((z_test - z_bar) @ s) / norm
     return -((z_test - z_bar) @ s) / norm
 
 
@@ -122,6 +123,14 @@ def gmm_glrt_oracle(test_data: np.ndarray, train_data: np.ndarray,
     Same GMM background as gmm_glrt(), but skips the grid search and
     plugs in the TRUE θ directly. Clairvoyant upper bound for grid GMM-GLRT.
         T(y) = log p_GMM(y − θ·s) − log p_GMM(y)
+
+    ⚠️  UNUSED by the honest pipeline. This is a SEPARATE, WEAKER clairvoyant
+        built on the single K-component GMM density of gmm_glrt() — it is NOT
+        the Levin product-GMM oracle. The honest pipeline's oracle curve is
+        GMMGLRTLevin.score(..., oracle_p=θ) in gmm_glrt_levin.py, which uses the
+        same (stronger) product-GMM density as the honest 'GMM-Levin' curve and
+        is therefore a valid upper bound. Do not use this function as the paper
+        oracle — it can score BELOW the honest Levin curve.
     """
     gm = GaussianMixture(n_components=K, covariance_type='full',
                          n_init=5, random_state=0)
@@ -140,21 +149,25 @@ def dsm_replacement(test_data: np.ndarray, train_data: np.ndarray,
     """
     DSM-LMP for the replacement target model y = (1−θ)w + θs.
 
-        T(y) = ((ψ(y) − ψ̄)ᵀ(y−s) − r̄) / std(r_train)
+    Paper formula:
+        u_rep(y) = (ψ(y) − ψ̄)ᵀ(y−s) + d
+        I_rep    = E[(ψ(w)−ψ̄)ᵀ(w−s))²] − d²
+        T(y)     = u_rep(y) / sqrt(I_rep)
 
-    We subtract the per-dimensional score mean ψ̄ = E_train[ψ(x)] BEFORE
-    taking the dot product with (y−s).  This mirrors the additive statistic
-    and prevents the sigma-smoothing bias from flipping the statistic sign
-    (which caused AUC < 0.5 at large n / large sigma).
+    The only adaptation: center ψ by its empirical mean ψ̄ = E_train[ψ(x)].
+    For a well-trained model the Stein identity gives E[r] ≈ −d, so
+    I_rep = E[r²] − d² = Var[r].
     """
     model.eval()
     psi_train = compute_scores(model, train_data)
     psi_test  = compute_scores(model, test_data)
-    psi_bar   = psi_train.mean(axis=0)                    # (D,) per-dim score mean
-    r_train   = ((psi_train - psi_bar) * (train_data - s)).sum(axis=1)
-    r_bar, r_std = r_train.mean(), r_train.std() + 1e-12
-    r_test    = ((psi_test  - psi_bar) * (test_data  - s)).sum(axis=1)
-    return (r_test - r_bar) / r_std
+    psi_bar   = psi_train.mean(axis=0)          # (D,) per-dim score mean
+    d         = train_data.shape[1]
+
+    r_train = ((psi_train - psi_bar) * (train_data - s)).sum(axis=1)
+    I_rep   = max(float((r_train**2).mean()) - d**2, 1e-12)
+    r_test  = ((psi_test  - psi_bar) * (test_data  - s)).sum(axis=1)
+    return (r_test + d) / np.sqrt(I_rep)
 
 
 def amf_replacement(test_data: np.ndarray, train_data: np.ndarray,
@@ -219,6 +232,11 @@ def gmm_glrt_replacement_oracle(test_data: np.ndarray, train_data: np.ndarray,
     """
     GMM-GLRT for the replacement model — ORACLE (known amplitude θ).
         T(y) = log p_GMM((y−θs)/(1−θ)) − d·log(1−θ) − log p_GMM(y)
+
+    ⚠️  UNUSED by the honest pipeline, and the paper now uses the additive model
+        only. Like gmm_glrt_oracle(), this is a SEPARATE, WEAKER single-GMM
+        clairvoyant — NOT the Levin product-GMM oracle. Do not use as the paper
+        oracle; see GMMGLRTLevin.score(..., oracle_p=θ) in gmm_glrt_levin.py.
     """
     d  = test_data.shape[1]
     means, Sigma, weights = _fit_gmm_shared_cov(train_data, K)

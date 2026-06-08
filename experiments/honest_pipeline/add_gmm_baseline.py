@@ -1,6 +1,10 @@
 """
-add_gmm_baseline.py — compute ONLY the GMM-GLRT (oracle) baseline and merge
-it into an existing sweep results dir, WITHOUT retraining any neural models.
+add_gmm_baseline.py — compute ONLY the GMM-GLRT (Levin product-GMM, honest
+grid-search over the fill factor) baseline and merge it into an existing sweep
+results dir, WITHOUT retraining any neural models.
+
+NOTE: this is the HONEST detector (det.score(..., p_steps, p_max) — it searches
+the fill factor, it is NOT fed the true planted amplitude). It is not an oracle.
 
 Replicates the exact data split of run_sweep.run_one_seed (same seeds, same
 n / target / background, same global_max scaling, same planted indices), so
@@ -71,7 +75,7 @@ def main():
     t_raw = flat[gt_flat == tcls].mean(0).astype(np.float32)
     print(f"bkg={len(bkg_all)}px  tgt cls {tcls}({CLS_NAMES.get(tcls,'?')})\n", flush=True)
 
-    # ---- per-seed GMM-GLRT (oracle), same split as run_one_seed ----
+    # ---- per-seed GMM-GLRT (Levin, honest grid-search), same split as run_one_seed ----
     all_gmm = []
     for k, seed in enumerate(seeds):
         print(f"=== seed {k+1}/{len(seeds)} (seed={seed}) ===", flush=True)
