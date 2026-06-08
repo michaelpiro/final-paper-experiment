@@ -315,6 +315,19 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
     print(f"  signature: {w_dom}·{dom_name} + {w_mean}·patch_mean  "
           f"||s_pca||={np.linalg.norm(s_pca):.4f}", flush=True)
 
+    # ---- DSM per-band standardization (from TRAINING pixels only) ----
+    # The PCA bands have very different variances (PC1 ≫ later PCs). With
+    # isotropic DSM noise the loss is dominated by high-variance bands and the
+    # score in low-variance directions — where much discriminative structure
+    # lives — is poorly learned, collapsing DSM-LMP to ≈AMF.  Z-scoring each
+    # band equalizes the scales so the score net learns all directions.
+    # The additive offset θ·s transforms as θ·(s/σ_band) under standardization.
+    dsm_mu = tr_pca.mean(axis=0).astype(np.float32)
+    dsm_sd = (tr_pca.std(axis=0) + 1e-8).astype(np.float32)
+    tr_pca_dsm = ((tr_pca - dsm_mu) / dsm_sd).astype(np.float32)
+    s_pca_dsm  = (s_pca / dsm_sd).astype(np.float32)
+    sigma_dsm  = compute_sigma_from_data(tr_pca_dsm, cfg['dsm_sigma_rho'])
+
     # ---- Train models (with checkpoint save/load) ----
     def ckpt(name):
         return os.path.join(mdl_dir, f'{name}_s{sid}_n{n_budget}.pt')
@@ -362,7 +375,7 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
     else:
         print("  [DSM] training ...", flush=True)
         t0 = time.time()
-        dsm_net = _train_dsm(D, sigma, tr_pca, cfg, device)
+        dsm_net = _train_dsm(D, sigma_dsm, tr_pca_dsm, cfg, device)
         torch.save({'state_dict': dsm_net.state_dict(), 'cfg': cfg}, dsm_ckpt)
         print(f"  [DSM] done in {time.time()-t0:.0f}s", flush=True)
 
@@ -414,7 +427,8 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
             cfattn, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
         sc_nmlp     = score_nmlp_additive(
             nmlp, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
-        sc_dsm      = dsm_additive(planted_pca, tr_pca, dsm_net, s_pca)
+        planted_pca_dsm = ((planted_pca - dsm_mu) / dsm_sd).astype(np.float32)
+        sc_dsm      = dsm_additive(planted_pca_dsm, tr_pca_dsm, dsm_net, s_pca_dsm)
 
         sc_amf    = amf(planted_pca, tr_pca, s_pca)
         sc_regamf = reg_amf(planted_pca, tr_pca, s_pca, sigma)
@@ -452,7 +466,7 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
                 cfattn, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
             tr_sc_nmlp = score_nmlp_additive(
                 nmlp, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
-            tr_sc_dsm  = dsm_additive(tr_pca, tr_pca, dsm_net, s_pca)
+            tr_sc_dsm  = dsm_additive(tr_pca_dsm, tr_pca_dsm, dsm_net, s_pca_dsm)
 
         tr_sc_amf    = amf(tr_pca, tr_pca, s_pca)
         tr_sc_regamf = reg_amf(tr_pca, tr_pca, s_pca, sigma)
