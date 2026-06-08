@@ -274,13 +274,14 @@ def run_scenario(sid, sid_idx, scenario, cfg, pca, pca_img, data_norm, gt,
 
     # ---- evaluate each regime ----
     results = {'info': info, 'auc': {}, 'roc': {}}
+    plant_model = cfg.get('plant_model', 'additive')
     for regime, sig_raw in sigs.items():
         s_pca = pca.transform(sig_raw[None]).flatten().astype(np.float32)
         pl_pca, lab, _ = plant_targets(te_pca, s_pca, cfg['amplitude'],
-                                       cfg['target_fraction'], model='additive',
+                                       cfg['target_fraction'], model=plant_model,
                                        seed=seed)
         pl_raw, _, _   = plant_targets(te_raw, sig_raw, cfg['amplitude'],
-                                       cfg['target_fraction'], model='additive',
+                                       cfg['target_fraction'], model=plant_model,
                                        seed=seed)
         pl_pca_dsm = ((pl_pca - dsm_mu) / dsm_sd).astype(np.float32)
         s_pca_dsm  = (s_pca / dsm_sd).astype(np.float32)
@@ -368,6 +369,13 @@ def main():
                          'scenarios (the real, challenging setup). Or a comma-separated '
                          'list of class ids to instead use homogeneous single-material '
                          'boxes (diagnostic only).')
+    ap.add_argument('--plant_model', default='additive',
+                    choices=['additive', 'replacement'],
+                    help='target model. "replacement" (y=(1-θ)w+θs) with high amplitude '
+                         '≈ full-pixel targets — THANTD\'s native regime.')
+    ap.add_argument('--amplitude', type=float, default=None,
+                    help='override target amplitude θ (default = config). Use a strong '
+                         'value (e.g. 1.0) to verify THANTD on strong/full-pixel targets.')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--no-thantd', action='store_true')
     args = ap.parse_args()
@@ -375,6 +383,11 @@ def main():
     cfg = dict(DEFAULT_CFG)
     if args.config:
         cfg.update(yaml.safe_load(open(args.config)))
+    cfg['plant_model'] = args.plant_model
+    if args.amplitude is not None:
+        cfg['amplitude'] = args.amplitude
+    print(f"Planting: model={cfg['plant_model']}  amplitude={cfg['amplitude']}  "
+          f"fraction={cfg['target_fraction']}", flush=True)
     if args.dry_run:
         cfg.update(dict(box_size_ablation=[400], cfattn_epochs=8, nmlp_epochs=8,
                         dsm_epochs=15, thantd_epochs=4, cfattn_K=4, nmlp_K=4,
