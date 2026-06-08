@@ -156,7 +156,7 @@ def _fig_target_locations(data_norm, test_box, tgt_idx_dict, te_gt_flat):
 def _fig_score_maps(scores_dict, labels_dict, tgt_idx_dict, thresholds_dict,
                     test_box):
     """
-    One row per detector, 2 cols: additive | replacement.
+    One row per detector, single column: additive model.
     Spatial heatmap of scores over test box.
     White contour at 1% CFAR threshold (from training).
     White dots = planted targets.
@@ -165,7 +165,7 @@ def _fig_score_maps(scores_dict, labels_dict, tgt_idx_dict, thresholds_dict,
     H_b, W_b = r1 - r0, c1 - c0
     n_pix = H_b * W_b
 
-    target_models = [tm for tm in ('additive', 'replacement')
+    target_models = [tm for tm in ('additive',)
                      if any(f'{name}_{tm}' in scores_dict
                             for name in METHOD_COLORS)]
 
@@ -237,7 +237,7 @@ def _fig_detection_on_gt(scores_dict, labels_dict, thresholds_dict,
     H_b, W_b = r1 - r0, c1 - c0
     n_pix = H_b * W_b
 
-    target_models = [tm for tm in ('additive', 'replacement')
+    target_models = [tm for tm in ('additive',)
                      if any(f'{nm}_{tm}' in scores_dict for nm in METHOD_COLORS)]
     detectors = [nm for nm in METHOD_COLORS
                  if any(f'{nm}_{tm}' in scores_dict for tm in target_models)]
@@ -309,8 +309,8 @@ def _fig_detection_on_gt(scores_dict, labels_dict, thresholds_dict,
 # ---------------------------------------------------------------------------
 
 def _fig_roc(scores_dict, labels_dict):
-    """ROC curves for all detectors, additive + replacement panels."""
-    target_models = [tm for tm in ('additive', 'replacement')
+    """ROC curves for all detectors (additive model)."""
+    target_models = [tm for tm in ('additive',)
                      if any(f'{nm}_{tm}' in scores_dict for nm in METHOD_COLORS)]
     if not target_models:
         return None
@@ -362,11 +362,11 @@ def save_scenario_figures(sid: int, n_budget: int,
     ----------
     sid            : scenario index (0-based)
     n_budget       : box-size budget (used in filename)
-    scores_dict    : {'MethodName_additive': array, 'MethodName_replacement': array, ...}
+    scores_dict    : {'MethodName_additive': array, ...}
     labels_dict    : same keys, binary label arrays
     thresholds_dict: same keys, float thresholds from training pixels
     te_gt_flat     : (n_test,) GT class label for each test pixel
-    tgt_idx_dict   : {'additive': array, 'replacement': array} target pixel indices
+    tgt_idx_dict   : {'additive': array} target pixel indices
     data_norm      : (H, W, D_raw) normalized image
     gt             : (H, W) full GT label map
     train_box      : [r0, r1, c0, c1]
@@ -484,41 +484,40 @@ def save_cfar_per_class_figure(all_cfar: list, fig_dir: str,
 
 
 def save_auc_summary_figure(all_metrics: dict, fig_dir: str, n_budget: int):
-    """AUC summary bar chart: additive + replacement side by side."""
+    """AUC summary bar chart for the additive model."""
     os.makedirs(fig_dir, exist_ok=True)
     if not all_metrics:
         return
 
     # Gather AUC per detector across scenarios for this budget
-    det_aucs = {tm: {} for tm in ('additive', 'replacement')}
+    tm = 'additive'
+    det_aucs = {}
     for sid_key, sid_data in all_metrics.items():
         bkey = f'n{n_budget}'
         if bkey not in sid_data:
             continue
-        for tm in det_aucs:
-            # sid_data[bkey][tm] = {'auc': {...}, 'pauc': {...}, ...}
-            auc_dict = sid_data[bkey].get(tm, {})
-            if isinstance(auc_dict, dict):
-                auc_dict = auc_dict.get('auc', auc_dict)
-            for nm, val in auc_dict.items():
-                if isinstance(val, (int, float)) and not isinstance(val, bool):
-                    det_aucs[tm].setdefault(nm, []).append(val)
+        # sid_data[bkey][tm] = {'auc': {...}, 'pauc': {...}, ...}
+        auc_dict = sid_data[bkey].get(tm, {})
+        if isinstance(auc_dict, dict):
+            auc_dict = auc_dict.get('auc', auc_dict)
+        for nm, val in auc_dict.items():
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                det_aucs.setdefault(nm, []).append(val)
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-    for ax, tm in zip(axes, ('additive', 'replacement')):
-        names = [n for n in det_aucs[tm] if det_aucs[tm][n]]
-        means = [np.nanmean(det_aucs[tm][n]) for n in names]
-        stds  = [np.nanstd(det_aucs[tm][n])  for n in names]
-        colors = [METHOD_COLORS.get(n, 'grey') for n in names]
-        bars = ax.bar(names, means, yerr=stds, color=colors, capsize=4)
-        ax.set_ylim(0.4, 1.0); ax.set_ylabel('AUC')
-        ax.set_title(f'{tm.capitalize()} model  (n={n_budget})', fontsize=11)
-        ax.set_xticks(range(len(names)))
-        ax.set_xticklabels(names, rotation=25, ha='right')
-        ax.grid(True, alpha=0.3, axis='y')
-        for bar, v in zip(bars, means):
-            ax.text(bar.get_x() + bar.get_width() / 2, min(v + 0.01, 0.99),
-                    f'{v:.3f}', ha='center', va='bottom', fontsize=8)
+    fig, ax = plt.subplots(1, 1, figsize=(7, 4))
+    names = [n for n in det_aucs if det_aucs[n]]
+    means = [np.nanmean(det_aucs[n]) for n in names]
+    stds  = [np.nanstd(det_aucs[n])  for n in names]
+    colors = [METHOD_COLORS.get(n, 'grey') for n in names]
+    bars = ax.bar(names, means, yerr=stds, color=colors, capsize=4)
+    ax.set_ylim(0.4, 1.0); ax.set_ylabel('AUC')
+    ax.set_title(f'Additive model  (n={n_budget})', fontsize=11)
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=25, ha='right')
+    ax.grid(True, alpha=0.3, axis='y')
+    for bar, v in zip(bars, means):
+        ax.text(bar.get_x() + bar.get_width() / 2, min(v + 0.01, 0.99),
+                f'{v:.3f}', ha='center', va='bottom', fontsize=8)
 
     fig.suptitle(f'AUC summary (mean ± std over {len(all_metrics)} scenarios)',
                  fontsize=12)

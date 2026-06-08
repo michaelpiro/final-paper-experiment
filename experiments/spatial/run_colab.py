@@ -53,11 +53,11 @@ from final_paper_experiments.data_utils import (
     load_and_normalize, compute_sigma_from_data, plant_targets,
 )
 from final_paper_experiments.baselines.detectors import (
-    amf, reg_amf, dsm_additive, dsm_replacement,
-    gmm_glrt, gmm_glrt_replacement,
+    amf, reg_amf, dsm_additive,
+    gmm_glrt,
 )
 from final_paper_experiments.baselines.gmm_glrt_levin import (
-    gmm_glrt_levin_additive, gmm_glrt_levin_replacement,
+    gmm_glrt_levin_additive,
 )
 from final_paper_experiments.evaluation import (
     partial_auc, dr_at_fpr, auc_safe, roc_safe,
@@ -69,12 +69,12 @@ from final_paper_experiments.models.neighbor_adapted import extract_neighborhood
 from dsm_model import ScoreNet, dsm_loss
 from cfattn_model import (
     CFAttnGaussianScoreNet, cfattn_dsm_loss,
-    score_cfattn_additive, score_cfattn_replacement,
-    score_cfattn_additive_cfar, score_cfattn_replacement_cfar,
+    score_cfattn_additive,
+    score_cfattn_additive_cfar,
 )
 from neighbor_mlp_model import (
     NeighborMLPDenoiser, neighbor_mlp_dsm_loss,
-    score_nmlp_additive, score_nmlp_replacement,
+    score_nmlp_additive,
 )
 from thantd_model import (
     THANTD, build_thantd_samples, train_thantd, score_thantd,
@@ -399,7 +399,7 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
     te_nbr_f = te_nbr_full.astype(np.float32)
     tr_nbr_f = tr_nbr.astype(np.float32)
 
-    for tm in ('additive', 'replacement'):
+    for tm in ('additive',):
         planted_pca, labels, tgt_idx = plant_targets(
             te_pca_full, s_pca, cfg['amplitude'], cfg['target_fraction'],
             model=tm, seed=seed)
@@ -408,38 +408,22 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
             model=tm, seed=seed)
         tgt_idx_dict[tm] = tgt_idx
 
-        if tm == 'additive':
-            sc_cfa_cfar = score_cfattn_additive_cfar(
-                cfattn, planted_pca, te_nbr_f, s_pca)
-            sc_cfa      = score_cfattn_additive(
-                cfattn, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
-            sc_nmlp     = score_nmlp_additive(
-                nmlp, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
-            sc_dsm      = dsm_additive(planted_pca, tr_pca, dsm_net, s_pca)
-        else:
-            sc_cfa_cfar = score_cfattn_replacement_cfar(
-                cfattn, planted_pca, te_nbr_f, s_pca)
-            sc_cfa      = score_cfattn_replacement(
-                cfattn, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
-            sc_nmlp     = score_nmlp_replacement(
-                nmlp, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
-            sc_dsm      = dsm_replacement(planted_pca, tr_pca, dsm_net, s_pca)
+        sc_cfa_cfar = score_cfattn_additive_cfar(
+            cfattn, planted_pca, te_nbr_f, s_pca)
+        sc_cfa      = score_cfattn_additive(
+            cfattn, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
+        sc_nmlp     = score_nmlp_additive(
+            nmlp, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
+        sc_dsm      = dsm_additive(planted_pca, tr_pca, dsm_net, s_pca)
 
         sc_amf    = amf(planted_pca, tr_pca, s_pca)
         sc_regamf = reg_amf(planted_pca, tr_pca, s_pca, sigma)
 
-        if tm == 'additive':
-            sc_gmmglrt = gmm_glrt(planted_pca, tr_pca, s_pca,
-                                  K=cfg.get('gmm_K', 3),
-                                  theta_steps=cfg.get('gmm_steps', 50))
-            sc_levin   = gmm_glrt_levin_additive(planted_pca, tr_pca, s_pca,
-                                                  p_steps=cfg.get('gmm_steps', 50))
-        else:
-            sc_gmmglrt = gmm_glrt_replacement(planted_pca, tr_pca, s_pca,
-                                              K=cfg.get('gmm_K', 3),
-                                              theta_steps=cfg.get('gmm_steps', 50))
-            sc_levin   = gmm_glrt_levin_replacement(planted_pca, tr_pca, s_pca,
-                                                     p_steps=cfg.get('gmm_steps', 50))
+        sc_gmmglrt = gmm_glrt(planted_pca, tr_pca, s_pca,
+                              K=cfg.get('gmm_K', 3),
+                              theta_steps=cfg.get('gmm_steps', 50))
+        sc_levin   = gmm_glrt_levin_additive(planted_pca, tr_pca, s_pca,
+                                              p_steps=cfg.get('gmm_steps', 50))
 
         det_scores = {
             'CF-Attn-CFAR': sc_cfa_cfar,
@@ -462,37 +446,21 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
         # ---- Compute training-pixel scores for CFAR threshold ----
         # Use CLEAN training pixels (no planted targets) for threshold setting
         with torch.no_grad():
-            if tm == 'additive':
-                tr_sc_cfar = score_cfattn_additive_cfar(
-                    cfattn, tr_pca, tr_nbr_f, s_pca)
-                tr_sc_cfa  = score_cfattn_additive(
-                    cfattn, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
-                tr_sc_nmlp = score_nmlp_additive(
-                    nmlp, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
-                tr_sc_dsm  = dsm_additive(tr_pca, tr_pca, dsm_net, s_pca)
-            else:
-                tr_sc_cfar = score_cfattn_replacement_cfar(
-                    cfattn, tr_pca, tr_nbr_f, s_pca)
-                tr_sc_cfa  = score_cfattn_replacement(
-                    cfattn, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
-                tr_sc_nmlp = score_nmlp_replacement(
-                    nmlp, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
-                tr_sc_dsm  = dsm_replacement(tr_pca, tr_pca, dsm_net, s_pca)
+            tr_sc_cfar = score_cfattn_additive_cfar(
+                cfattn, tr_pca, tr_nbr_f, s_pca)
+            tr_sc_cfa  = score_cfattn_additive(
+                cfattn, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
+            tr_sc_nmlp = score_nmlp_additive(
+                nmlp, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
+            tr_sc_dsm  = dsm_additive(tr_pca, tr_pca, dsm_net, s_pca)
 
         tr_sc_amf    = amf(tr_pca, tr_pca, s_pca)
         tr_sc_regamf = reg_amf(tr_pca, tr_pca, s_pca, sigma)
-        if tm == 'additive':
-            tr_sc_gmmglrt = gmm_glrt(tr_pca, tr_pca, s_pca,
-                                     K=cfg.get('gmm_K', 3),
-                                     theta_steps=cfg.get('gmm_steps', 50))
-            tr_sc_levin   = gmm_glrt_levin_additive(tr_pca, tr_pca, s_pca,
-                                                     p_steps=cfg.get('gmm_steps', 50))
-        else:
-            tr_sc_gmmglrt = gmm_glrt_replacement(tr_pca, tr_pca, s_pca,
-                                                  K=cfg.get('gmm_K', 3),
-                                                  theta_steps=cfg.get('gmm_steps', 50))
-            tr_sc_levin   = gmm_glrt_levin_replacement(tr_pca, tr_pca, s_pca,
-                                                        p_steps=cfg.get('gmm_steps', 50))
+        tr_sc_gmmglrt = gmm_glrt(tr_pca, tr_pca, s_pca,
+                                 K=cfg.get('gmm_K', 3),
+                                 theta_steps=cfg.get('gmm_steps', 50))
+        tr_sc_levin   = gmm_glrt_levin_additive(tr_pca, tr_pca, s_pca,
+                                                 p_steps=cfg.get('gmm_steps', 50))
         train_scores = {
             'CF-Attn-CFAR': tr_sc_cfar,
             'CF-Attn':      tr_sc_cfa,
@@ -626,7 +594,7 @@ def run_dry_run_checks(sid, n_budget, results_dir):
     mj_path = os.path.join(scen_dir, 'metrics.json')
     if os.path.exists(mj_path):
         mj = json.load(open(mj_path))
-        for field in ('additive', 'replacement'):
+        for field in ('additive',):
             ok = field in mj and 'auc' in mj[field] and 'cfar' in mj[field]
             print(f"  {'[PASS]' if ok else '[FAIL]'} metrics.json[{field}] has auc+cfar")
             if not ok:
@@ -754,10 +722,10 @@ def main():
                 dry_run=args.dry_run,
             )
             all_metrics[key][f'n{n_budget}'] = {
-                tm: m.get(tm, {}) for tm in ('additive', 'replacement')
+                tm: m.get(tm, {}) for tm in ('additive',)
             }
             # Also store cfar + dr separately for aggregated figures
-            for tm in ('additive', 'replacement'):
+            for tm in ('additive',):
                 if tm in m:
                     all_metrics[key][f'n{n_budget}'][f'dr_{tm}'] = m[tm].get('dr', {})
                     all_metrics[key][f'n{n_budget}'][f'cfar_{tm}'] = m[tm].get('cfar', {})
