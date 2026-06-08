@@ -49,7 +49,7 @@ Usage:
         --results_dir /content/drive/MyDrive/final_paper/invariance_results
 """
 
-import argparse, json, os, sys, time
+import argparse, json, os, sys, time, pickle
 from datetime import datetime
 
 _EXP  = os.path.dirname(os.path.abspath(__file__))
@@ -93,6 +93,43 @@ DET_COLORS = {
     'CF-Attn-CFAR': '#1f77b4', 'CF-Attn': '#aec7e8', 'NeighborMLP': '#2ca02c',
     'DSM': '#ff7f0e', 'THANTD': '#d62728', 'AMF': '#9467bd', 'Reg-AMF': '#c5b0d5',
 }
+
+
+def _build_cfattn(cfg, D, sigma):
+    return CFAttnGaussianScoreNet(D=D, h=cfg['cfattn_h'], K=cfg['cfattn_K'],
+                                  sigma=sigma, eps=cfg.get('cfattn_eps', 1e-4))
+
+
+def _build_nmlp(cfg, D, sigma):
+    return NeighborMLPDenoiser(D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
+                               hidden=cfg['nmlp_hidden'], n_layers=cfg['nmlp_n_layers'],
+                               sigma=sigma, activation=cfg['activation'])
+
+
+def _build_dsm(cfg, D):
+    return ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'])
+
+
+def _find_ckpt(pretrained_dir, sid_idx, sid_label, n_budget, name):
+    """Locate a model checkpoint in either the run_colab (spatial) layout or the
+    invariance layout. Returns the path, or None if not found.
+
+    The two trainings share the SAME background-only objective, the SAME boxes,
+    the SAME PCA (random_state=seed) and the SAME per-scenario seed, so a
+    signature-agnostic model (cfattn/nmlp/dsm) trained by run_colab is identical
+    to one trained here and can be reused directly.
+    """
+    cands = [
+        # run_colab (spatial) layout
+        os.path.join(pretrained_dir, f'scenario_{sid_idx}', f'n{n_budget}',
+                     'models', f'{name}_s{sid_idx}_n{n_budget}.pt'),
+        # invariance layout (saved by this script)
+        os.path.join(pretrained_dir, f'scenario_{sid_label}', 'models', f'{name}.pt'),
+    ]
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    return None
 
 
 def find_homogeneous_boxes(gt, bg_class, box_h=26, box_w=26,
@@ -210,11 +247,13 @@ def build_signatures(pca, gt, data_norm, class_means, test_box, dom_cls, rng):
 
 
 def run_scenario(sid, sid_idx, scenario, cfg, pca, pca_img, data_norm, gt,
-                 class_means, sigma, results_dir, run_thantd, device, dry_run):
+                 class_means, sigma, results_dir, run_thantd, device, dry_run,
+                 pretrained_dir=None):
     train_box = scenario['train_box']
     test_box  = scenario['test_box']
     scen_dir  = os.path.join(results_dir, f'scenario_{sid}')
-    os.makedirs(scen_dir, exist_ok=True)
+    mdl_dir   = os.path.join(scen_dir, 'models')
+    os.makedirs(mdl_dir, exist_ok=True)
 
     print(f"\n{'='*60}\nScenario {sid}  device={device}", flush=True)
     # Same per-scenario seed convention as run_colab (cfg.seed + idx*100) so the
@@ -255,22 +294,52 @@ def run_scenario(sid, sid_idx, scenario, cfg, pca, pca_img, data_norm, gt,
           f"A={info['resid_A']:.3f}  B={info['resid_B']:.3f}  "
           f"C={info['resid_C']:.3f}", flush=True)
 
-    # ---- train signature-AGNOSTIC models ONCE (background only) ----
-    print("  [CF-Attn] training ...", flush=True); t0 = time.time()
-    cfattn = _train_cfattn(D, sigma, tr_pca, tr_nbr, cfg, device, seed)
-    print(f"    done {time.time()-t0:.0f}s", flush=True)
-    print("  [NeighborMLP] training ...", flush=True); t0 = time.time()
-    nmlp = _train_nmlp(D, sigma, tr_pca, tr_nbr, cfg, device)
-    print(f"    done {time.time()-t0:.0f}s", flush=True)
+    n_budget = cfg['box_size_ablation'][0]
 
-    # DSM with per-band standardization (same as run_colab)
+    # ---- signature-AGNOSTIC models (background only): LOAD if available, else TRAIN ----
+    # These do not depend on the planting model/amplitude, so they are reused as-is
+    # for the strong/full-pixel verification runs.
+    def _load(name, build):
+        if pretrained_dir is None:
+            return None
+        ck = _find_ckpt(pretrained_dir, sid_idx, sid, n_budget, name)
+        if ck is None:
+            return None
+        m = build().to(device)
+        m.load_state_dict(torch.load(ck, map_location=device)['state_dict'])
+        m.eval()
+        print(f"  [{name}] loaded {ck}", flush=True)
+        return m
+
+    cfattn = _load('cfattn', lambda: _build_cfattn(cfg, D, sigma))
+    if cfattn is None:
+        print("  [CF-Attn] training ...", flush=True); t0 = time.time()
+        cfattn = _train_cfattn(D, sigma, tr_pca, tr_nbr, cfg, device, seed)
+        torch.save({'state_dict': cfattn.state_dict(), 'cfg': cfg},
+                   os.path.join(mdl_dir, 'cfattn.pt'))
+        print(f"    done {time.time()-t0:.0f}s", flush=True)
+
+    nmlp = _load('nmlp', lambda: _build_nmlp(cfg, D, sigma))
+    if nmlp is None:
+        print("  [NeighborMLP] training ...", flush=True); t0 = time.time()
+        nmlp = _train_nmlp(D, sigma, tr_pca, tr_nbr, cfg, device)
+        torch.save({'state_dict': nmlp.state_dict(), 'cfg': cfg},
+                   os.path.join(mdl_dir, 'nmlp.pt'))
+        print(f"    done {time.time()-t0:.0f}s", flush=True)
+
+    # DSM with per-band standardization (same as run_colab). mu/sd are recomputed
+    # from the matched subsample (same seed+PCA => identical to the saved model's).
     dsm_mu = tr_pca.mean(0).astype(np.float32)
     dsm_sd = (tr_pca.std(0) + 1e-8).astype(np.float32)
     tr_pca_dsm = ((tr_pca - dsm_mu) / dsm_sd).astype(np.float32)
     sigma_dsm  = compute_sigma_from_data(tr_pca_dsm, cfg['dsm_sigma_rho'])
-    print("  [DSM] training ...", flush=True); t0 = time.time()
-    dsm_net = _train_dsm(D, sigma_dsm, tr_pca_dsm, cfg, device)
-    print(f"    done {time.time()-t0:.0f}s", flush=True)
+    dsm_net = _load('dsm', lambda: _build_dsm(cfg, D))
+    if dsm_net is None:
+        print("  [DSM] training ...", flush=True); t0 = time.time()
+        dsm_net = _train_dsm(D, sigma_dsm, tr_pca_dsm, cfg, device)
+        torch.save({'state_dict': dsm_net.state_dict(), 'cfg': cfg},
+                   os.path.join(mdl_dir, 'dsm.pt'))
+        print(f"    done {time.time()-t0:.0f}s", flush=True)
 
     # ---- evaluate each regime ----
     results = {'info': info, 'auc': {}, 'roc': {}}
@@ -376,6 +445,12 @@ def main():
     ap.add_argument('--amplitude', type=float, default=None,
                     help='override target amplitude θ (default = config). Use a strong '
                          'value (e.g. 1.0) to verify THANTD on strong/full-pixel targets.')
+    ap.add_argument('--pretrained_dir', default=None,
+                    help='path to a prior run (this invariance script OR run_colab) '
+                         'whose signature-agnostic models (cfattn/nmlp/dsm) + pca.pkl '
+                         'are LOADED instead of retrained. THANTD is still retrained '
+                         '(it depends on the signature). Ideal for the strong/full-pixel '
+                         'verification: reuse the already-trained models, only re-score.')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--no-thantd', action='store_true')
     args = ap.parse_args()
@@ -405,10 +480,21 @@ def main():
     H, W, _ = data_norm.shape
     flat = data_norm.reshape(-1, data_norm.shape[-1])
     gtf  = gt.ravel()
-    # Same PCA construction as run_colab (random_state = seed) so this experiment
-    # shares the IDENTICAL feature space as the main run even when run in parallel.
-    pca = PCA(n_components=cfg['latent_dim'], random_state=int(cfg['seed'])).fit(flat)
+    # PCA: if loading pretrained models, REUSE that run's pca.pkl so the feature
+    # space matches the loaded models exactly. Otherwise fit (random_state=seed,
+    # same as run_colab) so it matches the main run even when run in parallel.
+    pca = None
+    if args.pretrained_dir:
+        pkl = os.path.join(args.pretrained_dir, 'pca.pkl')
+        if os.path.exists(pkl):
+            with open(pkl, 'rb') as fh:
+                pca = pickle.load(fh)
+            print(f"Loaded PCA from {pkl}", flush=True)
+    if pca is None:
+        pca = PCA(n_components=cfg['latent_dim'], random_state=int(cfg['seed'])).fit(flat)
     pca_img = pca.transform(flat).reshape(H, W, -1)
+    with open(os.path.join(results_dir, 'pca.pkl'), 'wb') as fh:
+        pickle.dump(pca, fh)
     sigma = compute_sigma_from_data(pca.transform(flat), cfg['dsm_sigma_rho'])
     class_means = {int(c): flat[gtf == c].mean(0).astype(np.float32)
                    for c in np.unique(gtf) if c != 0}
@@ -440,7 +526,7 @@ def main():
         res = run_scenario(label, sid_idx, box, cfg, pca, pca_img, data_norm, gt,
                            class_means, sigma, results_dir,
                            run_thantd=(not args.no_thantd), device=device,
-                           dry_run=args.dry_run)
+                           dry_run=args.dry_run, pretrained_dir=args.pretrained_dir)
         all_auc[label] = res['auc']
         json.dump(all_auc, open(os.path.join(results_dir, 'all_invariance_auc.json'), 'w'),
                   indent=2)
