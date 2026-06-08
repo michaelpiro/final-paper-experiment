@@ -1,0 +1,121 @@
+[
+  {
+    "train_box": [
+      344,
+      391,
+      105,
+      177
+    ],
+    "train_stats": {
+      "unlabeled": 2457,
+      "asphalt": 76,
+      "trees": 15,
+      "bare_soil": 219,
+      "bitumen": 551,
+      "shadows": 66
+    },
+    "train_total": 3384,
+    "train_dominant": "unlabeled",
+    "test_box": [
+      316,
+      340,
+      71,
+      141
+    ],
+    "test_stats": {
+      "unlabeled": 1068,
+      "asphalt": 91,
+      "trees": 26,
+      "bitumen": 462,
+      "shadows": 33
+    },
+    "test_total": 1680,
+    "test_dominant": "unlabeled"
+  },
+  {
+    "train_box": [
+      472,
+      535,
+      4,
+      74
+    ],
+    "train_stats": {
+      "unlabeled": 3569,
+      "meadows": 567,
+      "gravel": 34,
+      "bricks": 174,
+      "shadows": 66
+    },
+    "train_total": 4410,
+    "train_dominant": "unlabeled",
+    "test_box": [
+      423,
+      518,
+      81,
+      110
+    ],
+    "test_stats": {
+      "unlabeled": 2283,
+      "gravel": 39,
+      "trees": 64,
+      "bricks": 296,
+      "shadows": 73
+    },
+    "test_total": 2755,
+    "test_dominant": "unlabeled"
+  },
+  {
+    "train_box": [
+      47,
+      114,
+      81,
+      139
+    ],
+    "train_stats": {
+      "unlabeled": 2945,
+      "asphalt": 260,
+      "meadows": 622,
+      "trees": 59
+    },
+    "train_total": 3886,
+    "train_dominant": "unlabeled",
+    "test_box": [
+      121,
+      141,
+      79,
+      156
+    ],
+    "test_stats": {
+      "unlabeled": 1516,
+      "trees": 24
+    },
+    "test_total": 1540,
+    "test_dominant": "unlabeled"
+  },
+  {
+    "train_box": [
+      155,
+      217,
+      222,
+      302
+    ],
+    "train_stats": {
+      "unlabeled": 4927,
+      "trees": 33
+    },
+    "train_total": 4960,
+    "train_dominant": "unlabeled",
+    "test_box": [
+      232,
+      260,
+      230,
+      290
+    ],
+    "test_stats": {
+      "unlabeled": 1668,
+      "trees": 12
+    },
+    "test_total": 1680,
+    "test_dominant": "unlabeled"
+  }
+]

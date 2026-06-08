@@ -4,6 +4,46 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+def _robust_svd_np(A: np.ndarray):
+    """
+    SVD with fallback chain for ill-conditioned matrices.
+
+    Primary attempt uses the original matrix unchanged (no ridge) so that
+    normal runs are completely unaffected.  The fallback chain only activates
+    when np.linalg.svd (LAPACK gesdd) fails to converge.
+
+      1. np.linalg.svd(A)              — unchanged, fast (gesdd)
+      2. scipy gesvd(A)                — slower but more robust
+      3. scipy gesvd(A + 1e-6 I)       — light ridge + robust driver
+      4. scipy gesvd(A + 1e-3 I)       — heavier ridge as last resort
+
+    A matrix with NaN/Inf is handled before any SVD attempt.
+    """
+    if not np.all(np.isfinite(A)):
+        # NaN/Inf in covariance (exploding gradients, untrained model).
+        # Return trivial decomposition → pseudo-inverse = 0 → scores = 0 → AUC≈0.5.
+        n = A.shape[0]
+        return np.eye(n), np.zeros(n), np.eye(n)
+    try:
+        return np.linalg.svd(A)                         # 1. unchanged primary
+    except np.linalg.LinAlgError:
+        pass
+    try:
+        from scipy.linalg import svd as scipy_svd
+        return scipy_svd(A, full_matrices=True, lapack_driver='gesvd')   # 2.
+    except Exception:
+        pass
+    try:
+        from scipy.linalg import svd as scipy_svd
+        return scipy_svd(A + 1e-6 * np.eye(A.shape[0]),                 # 3.
+                         full_matrices=True, lapack_driver='gesvd')
+    except Exception:
+        pass
+    from scipy.linalg import svd as scipy_svd
+    return scipy_svd(A + 1e-3 * np.eye(A.shape[0]),                     # 4.
+                     full_matrices=True, lapack_driver='gesvd')
+
+
 class MixtureOfLinears(nn.Module):
     """
     Lightweight score model: mixture of K linear experts with a small gating network.
@@ -363,7 +403,8 @@ def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
         mu_psi   = psi_0.mean(dim=0)
         centered = psi_0 - mu_psi
         Sigma    = (centered.T @ centered) / max(n - 1, 1)
-        # Truncated pseudo-inverse (Zschetzsche et al. lfi_diag_autocorr)
+        # Truncated pseudo-inverse (Zschetzsche et al. lfi_diag_autocorr).
+        # torch.linalg.svd is robust; no ridge added so training is unaffected.
         U, S, Vh  = torch.linalg.svd(Sigma)
         cutoff    = sigma_cutoff * S[0]
         S_inv     = torch.where(S > cutoff, 1.0 / S, torch.zeros_like(S))
@@ -450,12 +491,17 @@ def compute_lfi_detector_scores_mode2(model: ScoreNet, train_data: np.ndarray,
 
     psi_tr = model(X_tr).numpy()                     # (n, d_out)
     d_out  = psi_tr.shape[1]
+    if not np.all(np.isfinite(psi_tr)):
+        # Model outputs contain NaN/Inf (exploding gradients, untrained model).
+        # Return zeros — AUC will be 0.5, flagging the run as degenerate.
+        return np.zeros(len(test_data), dtype=np.float32)
     mu     = psi_tr.mean(axis=0)
     centered = psi_tr - mu
     n = len(train_data)
     Sigma     = centered.T @ centered / max(n - 1, 1)
     # Truncated pseudo-inverse (matches lfi_loss_mode2 and original LRao code).
-    U, S, Vh  = np.linalg.svd(Sigma)
+    # _robust_svd_np tries the original matrix first; only adds ridge if gesdd fails.
+    U, S, Vh  = _robust_svd_np(Sigma)
     cutoff    = sigma_cutoff * S[0]
     S_inv     = np.where(S > cutoff, 1.0 / S, 0.0)
     Sigma_inv = Vh.T @ np.diag(S_inv) @ U.T
@@ -647,5 +693,7 @@ def select_sigma_loo(data: np.ndarray, sigma_grid: list) -> tuple:
 def compute_scores(model: ScoreNet, data: np.ndarray) -> np.ndarray:
     """Evaluate learned score ψ̂(w) on a numpy array. Returns (n, d) numpy array."""
     model.eval()
-    X = torch.tensor(data, dtype=torch.float32)
-    return model(X).numpy()
+    device = next(model.parameters()).device
+    X = torch.tensor(data, dtype=torch.float32).to(device)
+    with torch.no_grad():
+        return model(X).cpu().numpy()

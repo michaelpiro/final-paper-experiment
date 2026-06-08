@@ -1,0 +1,75 @@
+# colab.yaml — Config for the Colab spatial experiment runner
+# Run:  python -u run_colab.py --config colab.yaml --results_dir /drive/MyDrive/spatial_results
+
+dataset:     data/pavia-u.mat
+norm_mode:   global_max
+manual_boxes_path: experiments/spatial/manual_boxes.json
+
+# Target signature: s = sig_dom_weight * dominant_class_mean + sig_mean_weight * patch_mean
+sig_dom_weight:  0.8
+sig_mean_weight: 0.2
+
+# Random scenario seeds (one per random scenario)
+random_scenario_seeds: [42, 123, 456, 789]
+min_pixels: 2000
+
+# Box-size ablation: try these minimum box sizes (training pixels subsampled to each)
+box_size_ablation: [2000, 4000, 8000]
+
+# Target planting
+amplitude:        0.15
+target_fraction:  0.10
+
+# PCA
+latent_dim: 20
+k: 5                  # spatial neighborhood window size (k×k - 1 neighbors)
+
+# ------- CF-Attn -------
+cfattn_h:      64
+cfattn_K:      9
+cfattn_eps:    1.0e-4
+cfattn_epochs: 300
+cfattn_lr:     3.0e-4
+lam_ent:       0.05
+lam_div:       0.05
+lam_cov:       1.0e-5
+
+# ------- NeighborMLP -------
+nmlp_d_lat:    32
+nmlp_K:        8
+nmlp_hidden:   128
+nmlp_n_layers: 3
+nmlp_epochs:   300
+nmlp_lr:       3.0e-4
+nmlp_batch:    256
+
+# ------- THANTD -------
+thantd_m:               7
+thantd_d:               64
+thantd_heads:           4
+thantd_epochs:          300
+thantd_batch:           64
+thantd_lr:              1.0e-4
+thantd_margin:          0.3
+thantd_lambda:          0.5
+thantd_alpha:           0.5
+thantd_n_pairs:         2048
+thantd_use_secondary:   true   # HONEST: train on clean secondary, not CEM pseudo-targets
+
+# ------- DSM (global baseline) -------
+dsm_hidden:    [64, 64]
+dsm_epochs:    1000
+dsm_lr:        5.0e-4
+
+# ------- Shared -------
+activation:    silu
+dsm_sigma_rho: 0.01
+batch_size:    256
+weight_decay:  1.0e-4
+seed:          42
+
+# ------- GMM baselines -------
+gmm_K:     3     # number of GMM components for GMM-GLRT
+gmm_steps: 50    # grid-search steps for fill factor p
+
+results_dir:   final_paper_experiments/results

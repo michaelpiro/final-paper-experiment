@@ -215,14 +215,15 @@ def score_cfattn_additive(model: CFAttnGaussianScoreNet,
     sqrt(s^T C_psi s), where C_psi = cov of score vectors on training set.
     """
     model.eval()
+    device = next(model.parameters()).device
     with torch.no_grad():
         def _scores(pix, nbr):
             out = []
             for i in range(0, len(pix), batch_size):
-                p = torch.tensor(pix[i:i+batch_size], dtype=torch.float32)
-                n = torch.tensor(nbr[i:i+batch_size], dtype=torch.float32)
+                p = torch.tensor(pix[i:i+batch_size], dtype=torch.float32).to(device)
+                n = torch.tensor(nbr[i:i+batch_size], dtype=torch.float32).to(device)
                 si, _ = model(p, n)
-                out.append(si.numpy())
+                out.append(si.cpu().numpy())
             return np.concatenate(out, axis=0)
 
         z_train = _scores(train_pix, train_nbr)    # (N_tr, D)
@@ -247,14 +248,15 @@ def score_cfattn_replacement(model: CFAttnGaussianScoreNet,
     Replacement model score: T_i = psi(y)^T (y - s), normalized.
     """
     model.eval()
+    device = next(model.parameters()).device
     with torch.no_grad():
         def _scores(pix, nbr):
             out = []
             for i in range(0, len(pix), batch_size):
-                p = torch.tensor(pix[i:i+batch_size], dtype=torch.float32)
-                n = torch.tensor(nbr[i:i+batch_size], dtype=torch.float32)
+                p = torch.tensor(pix[i:i+batch_size], dtype=torch.float32).to(device)
+                n = torch.tensor(nbr[i:i+batch_size], dtype=torch.float32).to(device)
                 si, _ = model(p, n)
-                out.append(si.numpy())
+                out.append(si.cpu().numpy())
             return np.concatenate(out, axis=0)
 
         psi_train = _scores(train_pix, train_nbr)
@@ -265,3 +267,109 @@ def score_cfattn_replacement(model: CFAttnGaussianScoreNet,
     r_bar, r_std = r_train.mean(), r_train.std() + 1e-12
     r_test  = ((psi_test  - psi_bar) * (test_pix  - s)).sum(axis=1)
     return (r_test - r_bar) / r_std
+
+
+# ---------------------------------------------------------------------------
+# Local Fisher (CFAR) normalization — T̂_head  (Eq. 65 in paper)
+# ---------------------------------------------------------------------------
+
+def _cfattn_cfar_forward(model: CFAttnGaussianScoreNet,
+                          y: np.ndarray,
+                          nbr: np.ndarray,
+                          s: np.ndarray,
+                          batch_size: int = 512) -> np.ndarray:
+    """
+    Compute T̂_head_i = s^T Â_i (μ̂_i − y_i) / sqrt(s^T Â_i s + ε)
+    where Â_i = (Σ̂_i + (σ²+ε)I)^{-1}.
+
+    No global training statistics needed — normalization is local (per-pixel).
+    This is the CFAR variant that should give a flat FPR across all background
+    classes under the local Gaussian assumption.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    s_t = torch.tensor(s, dtype=torch.float32).to(device)
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(y), batch_size):
+            y_b   = torch.tensor(y[i:i+batch_size],   dtype=torch.float32).to(device)
+            nbr_b = torch.tensor(nbr[i:i+batch_size], dtype=torch.float32).to(device)
+            B, D  = y_b.shape
+
+            # Re-run the forward pass to get mu_i and A_Sigma
+            # (same computation as model.forward, but we need the matrices)
+            M_      = nbr_b.shape[1]
+            z_nbr   = model.phi(nbr_b.reshape(B * M_, D)).reshape(B, M_, model.h)
+            mean_p  = z_nbr.mean(1)
+            var_p   = z_nbr.var(1, unbiased=False).clamp(min=0)
+            q       = model.query_net(torch.cat([mean_p, var_p], -1))
+            nbr_keys  = model.key_net(z_nbr)
+            comp_keys = model.comp_key.unsqueeze(0).expand(B, -1, -1)
+            all_keys  = torch.cat([nbr_keys, comp_keys], dim=1)
+            logits  = (q.unsqueeze(1) * all_keys).sum(-1) * (model.h ** -0.5)
+            temp    = torch.sigmoid(model.temp_head(q)) + 0.05
+            w       = torch.softmax(logits / temp, dim=-1)
+
+            comp_mu  = model.comp_mu.unsqueeze(0).expand(B, -1, -1)
+            cand_mu  = torch.cat([nbr_b, comp_mu], dim=1)
+            comp_cov = model._comp_cov().unsqueeze(0).expand(B, -1, -1, -1)
+
+            w3 = w.unsqueeze(-1)
+            mu_i = (w3 * cand_mu).sum(1)
+
+            diff  = cand_mu - mu_i.unsqueeze(1)
+            outer = diff.unsqueeze(-1) * diff.unsqueeze(-2)
+            w4    = w.unsqueeze(-1).unsqueeze(-1)
+            Sigma_nbr  = (w4[:, :M_] * outer[:, :M_]).sum(1)
+            Sigma_comp = (w4[:, M_:] * (comp_cov + outer[:, M_:])).sum(1)
+            Sigma_i    = Sigma_nbr + Sigma_comp
+
+            reg     = (model.sigma ** 2 + model.eps) * torch.eye(D, device=y_b.device)
+            A_Sigma = Sigma_i + reg.unsqueeze(0)   # [B, D, D]
+
+            # T̂_head = s^T Â_i (μ_i − y_i) / sqrt(s^T Â_i s + ε)
+            # numerator:   A_i_s = A_Sigma^{-1} s,   dot with (mu_i - y_i)
+            # denominator: A_i_s · s
+            s_exp   = s_t.unsqueeze(0).unsqueeze(-1).expand(B, -1, 1)
+            A_i_s   = torch.linalg.solve(A_Sigma, s_exp).squeeze(-1)   # [B, D]
+
+            rhs     = (y_b - mu_i)                                      # [B, D]  (+sign: higher = target)
+            numer   = (A_i_s * rhs).sum(-1)                             # [B]
+            denom   = torch.sqrt((A_i_s * s_t.unsqueeze(0)).sum(-1)
+                                 .clamp(min=model.eps))                  # [B]
+            t_head  = numer / denom                                      # [B]
+            out.append(t_head.cpu().numpy())
+
+    return np.concatenate(out, axis=0)
+
+
+def score_cfattn_additive_cfar(model: CFAttnGaussianScoreNet,
+                                test_pix: np.ndarray,
+                                test_nbr: np.ndarray,
+                                s: np.ndarray,
+                                batch_size: int = 512) -> np.ndarray:
+    """
+    Additive model CFAR score — local Fisher normalization T̂_head (Eq. 65).
+
+    T̂_head_i = s^T Â_i (μ̂_i − y_i) / sqrt(s^T Â_i s + ε)
+
+    No global training statistics needed — normalization is local (per-pixel).
+    Theoretically CFAR under the local Gaussian model for the test pixels.
+    """
+    return _cfattn_cfar_forward(model, test_pix, test_nbr, s, batch_size)
+
+
+def score_cfattn_replacement_cfar(model: CFAttnGaussianScoreNet,
+                                   test_pix: np.ndarray,
+                                   test_nbr: np.ndarray,
+                                   s: np.ndarray,
+                                   batch_size: int = 512) -> np.ndarray:
+    """
+    Replacement model CFAR score — local Fisher normalization T̂_head (Eq. 65).
+
+    For the replacement model y = (1-θ)w + θs, the score inner product gives
+    the same T̂_head; the replacement-specific term (y-s) is captured in
+    the numerator s^T Â_i (μ̂_i - y_i) when y contains the replacement signal.
+    Use this with the replacement-planted test pixels.
+    """
+    return _cfattn_cfar_forward(model, test_pix, test_nbr, s, batch_size)

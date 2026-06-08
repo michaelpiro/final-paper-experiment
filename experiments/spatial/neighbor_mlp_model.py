@@ -124,12 +124,13 @@ def neighbor_mlp_dsm_loss(model: NeighborMLPDenoiser,
 def _batch_scores(model, pix, nbr, batch_size=512):
     """Evaluate model on (pix, nbr) in batches. Returns (N, D) numpy."""
     model.eval()
+    device = next(model.parameters()).device
     out = []
     with torch.no_grad():
         for i in range(0, len(pix), batch_size):
-            p = torch.tensor(pix[i:i + batch_size], dtype=torch.float32)
-            n = torch.tensor(nbr[i:i + batch_size], dtype=torch.float32)
-            out.append(model(p, n).numpy())
+            p = torch.tensor(pix[i:i + batch_size], dtype=torch.float32).to(device)
+            n = torch.tensor(nbr[i:i + batch_size], dtype=torch.float32).to(device)
+            out.append(model(p, n).cpu().numpy())
     return np.concatenate(out, axis=0)
 
 
