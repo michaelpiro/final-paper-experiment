@@ -209,7 +209,7 @@ def build_signatures(pca, gt, data_norm, class_means, test_box, dom_cls, rng):
     return {'A: entangled': sig_A, 'B: distinct': sig_B, 'C: synth-perp': sig_C}, info
 
 
-def run_scenario(sid, scenario, cfg, pca, pca_img, data_norm, gt,
+def run_scenario(sid, sid_idx, scenario, cfg, pca, pca_img, data_norm, gt,
                  class_means, sigma, results_dir, run_thantd, device, dry_run):
     train_box = scenario['train_box']
     test_box  = scenario['test_box']
@@ -217,7 +217,9 @@ def run_scenario(sid, scenario, cfg, pca, pca_img, data_norm, gt,
     os.makedirs(scen_dir, exist_ok=True)
 
     print(f"\n{'='*60}\nScenario {sid}  device={device}", flush=True)
-    seed = int(cfg['seed']) + (abs(hash(str(sid))) % 1000)
+    # Same per-scenario seed convention as run_colab (cfg.seed + idx*100) so the
+    # training-pixel subsample (and thus regime A) matches the main experiment.
+    seed = int(cfg['seed']) + sid_idx * 100
     rng  = np.random.default_rng(seed)
     torch.manual_seed(seed)
 
@@ -390,7 +392,9 @@ def main():
     H, W, _ = data_norm.shape
     flat = data_norm.reshape(-1, data_norm.shape[-1])
     gtf  = gt.ravel()
-    pca = PCA(n_components=cfg['latent_dim']).fit(flat)
+    # Same PCA construction as run_colab (random_state = seed) so this experiment
+    # shares the IDENTICAL feature space as the main run even when run in parallel.
+    pca = PCA(n_components=cfg['latent_dim'], random_state=int(cfg['seed'])).fit(flat)
     pca_img = pca.transform(flat).reshape(H, W, -1)
     sigma = compute_sigma_from_data(pca.transform(flat), cfg['dsm_sigma_rho'])
     class_means = {int(c): flat[gtf == c].mean(0).astype(np.float32)
@@ -417,10 +421,10 @@ def main():
     print(f"Scenarios: {[s[0] for s in scenarios]}", flush=True)
 
     all_auc = {}
-    for sid, (label, box) in enumerate(scenarios):
+    for sid_idx, (label, box) in enumerate(scenarios):
         print(f"\n### {label}  train={box['train_box']} test={box['test_box']}",
               flush=True)
-        res = run_scenario(label, box, cfg, pca, pca_img, data_norm, gt,
+        res = run_scenario(label, sid_idx, box, cfg, pca, pca_img, data_norm, gt,
                            class_means, sigma, results_dir,
                            run_thantd=(not args.no_thantd), device=device,
                            dry_run=args.dry_run)
