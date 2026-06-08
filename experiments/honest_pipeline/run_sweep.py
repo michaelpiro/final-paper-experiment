@@ -43,23 +43,22 @@ from tqdm import tqdm
 from pipeline import HonestDetectionPipeline, amf_score, amf_replacement_score
 from final_paper_experiments.data_utils import compute_sigma_from_data
 from final_paper_experiments.baselines.gmm_glrt_levin import GMMGLRTLevin
-from final_paper_experiments.baselines.detectors import (
-    gmm_glrt_oracle, gmm_glrt_replacement_oracle,
-)
 from dsm_model import (ScoreNet, dsm_loss, compute_scores, lfi_loss_mode2,
                        compute_lfi_detector_scores_mode2)
 
 CLS_NAMES = {1:'asphalt',2:'meadows',3:'gravel',4:'trees',5:'metal_sheets',
              6:'bare_soil',7:'bitumen',8:'bricks',9:'shadows'}
-DET_COLORS   = {'AMF': '#1f77b4', 'DSM': '#ff7f0e', 'LRao': '#2ca02c',
+DET_COLORS   = {'AMF': '#1f77b4', 'AMF-rep': '#aec7e8',  # blue family
+                'DSM': '#ff7f0e', 'LRao': '#2ca02c',
                 'DSM-lin': '#bcbd22',           # yellow-green: linear score model
                 'G-rep-LMP': '#08306b',
                 'GMM-GLRT': '#9467bd',         # Levin product-of-GMMs oracle
                 'GMM-GLRT-G': '#e377c2'}        # simple grid-based GMM oracle
-DET_MARKERS  = {'AMF': 'o',       'DSM': 's',       'LRao': 'D',
+DET_MARKERS  = {'AMF': 'o',       'AMF-rep': 'o',   'DSM': 's',       'LRao': 'D',
                 'DSM-lin': 'x',
                 'G-rep-LMP': '^', 'GMM-GLRT': 'v', 'GMM-GLRT-G': 'P'}
-DET_LABELS   = {'AMF': 'AMF',     'DSM': 'DSM',     'LRao': 'LRao-IID',
+DET_LABELS   = {'AMF': 'AMF',     'AMF-rep': 'AMF-rep',
+                'DSM': 'DSM',     'LRao': 'LRao-IID',
                 'DSM-lin': 'DSM-linear',
                 'G-rep-LMP': 'G-rep-LMP',
                 'GMM-GLRT':   'GMM-GLRT (Levin)',
@@ -83,6 +82,22 @@ _STYLE = {
 # Low-level helpers
 # ---------------------------------------------------------------------------
 
+# Compute device — resolved in main() from cfg['device'] ('auto'|'cuda'|'cpu').
+# Module global so the train_* helpers can reference it without threading it
+# through every call (cfg itself gets yaml-dumped, so we can't stash a
+# torch.device on it).
+DEVICE = torch.device('cpu')
+
+
+def _resolve_device(cfg):
+    want = str(cfg.get('device', 'auto')).lower()
+    if want in ('cuda', 'gpu') or (want == 'auto' and torch.cuda.is_available()):
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        print("  [device] cuda requested but not available — using cpu", flush=True)
+    return torch.device('cpu')
+
+
 def auc_safe(lab, sc):
     try:    return float(roc_auc_score(lab, sc))
     except: return float('nan')
@@ -100,10 +115,11 @@ def plant(bkg, s, amp, frac, model, seed):
 
 def train_dsm(d, tr_pca, sigma, cfg, seed, label=''):
     torch.manual_seed(seed)
-    model = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation'])
+    model = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation']).to(DEVICE)
     opt   = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                               weight_decay=cfg['weight_decay'])
-    X = torch.tensor(tr_pca, dtype=torch.float32)
+    # dsm_loss moves a float sigma onto the batch device automatically.
+    X = torch.tensor(tr_pca, dtype=torch.float32).to(DEVICE)
     N, bs = len(X), min(cfg['batch_size'], len(tr_pca))
     pbar = tqdm(range(cfg['dsm_epochs']), desc=f'  DSM {label}',
                 dynamic_ncols=True, leave=False)
@@ -119,10 +135,10 @@ def train_dsm(d, tr_pca, sigma, cfg, seed, label=''):
 def train_dsm_lin(d, tr_pca, sigma, cfg, seed, label=''):
     """Linear score model (hidden_dims=[]) — analytic Gaussian-score baseline."""
     torch.manual_seed(seed)
-    model = ScoreNet(d, [], cfg['activation'])   # single Linear(d,d), no hidden
+    model = ScoreNet(d, [], cfg['activation']).to(DEVICE)   # single Linear(d,d)
     opt   = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                               weight_decay=cfg['weight_decay'])
-    X = torch.tensor(tr_pca, dtype=torch.float32)
+    X = torch.tensor(tr_pca, dtype=torch.float32).to(DEVICE)
     N, bs = len(X), min(cfg['batch_size'], len(tr_pca))
     pbar = tqdm(range(cfg['dsm_epochs']), desc=f'  DSM-lin {label}',
                 dynamic_ncols=True, leave=False)
@@ -138,13 +154,13 @@ def train_dsm_lin(d, tr_pca, sigma, cfg, seed, label=''):
 def train_lrao(d, tr_pca, cfg, seed, label=''):
     """Train LRao for a fixed number of epochs (no early stopping)."""
     torch.manual_seed(seed)
-    model  = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation'])
+    model  = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation']).to(DEVICE)
     opt    = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                                weight_decay=cfg['weight_decay'])
     epochs = int(cfg.get('lrao_epochs', 3000))
     delta  = cfg.get('lfi_delta_theta', 0.01)
     cutoff = cfg.get('lfi_sigma_cutoff', 1e-3)
-    X  = torch.tensor(tr_pca, dtype=torch.float32)
+    X  = torch.tensor(tr_pca, dtype=torch.float32).to(DEVICE)
     N, bs = len(X), min(cfg['batch_size'], len(tr_pca))
     pbar = tqdm(range(epochs), desc=f'  LRao {label}',
                 dynamic_ncols=True, leave=False)
@@ -171,10 +187,13 @@ def _score_dsm(model, tr_pca, te_pca, s, tm):
         norm = float(np.sqrt(max(float(s @ C @ s), 1e-12)))
         return -((z_te - z_bar) @ s) / norm
     else:
+        # Paper: u_rep(y) = (ψ(y)−ψ̄)ᵀ(y−s) + d,  I_rep = E[r²] − d²
         psi_bar = z_tr.mean(0)
+        d = tr_pca.shape[1]
         r_tr = ((z_tr - psi_bar) * (tr_pca - s)).sum(1)
-        r_bar, r_std = r_tr.mean(), r_tr.std() + 1e-12
-        return (((z_te - psi_bar) * (te_pca - s)).sum(1) - r_bar) / r_std
+        I_rep = max(float((r_tr**2).mean()) - d**2, 1e-12)
+        r_te  = ((z_te - psi_bar) * (te_pca  - s)).sum(1)
+        return (r_te + d) / np.sqrt(I_rep)
 
 
 def _score_lrao(model, tr_pca, te_pca, s, cfg):
@@ -194,11 +213,67 @@ def _score_lrao(model, tr_pca, te_pca, s, cfg):
 
 
 # ---------------------------------------------------------------------------
+# Target-model selection + resumable (load-or-train) helpers
+# ---------------------------------------------------------------------------
+
+def _target_models(cfg):
+    """Target models to evaluate. Default both (back-compat); set
+    `target_models: [additive]` in the config for additive-only (~half compute)."""
+    tms = cfg.get('target_models', ['additive', 'replacement'])
+    if isinstance(tms, str):
+        tms = [x.strip() for x in tms.split(',')]
+    return [str(t) for t in tms]
+
+
+def _load_or_train_pipeline(path, d, cfg, bkg_tr, skip_pca):
+    """Resumable: reuse a saved fitted pipeline if present, else fit + save."""
+    import pickle
+    if path and os.path.exists(path):
+        with open(path, 'rb') as fh:
+            return pickle.load(fh)
+    p = HonestDetectionPipeline(latent_dim=d, norm=cfg['score_norm'],
+                                skip_pca=skip_pca)
+    p.fit(bkg_tr)
+    if path:
+        with open(path, 'wb') as fh:
+            pickle.dump(p, fh)
+    return p
+
+
+def _load_or_train_lrao(path, d, tr_pca, cfg, seed, label, meta=None):
+    """Resumable: reuse a saved LRao checkpoint if present, else train + save."""
+    if path and os.path.exists(path):
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        m = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation'])
+        m.load_state_dict(ckpt['state_dict']); m.eval(); m.to(DEVICE)
+        return m
+    m = train_lrao(d, tr_pca, cfg, seed, label=label)
+    if path:
+        torch.save({'state_dict': m.state_dict(), 'cfg': cfg, 'd': d,
+                    'seed': seed, **(meta or {})}, path)
+    return m
+
+
+def _load_or_train_dsm(path, d, tr_pca, sigma, cfg, seed, label, meta=None):
+    """Resumable: reuse a saved DSM checkpoint if present, else train + save."""
+    if path and os.path.exists(path):
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        m = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation'])
+        m.load_state_dict(ckpt['state_dict']); m.eval(); m.to(DEVICE)
+        return m
+    m = train_dsm(d, tr_pca, sigma, cfg, seed, label=label)
+    if path:
+        torch.save({'state_dict': m.state_dict(), 'cfg': cfg, 'd': d,
+                    'sigma': sigma, 'seed': seed, **(meta or {})}, path)
+    return m
+
+
+# ---------------------------------------------------------------------------
 # One-seed sweep — returns nested dict of AUC values
 # ---------------------------------------------------------------------------
 
 def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
-                 models_dir=None):
+                 models_dir=None, bkg_labels=None):
     """Run the full (n, d, rho) sweep for one seed.
 
     Parameters
@@ -222,6 +297,19 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
     bkg_tr = bkg_all[idx[:n_max]]
     bkg_te = bkg_all[idx[n_max:n_max + n_test]]
 
+    # Per-class pixel counts in train / test split
+    if bkg_labels is not None:
+        tr_labels = bkg_labels[idx[:n_max]]
+        te_labels = bkg_labels[idx[n_max:n_max + n_test]]
+        unique_cls = sorted(np.unique(bkg_labels))
+        print(f"  Per-class pixel counts  (train={n_max}  test={n_test}):", flush=True)
+        for cls_id in unique_cls:
+            n_tr = int((tr_labels == cls_id).sum())
+            n_te = int((te_labels == cls_id).sum())
+            name = CLS_NAMES.get(int(cls_id), f'cls{cls_id}')
+            print(f"    cls {cls_id:2d} ({name:<16s}):  train={n_tr:5d}  test={n_te:5d}",
+                  flush=True)
+
     # Create per-seed model directory
     seed_mdl = None
     if models_dir is not None:
@@ -235,22 +323,24 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
           f"{n_dsm_total} DSM ({len(rho_list)} rho × {len(d_list)} d × {len(n_list)} n)",
           flush=True)
 
+    # --- target models to evaluate (additive-only if configured) ---
+    tms = _target_models(cfg)
+
     # --- AMF: global_max, full 103-D (amplitude loop handled after DSM) ---
     print(f"  [AMF] setup ...", flush=True)
     gm = float(bkg_tr.max() + 1e-12)
     t_gm = t_raw / gm
-    amf_auc = {'additive': {}, 'replacement': {}}
+    amf_auc = {tm: {} for tm in tms}
 
-    # --- fit pipelines once per d ---
-    print(f"  [PCA] fitting {len(d_list)} pipelines ...", flush=True)
+    # --- fit pipelines once per d (resumable) ---
+    skip_pca = bool(cfg.get('skip_pca', False))
+    print(f"  [PCA] fitting {len(d_list)} pipelines "
+          f"{'(skip_pca=True — using full normalized space)' if skip_pca else ''} ...",
+          flush=True)
     pipes = {}
     for d in d_list:
-        p = HonestDetectionPipeline(latent_dim=d, norm=cfg['score_norm'])
-        p.fit(bkg_tr); pipes[d] = p
-        if seed_mdl:
-            import pickle
-            with open(os.path.join(seed_mdl, f'pipeline_d{d}.pkl'), 'wb') as fh:
-                pickle.dump(p, fh)
+        pp = os.path.join(seed_mdl, f'pipeline_d{d}.pkl') if seed_mdl else None
+        pipes[d] = _load_or_train_pipeline(pp, d, cfg, bkg_tr, skip_pca)
 
     rho_d_map = {d: pipes[d].rho_d(t_raw) for d in d_list}
     print(f"  rho_d: { {d: f'{rho_d_map[d]:.3f}' for d in d_list} }", flush=True)
@@ -266,8 +356,8 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
     t_lrao_start = time.time()
     for d in d_list:
         pipe  = pipes[d]; lrao_auc[d] = {}
-        s_add = pipe.signature_additive(t_raw)
-        s_rep = pipe.signature_replacement(t_raw)
+        sigs  = {'additive': pipe.signature_additive(t_raw),
+                 'replacement': pipe.signature_replacement(t_raw)}
         bkg_te_pca = pipe.project(bkg_te)
         for n in n_list:
             lrao_count += 1
@@ -275,15 +365,13 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
             print(f"  [LRao {lrao_count}/{n_lrao_total}] d={d} n={n} ...",
                   end='', flush=True)
             tr_pca = pipe.project(bkg_tr[:n])
-            lrao_m = train_lrao(d, tr_pca, cfg, seed, label=f'd={d} n={n}')
+            lp = os.path.join(seed_mdl, f'lrao_d{d}_n{n}.pt') if seed_mdl else None
+            lrao_m = _load_or_train_lrao(lp, d, tr_pca, cfg, seed,
+                                         label=f'd={d} n={n}', meta={'n': n})
             lrao_models[(d, n)] = lrao_m
-            if seed_mdl:
-                torch.save({'state_dict': lrao_m.state_dict(),
-                            'cfg': cfg, 'd': d, 'n': n, 'seed': seed},
-                           os.path.join(seed_mdl, f'lrao_d{d}_n{n}.pt'))
             lrao_auc[d][n] = {}
-            for tm in ('additive', 'replacement'):
-                sig = s_add if tm == 'additive' else s_rep
+            for tm in tms:
+                sig = sigs[tm]
                 lrao_auc[d][n][tm] = {}
                 for amp in amp_list:
                     te, lab = plant(bkg_te_pca, sig, amp,
@@ -291,9 +379,8 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
                     lrao_auc[d][n][tm][amp] = auc_safe(
                         lab, _score_lrao(lrao_m, tr_pca, te, sig, cfg))
             ref_amp = amp_list[len(amp_list)//2]
-            print(f" add={lrao_auc[d][n]['additive'][ref_amp]:.3f} "
-                  f"rep={lrao_auc[d][n]['replacement'][ref_amp]:.3f}  ({time.time()-t0:.0f}s)",
-                  flush=True)
+            summ = " ".join(f"{tm[:3]}={lrao_auc[d][n][tm][ref_amp]:.3f}" for tm in tms)
+            print(f" {summ}  ({time.time()-t0:.0f}s)", flush=True)
     print(f"  [LRao] done in {time.time()-t_lrao_start:.0f}s", flush=True)
 
     # --- DSM + DSM-lin: per (rho, d, n); evaluate at all amplitudes ---
@@ -307,10 +394,10 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
         dsm_auc[rho] = {}; dsm_lin_auc[rho] = {}
         for d in d_list:
             pipe  = pipes[d]
-            dsm_auc[rho][d]     = {'additive': {}, 'replacement': {}}
-            dsm_lin_auc[rho][d] = {'additive': {}, 'replacement': {}}
-            s_add = pipe.signature_additive(t_raw)
-            s_rep = pipe.signature_replacement(t_raw)
+            dsm_auc[rho][d]     = {tm: {} for tm in tms}
+            dsm_lin_auc[rho][d] = {tm: {} for tm in tms}
+            sigs = {'additive': pipe.signature_additive(t_raw),
+                    'replacement': pipe.signature_replacement(t_raw)}
             bkg_te_pca = pipe.project(bkg_te)
             for n in n_list:
                 dsm_count += 1
@@ -319,40 +406,30 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
                       end='', flush=True)
                 tr_pca = pipe.project(bkg_tr[:n])
                 sigma  = compute_sigma_from_data(tr_pca, rho)
-                dsm_m     = train_dsm(d, tr_pca, sigma, cfg, seed,
-                                      label=f'rho={rho} d={d} n={n}')
-                dsm_lin_m = train_dsm_lin(d, tr_pca, sigma, cfg, seed,
-                                          label=f'rho={rho} d={d} n={n}')
-                if seed_mdl:
-                    rho_str = str(rho).replace('.', 'p')
-                    torch.save({'state_dict': dsm_m.state_dict(),
-                                'cfg': cfg, 'd': d, 'n': n,
-                                'rho': rho, 'sigma': sigma, 'seed': seed},
-                               os.path.join(seed_mdl,
-                                            f'dsm_rho{rho_str}_d{d}_n{n}.pt'))
-                for tm in ('additive', 'replacement'):
-                    sig = s_add if tm == 'additive' else s_rep
+                rho_str = str(rho).replace('.', 'p')
+                dp = (os.path.join(seed_mdl, f'dsm_rho{rho_str}_d{d}_n{n}.pt')
+                      if seed_mdl else None)
+                dsm_m = _load_or_train_dsm(dp, d, tr_pca, sigma, cfg, seed,
+                                           label=f'rho={rho} d={d} n={n}',
+                                           meta={'n': n, 'rho': rho})
+                for tm in tms:
+                    sig = sigs[tm]
                     dsm_auc[rho][d][tm][n] = {}
-                    dsm_lin_auc[rho][d][tm][n] = {}
                     for amp in amp_list:
                         te, lab = plant(bkg_te_pca, sig, amp,
                                         cfg['target_fraction'], tm, seed)
                         dsm_auc[rho][d][tm][n][amp] = auc_safe(
                             lab, _score_dsm(dsm_m, tr_pca, te, sig, tm))
-                        dsm_lin_auc[rho][d][tm][n][amp] = auc_safe(
-                            lab, _score_dsm(dsm_lin_m, tr_pca, te, sig, tm))
-                print(f" add={dsm_auc[rho][d]['additive'][n][amp_list[0]]:.3f}"
-                      f"(lin={dsm_lin_auc[rho][d]['additive'][n][amp_list[0]]:.3f}) "
-                      f"rep={dsm_auc[rho][d]['replacement'][n][amp_list[0]]:.3f}"
-                      f"(lin={dsm_lin_auc[rho][d]['replacement'][n][amp_list[0]]:.3f})"
-                      f"  ({time.time()-t0:.0f}s)", flush=True)
+                summ = " ".join(
+                    f"{tm[:3]}={dsm_auc[rho][d][tm][n][amp_list[0]]:.3f}" for tm in tms)
+                print(f" {summ}  ({time.time()-t0:.0f}s)", flush=True)
     print(f"  [DSM+DSM-lin] done in {time.time()-t_dsm_start:.0f}s", flush=True)
 
     # --- AMF: evaluate at all amplitudes ---
     print(f"\n  [AMF] {len(n_list)} n-values × {len(amp_list)} amplitudes ...", flush=True)
     for n in n_list:
         tr_gm = bkg_tr[:n] / gm
-        for tm in ('additive', 'replacement'):
+        for tm in tms:
             amf_auc[tm][n] = {}
             for amp in amp_list:
                 te, lab = plant(bkg_te / gm, t_gm, amp,
@@ -369,7 +446,16 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
     # MULTICLASS-ONLY by default: a GMM background is motivated by multimodal
     # clutter; for a single near-Gaussian class it is unnecessary. Override
     # with `run_gmm_glrt: true/false` in the config.
-    is_multi = cfg.get('bkg_cls') is None
+    # is_multi: null (all non-target) OR an explicit list of >1 classes
+    _bkc = cfg.get('bkg_cls')
+    if _bkc is None:
+        is_multi = True
+    elif isinstance(_bkc, str):
+        is_multi = len(_bkc.split(',')) > 1
+    elif hasattr(_bkc, '__iter__'):
+        is_multi = len(list(_bkc)) > 1
+    else:
+        is_multi = False
     gmm_auc = {'additive': {}, 'replacement': {}}
     if cfg.get('run_gmm_glrt', is_multi):
         print(f"\n  [GMM-GLRT] {len(n_list)} n-values × {len(amp_list)} amplitudes ...",
@@ -381,7 +467,7 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
                 max_dim=cfg.get('gmm_max_dim', 5),
                 k_max=cfg.get('gmm_k_max', 5),
                 seed=seed).fit(bkg_tr[:n] / gm)
-            for tm in ('additive', 'replacement'):
+            for tm in tms:
                 gmm_auc[tm][n] = {}
                 for amp in amp_list:
                     te, lab = plant(bkg_te / gm, t_gm, amp,
@@ -390,36 +476,37 @@ def run_one_seed(seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
                                    p_steps=cfg.get('gmm_p_steps', 50),
                                    p_max=cfg.get('gmm_p_max', 1.0))
                     gmm_auc[tm][n][amp] = auc_safe(lab, sc)
-            print(f"  [GMM-GLRT] n={n}  add={gmm_auc['additive'][n][ref_amp]:.3f} "
-                  f"rep={gmm_auc['replacement'][n][ref_amp]:.3f}  "
-                  f"({time.time()-t0:.0f}s)", flush=True)
+            summ = " ".join(f"{tm[:3]}={gmm_auc[tm][n][ref_amp]:.3f}" for tm in tms)
+            print(f"  [GMM-GLRT] n={n}  {summ}  ({time.time()-t0:.0f}s)", flush=True)
 
-    # --- GMM-GLRT-G (simple K-Gaussian mixture, oracle θ) — multiclass only ---
-    # Same family as gmm_glrt() but with KNOWN amplitude (no grid search).
-    # Lower-capacity than Levin's product-of-GMMs; serves as a fair-to-Gaussian
-    # GMM oracle that uses the same K-component mixture as our older baseline.
+    # --- GMM-GLRT-G (oracle reference) — multiclass only ---
+    # GENUINE upper bound on GMM-Levin: the SAME fitted Levin product-GMM
+    # density is used, but the true fill factor (amplitude) is plugged in
+    # instead of being grid-searched (oracle_p=amp). Because the density model
+    # is identical to the honest GMM-Levin, this can only match or exceed it —
+    # a valid clairvoyant upper bound. Must be reported AS AN ORACLE, never as
+    # a fair baseline. (Previously used a weaker single K-Gaussian mixture,
+    # which made it apples-to-oranges and even fall below the honest curve.)
     gmm_g_auc = {'additive': {}, 'replacement': {}}
     if cfg.get('run_gmm_glrt_g', is_multi):
-        K_g = cfg.get('gmm_g_K', 3)
-        print(f"\n  [GMM-GLRT-G] K={K_g}  {len(n_list)} n × {len(amp_list)} amp ...",
+        print(f"\n  [GMM-GLRT-G oracle] {len(n_list)} n × {len(amp_list)} amp ...",
               flush=True)
         for n in n_list:
             t0 = time.time()
-            tr_gm = bkg_tr[:n] / gm
-            for tm in ('additive', 'replacement'):
+            det_o = GMMGLRTLevin(
+                cond_tol=cfg.get('gmm_cond_tol', 1e3),
+                max_dim=cfg.get('gmm_max_dim', 5),
+                k_max=cfg.get('gmm_k_max', 5),
+                seed=seed).fit(bkg_tr[:n] / gm)
+            for tm in tms:
                 gmm_g_auc[tm][n] = {}
                 for amp in amp_list:
                     te, lab = plant(bkg_te / gm, t_gm, amp,
                                     cfg['target_fraction'], tm, seed)
-                    if tm == 'additive':
-                        sc = gmm_glrt_oracle(te, tr_gm, t_gm, theta=amp, K=K_g)
-                    else:
-                        sc = gmm_glrt_replacement_oracle(te, tr_gm, t_gm,
-                                                         theta=amp, K=K_g)
+                    sc = det_o.score(te, t_gm, model=tm, oracle_p=amp)
                     gmm_g_auc[tm][n][amp] = auc_safe(lab, sc)
-            print(f"  [GMM-GLRT-G] n={n}  add={gmm_g_auc['additive'][n][ref_amp]:.3f} "
-                  f"rep={gmm_g_auc['replacement'][n][ref_amp]:.3f}  "
-                  f"({time.time()-t0:.0f}s)", flush=True)
+            summ = " ".join(f"{tm[:3]}={gmm_g_auc[tm][n][ref_amp]:.3f}" for tm in tms)
+            print(f"  [GMM-GLRT-G] n={n}  {summ}  ({time.time()-t0:.0f}s)", flush=True)
 
     return amf_auc, lrao_auc, dsm_auc, dsm_lin_auc, gmm_auc, gmm_g_auc, rho_d_map, amp_list
 
@@ -480,8 +567,11 @@ def plot_sweep(agg_amf, agg_lrao, agg_dsm, rho_d_map,
             for ci, d in enumerate(d_list):
                 ax = axes[ri, ci]; x = n_list
                 rho_d = rho_d_map[d]
-                _band(ax, x, [_get(agg_amf[tm][n], ref_amp)[0] for n in x],
-                              [_get(agg_amf[tm][n], ref_amp)[1] for n in x], 'AMF')
+                _band(ax, x, [_get(agg_amf['additive'][n], ref_amp)[0] for n in x],
+                              [_get(agg_amf['additive'][n], ref_amp)[1] for n in x], 'AMF')
+                if tm == 'replacement':
+                    _band(ax, x, [_get(agg_amf['replacement'][n], ref_amp)[0] for n in x],
+                                  [_get(agg_amf['replacement'][n], ref_amp)[1] for n in x], 'AMF-rep')
                 if agg_gmm is not None:
                     _band(ax, x, [_get(agg_gmm[tm][n], ref_amp)[0] for n in x],
                                   [_get(agg_gmm[tm][n], ref_amp)[1] for n in x], 'GMM-GLRT')
@@ -519,8 +609,12 @@ def plot_auc_vs_d(agg_amf, agg_lrao, agg_dsm, rho_d_map,
         for ci, rho in enumerate(rho_list):
             ax = axes[0, ci]
             _band(ax, d_list,
-                  [agg_amf[tm][ref_n][ref_amp][0]]*len(d_list),
-                  [agg_amf[tm][ref_n][ref_amp][1]]*len(d_list), 'AMF', logx=False)
+                  [agg_amf['additive'][ref_n][ref_amp][0]]*len(d_list),
+                  [agg_amf['additive'][ref_n][ref_amp][1]]*len(d_list), 'AMF', logx=False)
+            if tm == 'replacement':
+                _band(ax, d_list,
+                      [agg_amf['replacement'][ref_n][ref_amp][0]]*len(d_list),
+                      [agg_amf['replacement'][ref_n][ref_amp][1]]*len(d_list), 'AMF-rep', logx=False)
             if agg_gmm is not None:   # GMM-GLRT is d-independent (own PCA) → flat
                 _band(ax, d_list,
                       [agg_gmm[tm][ref_n][ref_amp][0]]*len(d_list),
@@ -573,8 +667,10 @@ def plot_auc_vs_rho(agg_amf, agg_lrao, agg_dsm, rho_d_map,
                   [agg_dsm_lin[rho][ref_d][tm][ref_n][ref_amp][1] for rho in rho_list],
                   'DSM-lin')
         # rho-independent detectors as dashed horizontal reference lines
-        refs = [('AMF', agg_amf[tm][ref_n][ref_amp]),
+        refs = [('AMF', agg_amf['additive'][ref_n][ref_amp]),
                 ('LRao', agg_lrao[ref_d][ref_n][tm][ref_amp])]
+        if tm == 'replacement':
+            refs.insert(1, ('AMF-rep', agg_amf['replacement'][ref_n][ref_amp]))
         if agg_gmm is not None:
             refs.append(('GMM-GLRT', agg_gmm[tm][ref_n][ref_amp]))
         if agg_gmmg is not None:
@@ -604,8 +700,12 @@ def plot_auc_vs_amp(agg_amf, agg_lrao, agg_dsm, rho_d_map,
     with plt.rc_context(_STYLE):
         fig, ax = plt.subplots(figsize=(5.5, 4.0))
         _band(ax, amp_list,
-              [agg_amf[tm][ref_n][amp][0] for amp in amp_list],
-              [agg_amf[tm][ref_n][amp][1] for amp in amp_list], 'AMF', logx=False)
+              [agg_amf['additive'][ref_n][amp][0] for amp in amp_list],
+              [agg_amf['additive'][ref_n][amp][1] for amp in amp_list], 'AMF', logx=False)
+        if tm == 'replacement':
+            _band(ax, amp_list,
+                  [agg_amf['replacement'][ref_n][amp][0] for amp in amp_list],
+                  [agg_amf['replacement'][ref_n][amp][1] for amp in amp_list], 'AMF-rep', logx=False)
         if agg_gmm is not None:
             _band(ax, amp_list,
                   [agg_gmm[tm][ref_n][amp][0] for amp in amp_list],
@@ -646,9 +746,22 @@ def main():
     args = p.parse_args()
     cfg = yaml.safe_load(open(args.config))
 
+    global DEVICE
+    DEVICE = _resolve_device(cfg)
+    print(f"Device: {DEVICE}", flush=True)
+
+    tms = _target_models(cfg)
     ts  = datetime.now().strftime('%Y%m%d_%H%M%S')
-    tag = 'multi' if cfg.get('bkg_cls') is None else 'single'
-    run_dir  = os.path.join(cfg['results_dir'], f'sweep_{tag}_{ts}')
+    _bkc_tag = cfg.get('bkg_cls')
+    _is_multi_tag = (_bkc_tag is None or
+                     (isinstance(_bkc_tag, str) and len(_bkc_tag.split(',')) > 1) or
+                     (hasattr(_bkc_tag, '__iter__') and len(list(_bkc_tag)) > 1))
+    tag = 'multi' if _is_multi_tag else 'single'
+    # Stable run name (resumable across Colab restarts) if `run_name` is given,
+    # else a timestamped dir (back-compat).
+    _rn = cfg.get('run_name')
+    run_dir  = os.path.join(cfg['results_dir'],
+                            _rn if _rn else f'sweep_{tag}_{ts}')
     fig_dir  = os.path.join(run_dir, 'figures')
     mdl_dir  = os.path.join(run_dir, 'models')
     os.makedirs(fig_dir, exist_ok=True)
@@ -668,17 +781,48 @@ def main():
     print(f"Image {H}x{W}x{D_raw}", flush=True)
 
     tcls = cfg['target_cls']
-    if cfg.get('bkg_cls') is not None:
-        bkg_all = flat[gt_flat == cfg['bkg_cls']]
-        bkg_desc = CLS_NAMES.get(cfg['bkg_cls'], f"cls{cfg['bkg_cls']}")
-    else:
-        bkg_all = flat[(gt_flat != 0) & (gt_flat != tcls)]
+    bkg_cls_raw = cfg.get('bkg_cls')
+
+    # bkg_cls can be:
+    #   null / ~          → all labeled non-target classes
+    #   2                 → single class
+    #   [2, 3, 5]         → explicit subset  (YAML list)
+    #   "2,3,5"           → comma-separated string (also accepted)
+    if bkg_cls_raw is None:
+        bkg_mask = (gt_flat != 0) & (gt_flat != tcls)
         bkg_desc = 'all-non-target'
-    tgt_all = flat[gt_flat == tcls]
-    t_raw   = tgt_all.mean(0).astype(np.float32)
+    else:
+        # Normalise to a Python list of ints
+        if isinstance(bkg_cls_raw, str):
+            bkg_cls_list = [int(x.strip()) for x in bkg_cls_raw.split(',')]
+        elif hasattr(bkg_cls_raw, '__iter__'):
+            bkg_cls_list = [int(x) for x in bkg_cls_raw]
+        else:
+            bkg_cls_list = [int(bkg_cls_raw)]
+
+        if len(bkg_cls_list) == 1:
+            bkg_mask = gt_flat == bkg_cls_list[0]
+            bkg_desc = CLS_NAMES.get(bkg_cls_list[0], f"cls{bkg_cls_list[0]}")
+        else:
+            bkg_mask = np.isin(gt_flat, bkg_cls_list)
+            bkg_desc = 'cls[' + ','.join(str(c) for c in bkg_cls_list) + ']'
+
+    bkg_all    = flat[bkg_mask]
+    bkg_labels = gt_flat[bkg_mask]       # class label for every background pixel
+    tgt_all    = flat[gt_flat == tcls]
+    t_raw      = tgt_all.mean(0).astype(np.float32)
     print(f"bkg={len(bkg_all)}px ({bkg_desc})  "
-          f"tgt cls {tcls}({CLS_NAMES.get(tcls,'?')})={len(tgt_all)}px REMOVED\n",
+          f"tgt cls {tcls}({CLS_NAMES.get(tcls,'?')})={len(tgt_all)}px REMOVED",
           flush=True)
+    # Print per-class breakdown of the full background pool
+    unique_bkg_cls = sorted(np.unique(bkg_labels))
+    print(f"  Background pool per-class breakdown:", flush=True)
+    for cls_id in unique_bkg_cls:
+        n_cls  = int((bkg_labels == cls_id).sum())
+        name   = CLS_NAMES.get(int(cls_id), f'cls{cls_id}')
+        print(f"    cls {cls_id:2d} ({name:<16s}): {n_cls:6d} px  "
+              f"({100.0*n_cls/len(bkg_all):.1f}%)", flush=True)
+    print(flush=True)
     print(f"Seeds: {seeds}", flush=True)
     print(f"n_train: {n_list}  d: {d_list}  rho: {rho_list}\n", flush=True)
 
@@ -699,7 +843,7 @@ def main():
         (amf_auc, lrao_auc, dsm_auc, dsm_lin_auc, gmm_auc, gmm_g_auc,
          rho_d_map, amp_list) = run_one_seed(
             seed, bkg_all, t_raw, cfg, n_list, d_list, rho_list, D_raw,
-            models_dir=mdl_dir)
+            models_dir=mdl_dir, bkg_labels=bkg_labels)
         all_amf.append(amf_auc); all_lrao.append(lrao_auc)
         all_dsm.append(dsm_auc); all_dsm_lin.append(dsm_lin_auc)
         all_gmm.append(gmm_auc)
@@ -707,7 +851,7 @@ def main():
 
         # quick summary per seed (at median amplitude)
         ref_amp = amp_list[len(amp_list)//2]
-        for tm in ('additive', 'replacement'):
+        for tm in tms:
             best_rho = rho_list[len(rho_list)//2]
             best_d   = d_list[-1]
             row = "  ".join(
@@ -733,27 +877,27 @@ def main():
     agg_amf = {tm: {n: {amp: _agg([a[tm][n][amp] for a in all_amf])
                         for amp in amp_list}
                     for n in n_list}
-               for tm in ('additive', 'replacement')}
+               for tm in tms}
 
     # LRao: {d: {n: {tm: {amp: (mean, std)}}}}
     agg_lrao = {d: {n: {tm: {amp: _agg([a[d][n][tm][amp] for a in all_lrao])
                               for amp in amp_list}
-                         for tm in ('additive', 'replacement')}
+                         for tm in tms}
                     for n in n_list} for d in d_list}
 
     # DSM: {rho: {d: {tm: {n: {amp: (mean, std)}}}}}
     agg_dsm = {rho: {d: {tm: {n: {amp: _agg([a[rho][d][tm][n][amp] for a in all_dsm])
                                    for amp in amp_list}
                                for n in n_list}
-                          for tm in ('additive', 'replacement')}
+                          for tm in tms}
                      for d in d_list} for rho in rho_list}
 
     # DSM-lin (linear score model): same shape as agg_dsm
-    agg_dsm_lin = {rho: {d: {tm: {n: {amp: _agg([a[rho][d][tm][n][amp] for a in all_dsm_lin])
-                                       for amp in amp_list}
-                                   for n in n_list}
-                              for tm in ('additive', 'replacement')}
-                         for d in d_list} for rho in rho_list}
+    # agg_dsm_lin = {rho: {d: {tm: {n: {amp: _agg([a[rho][d][tm][n][amp] for a in all_dsm_lin])
+    #                                    for amp in amp_list}
+    #                                for n in n_list}
+    #                           for tm in ('additive', 'replacement')}
+    #                      for d in d_list} for rho in rho_list}
 
     # GMM-GLRT (Levin): {tm: {n: {amp: (mean, std)}}}
     has_gmm = all_gmm and all_gmm[0].get('additive')
@@ -762,7 +906,7 @@ def main():
         agg_gmm = {tm: {n: {amp: _agg([a[tm][n][amp] for a in all_gmm])
                             for amp in amp_list}
                         for n in n_list}
-                   for tm in ('additive', 'replacement')}
+                   for tm in tms}
 
     # GMM-GLRT-G (simple K-Gauss, oracle): {tm: {n: {amp: (mean, std)}}}
     has_gmmg = all_gmmg and all_gmmg[0].get('additive')
@@ -771,21 +915,23 @@ def main():
         agg_gmmg = {tm: {n: {amp: _agg([a[tm][n][amp] for a in all_gmmg])
                               for amp in amp_list}
                          for n in n_list}
-                    for tm in ('additive', 'replacement')}
+                    for tm in tms}
 
     agg_rho_d = {d: float(np.mean([r[d] for r in all_rho_d])) for d in d_list}
 
     # ---- print final summary table ----
     ref_amp = amp_list[len(amp_list)//2]
-    for tm in ('additive', 'replacement'):
+    for tm in tms:
         print(f"\n=== {tm.upper()} (n={n_list[-1]}, d={d_list[-1]}, amp={ref_amp}) ===")
         print(f"  AMF-{D_raw}D: {agg_amf[tm][n_list[-1]][ref_amp][0]:.3f} ± {agg_amf[tm][n_list[-1]][ref_amp][1]:.3f}")
         print(f"  LRao d={d_list[-1]}: {agg_lrao[d_list[-1]][n_list[-1]][tm][ref_amp][0]:.3f} ± "
               f"{agg_lrao[d_list[-1]][n_list[-1]][tm][ref_amp][1]:.3f}")
         for rho in rho_list:
             v    = agg_dsm[rho][d_list[-1]][tm][n_list[-1]][ref_amp]
-            vlin = agg_dsm_lin[rho][d_list[-1]][tm][n_list[-1]][ref_amp]
-            print(f"  DSM rho={rho}: {v[0]:.3f} ± {v[1]:.3f}  |  DSM-lin: {vlin[0]:.3f} ± {vlin[1]:.3f}")
+            # vlin = agg_dsm_lin[rho][d_list[-1]][tm][n_list[-1]][ref_amp]
+            print(f"  DSM rho={rho}: {v[0]:.3f} ± {v[1]:.3f}  "
+                  # f"|  DSM-lin: {vlin[0]:.3f} ± {vlin[1]:.3f}"
+                  )
 
     # ---- save ----
     def _ser(v): return list(v) if isinstance(v, (tuple, list)) else v
@@ -793,38 +939,39 @@ def main():
         'n_list': n_list, 'd_list': d_list, 'rho_list': rho_list,
         'amp_list': amp_list, 'seeds': seeds,
         'target_cls': tcls, 'bkg_desc': bkg_desc, 'rho_d': agg_rho_d,
+        'target_models': tms,
         'amf':  {tm: {n: {amp: _ser(agg_amf[tm][n][amp])
                            for amp in amp_list}
                       for n in n_list}
-                 for tm in ('additive','replacement')},
+                 for tm in tms},
         'lrao': {str(d): {n: {tm: {amp: _ser(agg_lrao[d][n][tm][amp])
                                     for amp in amp_list}
-                               for tm in ('additive','replacement')}
+                               for tm in tms}
                            for n in n_list}
                  for d in d_list},
         'dsm':  {str(rho): {str(d): {tm: {n: {amp: _ser(agg_dsm[rho][d][tm][n][amp])
                                                for amp in amp_list}
                                             for n in n_list}
-                                      for tm in ('additive','replacement')}
+                                      for tm in tms}
                              for d in d_list}
                  for rho in rho_list},
-        'dsm_lin': {str(rho): {str(d): {tm: {n: {amp: _ser(agg_dsm_lin[rho][d][tm][n][amp])
-                                                   for amp in amp_list}
-                                              for n in n_list}
-                                          for tm in ('additive','replacement')}
-                               for d in d_list}
-                   for rho in rho_list},
+        # 'dsm_lin': {str(rho): {str(d): {tm: {n: {amp: _ser(agg_dsm_lin[rho][d][tm][n][amp])
+        #                                            for amp in amp_list}
+        #                                       for n in n_list}
+        #                                   for tm in ('additive','replacement')}
+        #                        for d in d_list}
+        #            for rho in rho_list},
     }
     if agg_gmm is not None:
         out['gmm'] = {tm: {n: {amp: _ser(agg_gmm[tm][n][amp])
                                 for amp in amp_list}
                            for n in n_list}
-                      for tm in ('additive','replacement')}
+                      for tm in tms}
     if agg_gmmg is not None:
         out['gmm_g'] = {tm: {n: {amp: _ser(agg_gmmg[tm][n][amp])
                                   for amp in amp_list}
                              for n in n_list}
-                        for tm in ('additive','replacement')}
+                        for tm in tms}
     json.dump(out, open(os.path.join(run_dir, 'metrics.json'), 'w'), indent=2)
 
     # ---- reference values for slice plots ----
@@ -838,31 +985,38 @@ def main():
     base = (f"target={tgt_name}, bkg={bkg_desc}, "
             f"AMF:global_max 103-D | DSM/LRao:{cfg['score_norm']} PCA-d  "
             f"[{len(seeds)} seeds]")
-    for tm in ('additive', 'replacement'):
+    for tm in tms:
         if len(n_list) > 1:
             plot_sweep(agg_amf, agg_lrao, agg_dsm, agg_rho_d,
                        n_list, d_list, rho_list, D_raw, tm,
                        f"{base} — {tm}", os.path.join(fig_dir, f'auc_vs_n_{tm}.pdf'),
                        ref_amp=ref_amp, agg_gmm=agg_gmm, agg_gmmg=agg_gmmg,
-                       agg_dsm_lin=agg_dsm_lin)
+                       # agg_dsm_lin=agg_dsm_lin
+                       )
         if len(d_list) > 1:
             plot_auc_vs_d(agg_amf, agg_lrao, agg_dsm, agg_rho_d,
                           n_list, d_list, rho_list, amp_list, D_raw, tm,
                           ref_n, ref_amp, f"{base} — {tm}",
                           os.path.join(fig_dir, f'auc_vs_d_{tm}.pdf'), agg_gmm=agg_gmm,
-                          agg_gmmg=agg_gmmg, agg_dsm_lin=agg_dsm_lin)
+                          agg_gmmg=agg_gmmg,
+                          # agg_dsm_lin=agg_dsm_lin
+                          )
         if len(rho_list) > 1:
             plot_auc_vs_rho(agg_amf, agg_lrao, agg_dsm, agg_rho_d,
                             n_list, d_list, rho_list, amp_list, D_raw, tm,
                             ref_n, ref_d, ref_amp, f"{base} — {tm}",
                             os.path.join(fig_dir, f'auc_vs_rho_{tm}.pdf'), agg_gmm=agg_gmm,
-                            agg_gmmg=agg_gmmg, agg_dsm_lin=agg_dsm_lin)
+                            agg_gmmg=agg_gmmg,
+                            # agg_dsm_lin=agg_dsm_lin
+                            )
         if len(amp_list) > 1:
             plot_auc_vs_amp(agg_amf, agg_lrao, agg_dsm, agg_rho_d,
                             n_list, d_list, rho_list, amp_list, D_raw, tm,
                             ref_n, ref_d, ref_rho, f"{base} — {tm}",
                             os.path.join(fig_dir, f'auc_vs_amp_{tm}.pdf'), agg_gmm=agg_gmm,
-                            agg_gmmg=agg_gmmg, agg_dsm_lin=agg_dsm_lin)
+                            agg_gmmg=agg_gmmg,
+                            # agg_dsm_lin=agg_dsm_lin
+                            )
 
     print(f"\nDone.  Results: {run_dir}", flush=True)
 

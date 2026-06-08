@@ -161,24 +161,39 @@ class GMMGLRTLevin:
         return self
 
     def score(self, test, t, model='additive',
-              p_steps=50, p_max=1.0):
+              p_steps=50, p_max=1.0, oracle_p=None):
         """
-        GLRT statistic via ML estimation of fill factor p (grid search).
+        GLRT statistic for the cluster-based (product-GMM) density.
 
         Paper Sec. II / eq. (15)-(16):
             Additive:    T(x) = max_p [log f(x − p·t)] − log f(x)
             Replacement: T(x) = max_p [log f((x−p·t)/(1−p)) − N·log(1−p)] − log f(x)
 
-        p is the fill factor (target abundance), estimated by 1-D grid search.
-        No knowledge of the true amplitude is used.
+        Fill-factor handling
+        --------------------
+        oracle_p is None (default) — HONEST detector:
+            p is the unknown fill factor, estimated per pixel by 1-D grid
+            search (ML estimation), exactly as in Sec. 4.2 of the paper.
+            No knowledge of the true amplitude is used. This is the curve
+            that must be reported as "GMM-Levin".
+
+        oracle_p = <float> — ORACLE (clairvoyant) reference:
+            the grid is replaced by the single TRUE fill factor. The density
+            model is IDENTICAL to the honest detector, so this is a genuine
+            upper bound on the honest GLRT (it can only do better, never
+            worse). Must be labelled as an oracle in any figure/table.
         """
         z     = (test - self.mu) @ self.Psi           # (n, r) PCA scores
         logf0 = self.pgmm.logpdf(z)
 
         if model == 'additive':
             psi_t = t @ self.Psi                       # direction rule: no centering
+            if oracle_p is not None:
+                p_grid = np.array([float(oracle_p)])
+            else:
+                p_grid = np.linspace(0.0, p_max, p_steps)
             best  = np.full(len(test), -np.inf)
-            for p in np.linspace(0.0, p_max, p_steps):
+            for p in p_grid:
                 logf1 = self.pgmm.logpdf(z - p * psi_t)
                 best  = np.maximum(best, logf1 - logf0)
             return best
@@ -187,8 +202,12 @@ class GMMGLRTLevin:
             # for why the Jacobian exponent is r, not N.
             N     = self.Psi.shape[1]                  # = r (retained rank)
             psi_tc = (t - self.mu) @ self.Psi         # point rule: centering applied (see module docstring)
+            if oracle_p is not None:
+                p_grid = np.array([min(float(oracle_p), 0.99)])
+            else:
+                p_grid = np.linspace(1e-4, min(p_max, 0.99), p_steps)
             best  = np.full(len(test), -np.inf)
-            for p in np.linspace(1e-4, min(p_max, 0.99), p_steps):
+            for p in p_grid:
                 z_b   = (z - p * psi_tc) / (1.0 - p)
                 logf1 = -N * np.log(1.0 - p) + self.pgmm.logpdf(z_b)
                 best  = np.maximum(best, logf1 - logf0)

@@ -484,12 +484,13 @@ def compute_lfi_detector_scores_mode2(model: ScoreNet, train_data: np.ndarray,
     T(y) = g_s^T Sigma^{-1} (Psi(y) - mu) / sqrt(J_s)
     """
     model.eval()
+    device = next(model.parameters()).device
     d    = train_data.shape[1]
-    X_tr = torch.tensor(train_data, dtype=torch.float32)
-    X_te = torch.tensor(test_data,  dtype=torch.float32)
-    I_d  = torch.eye(d)
+    X_tr = torch.tensor(train_data, dtype=torch.float32).to(device)
+    X_te = torch.tensor(test_data,  dtype=torch.float32).to(device)
+    I_d  = torch.eye(d, device=device)
 
-    psi_tr = model(X_tr).numpy()                     # (n, d_out)
+    psi_tr = model(X_tr).cpu().numpy()               # (n, d_out)
     d_out  = psi_tr.shape[1]
     if not np.all(np.isfinite(psi_tr)):
         # Model outputs contain NaN/Inf (exploding gradients, untrained model).
@@ -509,8 +510,8 @@ def compute_lfi_detector_scores_mode2(model: ScoreNet, train_data: np.ndarray,
     # Full Jacobian G: (d_out, d)
     G = np.zeros((d_out, d))
     for j in range(d):
-        psi_plus  = model(X_tr + delta_theta * I_d[j]).numpy()
-        psi_minus = model(X_tr - delta_theta * I_d[j]).numpy()
+        psi_plus  = model(X_tr + delta_theta * I_d[j]).cpu().numpy()
+        psi_minus = model(X_tr - delta_theta * I_d[j]).cpu().numpy()
         G[:, j]   = ((psi_plus - psi_minus) / (2.0 * delta_theta)).mean(axis=0)
 
     # Project onto signal direction
@@ -518,7 +519,7 @@ def compute_lfi_detector_scores_mode2(model: ScoreNet, train_data: np.ndarray,
     J_s   = float(g_s @ Sigma_inv @ g_s)
     denom = np.sqrt(max(J_s, 1e-12))
 
-    psi_te = model(X_te).numpy()
+    psi_te = model(X_te).cpu().numpy()
     return (psi_te - mu) @ (Sigma_inv @ g_s) / denom
 
 

@@ -3,30 +3,27 @@ pipeline.py — Honest score-based detection pipeline.
 
 Implements the derivation:
 
-  Step 0  Fixed invertible affine normalization N(x) = A(x - c), calibrated
-          on BACKGROUND ONLY.  Default A = diag(1/sigma_b), c = mu_b
-          (per-band standardization — robust, band-symmetric, invertible).
-          NOT per-band min-max; NEVER clipped.
+  Step 1  PCA on raw background pixels: z = V_d^T (x - m_raw).
+          Eigenvectors V are fitted on RAW (un-normalised) background.
 
-  Step 1  Carry the signature through N with the model-correct rule:
-            additive     t -> A t          (direction; c cancels)
-            replacement  t -> A(t - c)      (point)
+  Step 2  Fixed invertible affine normalisation N(z) = A(z - c), calibrated
+          on the d-dimensional PCA SCORES of the background.
+          Default A = diag(1/sigma_z), c = mu_z  (per-PC standardisation).
 
-  Step 2  PCA on the normalized background: z = V_d^T (N(x) - m).
-          Carry the signature again:
-            s_add = V_d^T (A t)             (no centering)
-            s_rep = V_d^T (A(t - c) - m)    (centered)
+  Step 3  Carry the signature through both transforms with the model-correct rule:
+            additive     s_add = A (V^T t)                (direction; c cancels)
+            replacement  s_rep = A (V^T(t - m_raw) - c)   (point rule)
 
-  Step 3  Train score model psi_hat ~ grad log p_z on background PCA features.
+  Step 4  Train score model psi_hat ~ grad log p on background features.
 
-  Step 4  Standardized (CFAR) LMP statistics in z-space.
+  Step 5  Standardised (CFAR) LMP statistics.
 
-Validity diagnostic (condition 2 of the derivation):
+Validity diagnostic:
     rho_d = retained deflection fraction
-          = [ sum_{i<=d} (v_i^T s_n)^2 / lambda_i ]
-          / [ sum_{i<=D} (v_i^T s_n)^2 / lambda_i ]
-    rho_d -> 1  <=>  the matched-filter direction Sigma_N^{-1} s lies in the
-    top-d PCA subspace  <=>  PCA projection is detection-lossless.
+          = [ sum_{i<=d} (v_i^T t)^2 / lambda_i ]
+          / [ sum_{i<=D} (v_i^T t)^2 / lambda_i ]
+    Computed in RAW PCA space (eigvecs of raw background covariance).
+    rho_d -> 1  <=>  PCA projection is detection-lossless.
 """
 
 import numpy as np
@@ -37,29 +34,37 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from sklearn.decomposition import PCA as SklearnPCA
 from dsm_model import ScoreNet, dsm_loss, compute_scores
 
 
 # ---------------------------------------------------------------------------
-# Normalization maps (Step 0) — all invertible, calibrated on background only
+# Normalisation maps (Step 2) — fitted on d-dim PCA scores, not raw pixels
 # ---------------------------------------------------------------------------
 
-def _fit_normalizer(bkg_raw: np.ndarray, mode: str):
-    """Return (A_diag, c) for the affine map N(x) = A_diag * (x - c)."""
-    if mode == 'per_band_std':
-        c = bkg_raw.mean(axis=0)
-        A = 1.0 / (bkg_raw.std(axis=0) + 1e-8)          # per-band 1/sigma
+def _fit_normalizer(bkg: np.ndarray, mode: str):
+    """Return (A_diag, c) for the affine map N(z) = A_diag * (z - c).
+
+    Called on d-dimensional PCA scores (new order: PCA first, then normalise).
+    pca_std / pca_elm are aliases that remain valid — they mean the same thing
+    as per_band_std / elm when applied to PCA scores.
+    """
+    if mode in ('per_band_std', 'pca_std'):
+        c = bkg.mean(axis=0)
+        A = 1.0 / (bkg.std(axis=0) + 1e-8)
     elif mode == 'global_max':
-        c = np.zeros(bkg_raw.shape[1], dtype=bkg_raw.dtype)
-        A = np.full(bkg_raw.shape[1], 1.0 / (bkg_raw.max() + 1e-12),
-                    dtype=bkg_raw.dtype)
+        c = np.zeros(bkg.shape[1], dtype=bkg.dtype)
+        A = np.full(bkg.shape[1], 1.0 / (bkg.max() + 1e-12), dtype=bkg.dtype)
     elif mode == 'per_band_minmax':
-        c = bkg_raw.min(axis=0)
-        A = 1.0 / (bkg_raw.max(axis=0) - bkg_raw.min(axis=0) + 1e-12)
-    elif mode == 'pca_std':
-        # No raw-space normalization; PC scores are standardised after PCA.
-        c = np.zeros(bkg_raw.shape[1], dtype=bkg_raw.dtype)
-        A = np.ones(bkg_raw.shape[1], dtype=bkg_raw.dtype)
+        c = bkg.min(axis=0)
+        A = 1.0 / (bkg.max(axis=0) - bkg.min(axis=0) + 1e-12)
+    elif mode in ('elm', 'pca_elm'):
+        # Robust two-point scaling: dark = 1st pct, bright = 99th pct.
+        c = np.percentile(bkg, 1, axis=0)
+        A = 1.0 / (np.percentile(bkg, 99, axis=0) - c + 1e-12)
+    elif mode == 'none':
+        c = np.zeros(bkg.shape[1], dtype=bkg.dtype)
+        A = np.ones(bkg.shape[1], dtype=bkg.dtype)
     else:
         raise ValueError(f"unknown norm mode {mode!r}")
     return A.astype(np.float32), c.astype(np.float32)
@@ -70,84 +75,87 @@ def _fit_normalizer(bkg_raw: np.ndarray, mode: str):
 # ---------------------------------------------------------------------------
 
 class HonestDetectionPipeline:
-    def __init__(self, latent_dim: int = 5, norm: str = 'per_band_std'):
-        self.d    = latent_dim
-        self.norm = norm
+    def __init__(self, latent_dim: int = 5, norm: str = 'per_band_std',
+                 skip_pca: bool = False):
+        self.d        = latent_dim
+        self.norm     = norm
+        self.skip_pca = skip_pca
 
-    # ---- Step 0 + 2: fit normalization + PCA on background ----
+    # ---- Step 1 + 2: PCA on raw pixels, then normalise PCA scores ----
     def fit(self, bkg_raw: np.ndarray):
-        # Step 0: normalization from background only
-        self.A, self.c = _fit_normalizer(bkg_raw, self.norm)
-        bkg_n = (bkg_raw - self.c) * self.A                  # N(bkg)
+        n_samples, D = bkg_raw.shape
 
-        # Step 2: PCA on normalized background
-        self.m = bkg_n.mean(axis=0).astype(np.float32)       # PCA centering
-        Xc     = bkg_n - self.m
-        # full eigendecomposition of the normalized-background covariance
-        Sigma_N = np.cov(bkg_n, rowvar=False)
-        evals, evecs = np.linalg.eigh(Sigma_N)               # ascending
-        order = np.argsort(evals)[::-1]                       # descending
-        self.eigvals = evals[order].astype(np.float64)        # (D,)
-        self.eigvecs = evecs[:, order].astype(np.float32)     # (D, D) cols = v_i
-        self.V = self.eigvecs[:, :self.d]                     # (D, d) top-d
+        if self.skip_pca:
+            # No PCA — V = I_D, m_raw = 0.
+            # Normalisation is fitted directly on raw pixels.
+            self.d       = D
+            self.m       = np.zeros(D, dtype=np.float32)   # no PCA centering
+            self.V       = np.eye(D, dtype=np.float32)
+            self.eigvals = np.ones(D, dtype=np.float64)
+            self.eigvecs = np.eye(D, dtype=np.float32)
+            self.A, self.c = _fit_normalizer(bkg_raw, self.norm)
+            return self
 
-        # Post-PCA standardisation (pca_std mode only):
-        # divide each PC score by its training std so all dims have unit variance.
-        if self.norm == 'pca_std':
-            Z = ((bkg_n - self.m) @ self.V).astype(np.float32)
-            self.post_pca_scale = (1.0 / (Z.std(axis=0) + 1e-8)).astype(np.float32)
-        else:
-            self.post_pca_scale = None
+        # Step 1: PCA on RAW background (sklearn SVD — numerically stable).
+        # Fit all available components so rho_d has the full eigenspectrum;
+        # only the top-d are used for projection.
+        n_comp_full = min(n_samples - 1, D)
+        n_comp      = min(self.d, n_comp_full)   # cap at available rank
+
+        pca = SklearnPCA(n_components=n_comp_full, svd_solver='full')
+        pca.fit(bkg_raw)
+
+        self.m       = pca.mean_.astype(np.float32)               # (D,) raw-space mean
+        self.eigvals = pca.explained_variance_.astype(np.float64)  # (n_comp_full,)
+        self.eigvecs = pca.components_.T.astype(np.float32)        # (D, n_comp_full)
+        self.V       = self.eigvecs[:, :n_comp]                    # (D, d)
+        self.d       = n_comp   # update in case capped (e.g. n=50, d=64 → d=49)
+
+        # Step 2: fit normaliser on PCA scores of background.
+        # A and c are d-dimensional (PCA score space).
+        bkg_pca      = ((bkg_raw - self.m) @ self.V).astype(np.float32)
+        self.A, self.c = _fit_normalizer(bkg_pca, self.norm)
+
         return self
 
-    # ---- Normalize + project ----
-    def normalize(self, x_raw):
-        return (x_raw - self.c) * self.A
+    # ---- Project: raw → PCA → normalise ----
+    def project(self, x_raw: np.ndarray) -> np.ndarray:
+        """Raw pixels → normalised PCA scores (d-dimensional)."""
+        z = ((x_raw - self.m) @ self.V).astype(np.float32)   # PCA
+        return (z - self.c) * self.A                           # normalise
 
-    def project(self, x_raw):
-        """Raw -> normalized -> PCA-d scores (-> per-PC std scale if pca_std)."""
-        x_n = self.normalize(x_raw)
-        z   = ((x_n - self.m) @ self.V).astype(np.float32)
-        if self.post_pca_scale is not None:
-            z = z * self.post_pca_scale
-        return z
+    # ---- Step 3: signature transforms (model-correct rules) ----
+    def signature_additive(self, t_raw: np.ndarray) -> np.ndarray:
+        """Direction rule: s_add = A * (V^T t).  c cancels for additive model."""
+        z = (self.V.T @ t_raw).astype(np.float32)   # project direction
+        return z * self.A                             # scale; c cancels
 
-    # ---- Step 1+2: signature transforms (model-correct rules) ----
-    def signature_additive(self, t_raw):
-        """Direction rule: s_add = V^T (A t).  No centering."""
-        t_n = (t_raw * self.A).astype(np.float32)            # A t  (c cancels)
-        s   = (self.V.T @ t_n).astype(np.float32)
-        if self.post_pca_scale is not None:
-            s = s * self.post_pca_scale
-        return s
-
-    def signature_replacement(self, t_raw):
-        """Point rule: s_rep = V^T (A(t - c) - m)."""
-        t_n = ((t_raw - self.c) * self.A).astype(np.float32) # A(t - c)
-        s   = (self.V.T @ (t_n - self.m)).astype(np.float32)
-        if self.post_pca_scale is not None:
-            s = s * self.post_pca_scale
-        return s
+    def signature_replacement(self, t_raw: np.ndarray) -> np.ndarray:
+        """Point rule: s_rep = A * (V^T(t - m_raw) - c)."""
+        z = (self.V.T @ (t_raw - self.m)).astype(np.float32)   # project point
+        return (z - self.c) * self.A                            # normalise
 
     # ---- Validity diagnostic: retained deflection fraction ----
-    def deflection_curve(self, t_raw):
+    def deflection_curve(self, t_raw: np.ndarray) -> np.ndarray:
         """
-        Returns the cumulative retained-deflection fraction rho_k for
-        k = 1..D, using the additive signature direction in normalized space.
+        Cumulative retained-deflection fraction rho_k for k = 1..n_comp_full.
 
-        rho_k = [sum_{i<=k} (v_i^T s_n)^2 / lambda_i] / [sum_i (v_i^T s_n)^2 / lambda_i]
+        Computed in raw PCA space (eigvecs of raw background covariance):
+            rho_k = [sum_{i<=k} (v_i^T t)^2 / lambda_i]
+                  / [sum_i      (v_i^T t)^2 / lambda_i]
         """
-        s_n = (t_raw * self.A).astype(np.float64)            # A t  (full D)
-        proj = self.eigvecs.T.astype(np.float64) @ s_n        # (v_i^T s_n) for all i
-        contrib = proj ** 2 / np.maximum(self.eigvals, 1e-12) # per-direction deflection
-        cum = np.cumsum(contrib)
-        total = cum[-1] + 1e-300
-        return cum / total                                    # rho_k, k=1..D
+        s_n   = t_raw.astype(np.float64)                        # raw signature
+        proj  = self.eigvecs.T.astype(np.float64) @ s_n          # (n_comp_full,)
+        contr = proj ** 2 / np.maximum(self.eigvals, 1e-12)
+        cum   = np.cumsum(contr)
+        return cum / (cum[-1] + 1e-300)
 
-    def rho_d(self, t_raw):
+    def rho_d(self, t_raw: np.ndarray) -> float:
+        if self.skip_pca:
+            return 1.0   # no projection → no loss by definition
         return float(self.deflection_curve(t_raw)[self.d - 1])
 
-    # ---- Step 3: train score model on background PCA features ----
+    # ---- Step 4: train score model on normalised PCA features ----
     def train_dsm(self, bkg_pca, sigma, hidden=(64, 64), activation='silu',
                   epochs=2000, lr=1e-3, weight_decay=1e-4, batch_size=256,
                   seed=42):
@@ -166,7 +174,7 @@ class HonestDetectionPipeline:
         self.dsm = model
         return model
 
-    # ---- Step 4: standardized (CFAR) LMP statistics ----
+    # ---- Step 5: standardised (CFAR) LMP statistics ----
     def score_dsm_additive(self, train_pca, test_pca, s_add):
         z_tr = compute_scores(self.dsm, train_pca)
         z_te = compute_scores(self.dsm, test_pca)
@@ -177,13 +185,17 @@ class HonestDetectionPipeline:
         return -((z_te - z_bar) @ s_add) / norm
 
     def score_dsm_replacement(self, train_pca, test_pca, s_rep):
-        psi_tr = compute_scores(self.dsm, train_pca)
-        psi_te = compute_scores(self.dsm, test_pca)
-        psi_bar = psi_tr.mean(0)
-        r_tr = ((psi_tr - psi_bar) * (train_pca - s_rep)).sum(1)
-        r_bar, r_std = r_tr.mean(), r_tr.std() + 1e-12
-        r_te = ((psi_te - psi_bar) * (test_pca - s_rep)).sum(1)
-        return (r_te - r_bar) / r_std
+        # Paper: u_rep(y) = (ψ(y)−ψ̄)ᵀ(y−s) + d,  I_rep = E[r²] − d²
+        # Statistic: u_rep / sqrt(I_rep)
+        # Adaptation: center ψ by its empirical mean ψ̄ = E_train[ψ(x)].
+        psi_tr  = compute_scores(self.dsm, train_pca)
+        psi_te  = compute_scores(self.dsm, test_pca)
+        psi_bar = psi_tr.mean(axis=0)
+        d = train_pca.shape[1]
+        r_tr = ((psi_tr - psi_bar) * (train_pca - s_rep)).sum(axis=1)
+        I_rep = max(float((r_tr**2).mean()) - d**2, 1e-12)
+        r_te  = ((psi_te - psi_bar) * (test_pca  - s_rep)).sum(axis=1) + d
+        return (r_te + d) / np.sqrt(I_rep)
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +205,7 @@ class HonestDetectionPipeline:
 def amf_score(train, test, s):
     """Adaptive matched filter: s^T Sigma^{-1}(y - mu) / sqrt(s^T Sigma^{-1} s).
 
-    Works in any space (full normalized D-dim, or PCA-d). `s` must be the
+    Works in any space (full normalised D-dim, or PCA-d). `s` must be the
     additive signature expressed in that same space.
     """
     mu = train.mean(0)
