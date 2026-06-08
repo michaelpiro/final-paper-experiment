@@ -10,22 +10,27 @@ Paper point (Section 5, invariance argument):
     is spectrally ENTANGLED with the background (a subpixel additive target
     whose signature is a linear combination of the local background materials).
 
-We hold the background region and the additive target model FIXED and vary ONLY
-the target's spectral DIRECTION across three regimes (all signatures renormalized
-to the SAME L2 norm, so amplitude is matched and only direction changes):
+We use the SAME heterogeneous test boxes as the main experiment (the real,
+challenging setup — a spatially mixed background is the whole point), hold the
+box and the additive target model FIXED, and vary ONLY the target's spectral
+DIRECTION across three regimes (all signatures renormalized to the SAME L2 norm,
+so amplitude is matched and only direction changes):
 
     A. ENTANGLED   — signature = 0.8·(dominant background class) + 0.2·patch_mean.
-                     A linear combination of the local scene materials.
+                     The original target: a linear combination of the local materials.
     B. DISTINCT    — signature = mean of a real class that is ABSENT from the
-                     local test box (trees/metal_sheets excluded as "too easy").
-                     Present elsewhere in the scene, so kept by the PCA features.
-    C. SYNTH-⟂     — synthetic signature orthogonal to the LOCAL background
-                     subspace but inside the GLOBAL scene PCA subspace.  Rigorously
-                     "not a linear combination of the local background materials",
-                     while remaining representable in our d-dim feature space
-                     (a target orthogonal to the WHOLE scene would fall in the
-                     bands PCA discards and be undetectable by any PCA detector —
-                     that is a preprocessing artifact, not a property of interest).
+                     test box (trees/metal_sheets excluded as "too easy").  In Pavia
+                     the materials are mutually low-rank, so a real absent class is
+                     usually only mildly distinct — an honest intermediate case.
+    C. SYNTH-⟂     — synthetic signature orthogonal to the present scene materials
+                     but inside the GLOBAL scene PCA subspace.  Rigorously "not a
+                     linear combination of the scene materials" (a target orthogonal
+                     to the WHOLE scene would fall in the bands PCA discards and be
+                     undetectable by any PCA detector — a preprocessing artifact, not
+                     a property of interest).
+
+PCA is fit on the WHOLE image here (acceptable for this controlled experiment;
+it only defines the feature space shared by all detectors).
 
 Expected pattern (the story):
     regime          CF-Attn(ours)   THANTD   AMF
@@ -356,10 +361,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default=None)
     ap.add_argument('--results_dir', default=None)
-    ap.add_argument('--bg_classes', default='2,1,8',
-                    help='comma-separated background class ids for homogeneous boxes '
-                         '(default meadows,asphalt,bricks). Use "manual" for the '
-                         'manual_boxes.json rich-background scenarios instead.')
+    ap.add_argument('--bg_classes', default='manual',
+                    help='"manual" (default) = the heterogeneous manual_boxes.json '
+                         'scenarios (the real, challenging setup). Or a comma-separated '
+                         'list of class ids to instead use homogeneous single-material '
+                         'boxes (diagnostic only).')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--no-thantd', action='store_true')
     args = ap.parse_args()
