@@ -260,7 +260,10 @@ def rescore_n_sweep(run_dir: str,
 
     # Initialise results (respect additive-only runs via target_models)
     tms   = tuple(met.get('target_models', ['additive', 'replacement']))
-    dets  = ['AMF', 'DSM', 'LRao']
+    # DSM PCA-dim variants: extra d's in d_list produce DSM-d{dd} curves
+    # (Ami: 2-3 DSM variants to approach Levin). Primary d = d_list[0] = 'DSM'.
+    dsm_variants = [f'DSM-d{dd}' for dd in d_list if dd != d]
+    dets  = ['AMF', 'DSM', 'LRao'] + dsm_variants
     if has_gmm:  dets.append('GMM-GLRT')
     if has_gmmg: dets.append('GMM-GLRT-G')
     results = {tm: {det: {n: {'pd': {f: [] for f in fpr_targets},
@@ -291,29 +294,34 @@ def rescore_n_sweep(run_dir: str,
         t_gm = t_raw / gm
         bkg_te_gm = bkg_te / gm
 
-        # Load pipeline (fitted once on bkg_tr[:n_max])
-        pkl_path = seed_mdl / f'pipeline_d{d}.pkl'
-        with open(pkl_path, 'rb') as fh:
-            pipe = pickle.load(fh)
-        bkg_te_pca = pipe.project(bkg_te)
-        s_add = pipe.signature_additive(t_raw)
-        s_rep = pipe.signature_replacement(t_raw)
+        # Load pipelines for every PCA dim (primary d + variants), fit on bkg_tr[:n_max]
+        pipe_by_d = {}
+        for dd in d_list:
+            with open(seed_mdl / f'pipeline_d{dd}.pkl', 'rb') as fh:
+                pipe_by_d[dd] = pickle.load(fh)
+        pipe = pipe_by_d[d]                       # primary pipeline (LRao space)
+        te_pca_by_d = {dd: pipe_by_d[dd].project(bkg_te) for dd in d_list}
+        sadd_by_d   = {dd: pipe_by_d[dd].signature_additive(t_raw) for dd in d_list}
+        srep_by_d   = {dd: pipe_by_d[dd].signature_replacement(t_raw) for dd in d_list}
 
         for n in tqdm(n_list, desc=f'    n', leave=False, disable=not verbose):
-            tr_pca = pipe.project(bkg_tr[:n])
             tr_gm  = bkg_tr[:n] / gm
-
-            # --- Load DSM model ---
             rho_str = str(rho).replace('.', 'p')
-            dsm_path = seed_mdl / f'dsm_rho{rho_str}_d{d}_n{n}.pt'
-            dsm_ckpt = torch.load(dsm_path, map_location='cpu', weights_only=False)
-            dsm_m = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation'])
-            dsm_m.load_state_dict(dsm_ckpt['state_dict'])
-            dsm_m.eval()
 
-            # --- Load LRao model ---
-            lrao_path = seed_mdl / f'lrao_d{d}_n{n}.pt'
-            lrao_ckpt = torch.load(lrao_path, map_location='cpu', weights_only=False)
+            # --- DSM models per PCA dim (primary 'DSM' + 'DSM-d{dd}' variants) ---
+            dsm_by_d, trpca_by_d = {}, {}
+            for dd in d_list:
+                trpca_by_d[dd] = pipe_by_d[dd].project(bkg_tr[:n])
+                ck = torch.load(seed_mdl / f'dsm_rho{rho_str}_d{dd}_n{n}.pt',
+                                map_location='cpu', weights_only=False)
+                m = ScoreNet(dd, list(cfg['hidden_dims']), cfg['activation'])
+                m.load_state_dict(ck['state_dict']); m.eval()
+                dsm_by_d[dd] = m
+            tr_pca = trpca_by_d[d]                 # primary-d train scores (LRao)
+
+            # --- Load LRao model (primary d) ---
+            lrao_ckpt = torch.load(seed_mdl / f'lrao_d{d}_n{n}.pt',
+                                   map_location='cpu', weights_only=False)
             lrao_m = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation'])
             lrao_m.load_state_dict(lrao_ckpt['state_dict'])
             lrao_m.eval()
@@ -327,18 +335,23 @@ def rescore_n_sweep(run_dir: str,
                     seed=seed).fit(tr_gm)
 
             for tm in tms:
-                sig = s_add if tm == 'additive' else s_rep
-                te_pca, lab = plant(bkg_te_pca, sig, amp, frac, tm, seed)
+                sig = sadd_by_d[d] if tm == 'additive' else srep_by_d[d]
+                te_pca, lab = plant(te_pca_by_d[d], sig, amp, frac, tm, seed)
                 te_gm,  _   = plant(bkg_te_gm,  t_gm, amp, frac, tm, seed)
 
                 # Scores
                 sc_amf  = (amf_score(tr_gm, te_gm, t_gm)
                            if tm == 'additive'
                            else amf_replacement_score(tr_gm, te_gm, t_gm))
-                sc_dsm  = _score_dsm(dsm_m, tr_pca, te_pca, sig, tm)
                 sc_lrao = _score_lrao(lrao_m, tr_pca, te_pca, sig, cfg)
 
-                sc_map = {'AMF': sc_amf, 'DSM': sc_dsm, 'LRao': sc_lrao}
+                sc_map = {'AMF': sc_amf, 'LRao': sc_lrao}
+                # DSM primary + PCA-dim variants
+                for dd in d_list:
+                    sg = sadd_by_d[dd] if tm == 'additive' else srep_by_d[dd]
+                    te_dd, _ = plant(te_pca_by_d[dd], sg, amp, frac, tm, seed)
+                    key = 'DSM' if dd == d else f'DSM-d{dd}'
+                    sc_map[key] = _score_dsm(dsm_by_d[dd], trpca_by_d[dd], te_dd, sg, tm)
                 if has_gmm:
                     # Honest GMM-Levin: fill factor p estimated by ML grid search.
                     sc_map['GMM-GLRT'] = det_gmm.score(
@@ -379,7 +392,7 @@ def rescore_n_sweep(run_dir: str,
 
     json.dump(raw_index, open(raw_dir / 'raw_index.json', 'w'), indent=2)
 
-    meta = dict(n_list=n_list, d=d, rho=rho, seeds=seeds,
+    meta = dict(n_list=n_list, d=d, d_list=d_list, rho=rho, seeds=seeds,
                 bkg_desc=bkg_desc, target_cls=tcls, amp=amp,
                 fpr_targets=list(fpr_targets), fpr_max_pauc=fpr_max_pauc,
                 rho_d=met.get('rho_d', {}))
@@ -624,7 +637,8 @@ def plot_pd_vs_n(agg, meta, out_path, main_fpr=0.1, title_prefix=''):
             ax.set_title(f'{"Additive" if tm == "additive" else "Replacement"} model',
                          fontsize=9)
             if ci == len(present)-1:
-                ax.legend(fontsize=7.5, framealpha=0.9, loc='lower right')
+                ax.legend(fontsize=7.5, framealpha=0.9,
+                          loc='center left', bbox_to_anchor=(1.02, 0.5))
         bkg = meta.get('bkg_desc', '')
         tcls = CLS_NAMES.get(meta.get('target_cls', 0), '')
         rho_str = f"$\\rho$={meta.get('rho', '?')}"
@@ -658,7 +672,8 @@ def plot_pauc_vs_n(agg, meta, out_path, title_prefix=''):
             ax.set_title(f'{"Additive" if tm == "additive" else "Replacement"} model',
                          fontsize=9)
             if ci == len(present)-1:
-                ax.legend(fontsize=7.5, framealpha=0.9, loc='lower right')
+                ax.legend(fontsize=7.5, framealpha=0.9,
+                          loc='center left', bbox_to_anchor=(1.02, 0.5))
         bkg = meta.get('bkg_desc', '')
         tcls = CLS_NAMES.get(meta.get('target_cls', 0), '')
         fig.suptitle(f"{title_prefix}  tgt={tcls}, bkg={bkg}, $\\theta$={meta.get('amp','?')}",
@@ -687,7 +702,8 @@ def plot_pd_multi_fpr(agg, meta, out_path, tm='additive', title_prefix=''):
             ax.set_xlabel('$n_{\\mathrm{train}}$', fontsize=9)
             ax.set_title(f'$P_{{fa}}={fpr}$', fontsize=9)
             if ci == nc-1:
-                ax.legend(fontsize=7.5, framealpha=0.9, loc='lower right')
+                ax.legend(fontsize=7.5, framealpha=0.9,
+                          loc='center left', bbox_to_anchor=(1.02, 0.5))
         bkg = meta.get('bkg_desc', '')
         tcls = CLS_NAMES.get(meta.get('target_cls', 0), '')
         fig.suptitle(f"{title_prefix}  {tm}  tgt={tcls}, bkg={bkg}",
@@ -729,7 +745,8 @@ def plot_pd_vs_rho(agg, meta, out_path, main_fpr=0.1, title_prefix=''):
             ax.set_title(f'{"Additive" if tm == "additive" else "Replacement"} model',
                          fontsize=9)
             if ci == len(present)-1:
-                ax.legend(fontsize=7.5, framealpha=0.9, loc='lower right')
+                ax.legend(fontsize=7.5, framealpha=0.9,
+                          loc='center left', bbox_to_anchor=(1.02, 0.5))
         bkg  = meta.get('bkg_desc', '')
         tcls = CLS_NAMES.get(meta.get('target_cls', 0), '')
         n    = meta.get('n', '?')

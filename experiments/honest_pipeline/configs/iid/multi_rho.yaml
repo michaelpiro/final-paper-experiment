@@ -38,7 +38,7 @@ weight_decay:     0.0001
 batch_size:       256
 
 run_gmm_glrt:     true
-run_gmm_glrt_g:   true
+run_gmm_glrt_g:   false    # oracle dropped (Ami: Levin+LRao enough)
 gmm_max_dim:      5
 gmm_k_max:        9
 gmm_cond_tol:     1000
