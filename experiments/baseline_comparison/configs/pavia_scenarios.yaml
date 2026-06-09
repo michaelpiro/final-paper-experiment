@@ -1,0 +1,33 @@
+# HARD case — real Pavia scenarios (the paper setting): additive model, amplitude
+# sweep around 0.15, the dominant-class "paper" signature per scenario.
+provider: pavia
+
+provider_cfg:
+  dataset: data/pavia-u.mat
+  norm_mode: global_max
+  manual_boxes_path: experiments/spatial/manual_boxes.json
+  scenarios: [0, 1, 2, 3]
+  latent_dim: 20
+  k: 5
+  n_budget: 2000
+  sig_dom_weight: 0.8
+  sig_mean_weight: 0.2
+  dsm_sigma_rho: 0.01
+  seed: 42
+
+detectors: [AMF, Reg-AMF, CEM, GMM-Levin, Self-GMM, Spatial-GMM,
+            DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR]
+
+detector_cfg:
+  Self-GMM:    {K: 9}
+  Spatial-GMM: {K: 9}
+
+target_models: [additive]
+signatures: all
+amplitudes: [0.05, 0.1, 0.15, 0.25, 0.4]
+target_fraction: 0.10
+seed: 42
+
+dry_run_amplitudes: [0.15]
+dry_run_provider_cfg: {scenarios: [0], n_budget: 400}
+dry_run_detector_cfg: {cfattn_epochs: 8, nmlp_epochs: 8, dsm_epochs: 20}
