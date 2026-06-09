@@ -201,7 +201,12 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     torch.manual_seed(seed)
     device = torch.device(cfg.get('device', 'cpu'))
     D = train_raw.shape[1]
-    W = _make_whitening(train_raw, cfg)
+    # LRao can use its own eigenvalue floor (lrao_whiten_eig_floor) — a larger
+    # floor cuts off more near-zero directions, keeping C_Psi well-conditioned.
+    # Falls back to the shared whiten_eig_floor if not set.
+    lrao_cfg = cfg if 'lrao_whiten_eig_floor' not in cfg else {
+        **cfg, 'whiten_eig_floor': cfg['lrao_whiten_eig_floor']}
+    W = _make_whitening(train_raw, lrao_cfg)
     model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                               weight_decay=cfg['weight_decay'])

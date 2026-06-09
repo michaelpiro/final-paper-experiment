@@ -10,7 +10,8 @@
 dataset: data/pavia-u.mat
 norm_mode: none                # RAW sensor values — no scaling (no PCA anywhere)
 whiten_mode: zca               # frozen whitening first layer: zca | pca | cholesky
-whiten_eig_floor: 0.001        # relative eigenvalue floor (× λ_max)
+whiten_eig_floor:      0.0000000000000001  # DSM floor  (× λ_max) — keep nearly all directions
+lrao_whiten_eig_floor: 0.01               # LRao floor (× λ_max) — cut near-zero dirs to keep C_Ψ invertible
 
 # ----- classes (single-class: ONE background class vs ONE target class) -----
 bkg_cls: 2                     # asphalt
@@ -29,7 +30,9 @@ n_train_list: [
     40, 60, 100, 200, 500, 1000, 2000
 ]
 
-rho_list: [0.00001, 0.001,0.005,0.01, 0.07, 0.1,0.5, 1.0, 3.0,5.0]
+rho_list: [
+  0.00001, 0.001, 0.007,0.01,0.07, 0.1,0.5, 1.0,3.0,10.0
+]
 n_fixed_for_rho: 1000           # n used for the vs-rho sweep
 
 # ----- metric operating points -----
@@ -42,15 +45,15 @@ activation: silu
 
 # ----- training budgets -----
 dsm_epochs: 2000
-lrao_epochs: 1
+lrao_epochs: 10
 
 # ----- optimizer (DSM, LRao) -----
 lr: 0.0005
 weight_decay: 0.00005
-batch_size: 512
+batch_size: 256
 
 # ----- DSM specifics -----
-dsm_sigma_rho: 1.0            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
+dsm_sigma_rho: 0.5            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
 
 # ----- LRao Mode-2 specifics -----
 lfi_delta_theta: 0.01
