@@ -13,6 +13,7 @@ For each scenario from the provider:
 
 from __future__ import annotations
 
+import os
 import time
 import numpy as np
 
@@ -47,13 +48,25 @@ def _with_sig(ctx: DetectorInput, s_feat, s_raw) -> DetectorInput:
                    signature_raw=s_raw.astype(np.float32))
 
 
-def run(cfg: dict, results_dir: str, only=None, dry_run=False, device="cpu"):
+def _should_load(dname, load):
+    if not load:
+        return False
+    return load == "all" or dname in load
+
+
+def run(cfg: dict, results_dir: str, only=None, dry_run=False, device="cpu",
+        pretrained_dir=None, load=None):
     registry.ensure_loaded()
     provider = get_provider(cfg["provider"])
     pcfg = dict(cfg.get("provider_cfg", {})); pcfg.setdefault("seed", cfg.get("seed", 42))
     if dry_run:
         pcfg.update(cfg.get("dry_run_provider_cfg", {}))
 
+    load = load if load is not None else cfg.get("load")   # 'all' or [names]
+    if isinstance(load, str) and load not in ("all", "none"):
+        load = [x for x in load.split(",") if x]
+    if load == "none":
+        load = None
     det_names = only or cfg["detectors"]
     det_cfgs = cfg.get("detector_cfg", {})
     models = cfg.get("target_models", ["additive"])
@@ -82,12 +95,21 @@ def run(cfg: dict, results_dir: str, only=None, dry_run=False, device="cpu"):
                 dcfg.update(cfg.get("dry_run_detector_cfg", {}))
                 det = registry.build(dname, dcfg)
 
-            t0 = time.time()
-            # fit on a clean signature-agnostic ctx (most fits ignore signature)
-            det.fit(_with_sig(base, sc.signatures[sig_names[0]][0],
-                              sc.signatures[sig_names[0]][1]))
-            fit_t = time.time() - t0
-            print(f"  [{dname}] fit {fit_t:.1f}s", flush=True)
+            # LOAD a pretrained model instead of training (scenarios + GMM data are
+            # deterministic across runs, so a saved model is exactly reusable).
+            mpath = (os.path.join(pretrained_dir, cfg["provider"], sc.name, dname,
+                                  "model.pkl") if pretrained_dir else None)
+            if _should_load(dname, load) and mpath and os.path.exists(mpath):
+                det.load(mpath); fit_t = 0.0
+                print(f"  [{dname}] LOADED {mpath}", flush=True)
+            else:
+                if _should_load(dname, load) and mpath:
+                    print(f"  [{dname}] no pretrained at {mpath} -> training", flush=True)
+                t0 = time.time()
+                det.fit(_with_sig(base, sc.signatures[sig_names[0]][0],
+                                  sc.signatures[sig_names[0]][1]))
+                fit_t = time.time() - t0
+                print(f"  [{dname}] fit {fit_t:.1f}s", flush=True)
 
             metr, scores_npz, maps_npz = {}, {}, {}
             scores_npz["gt_cls"] = (sc.test_gt_cls if sc.test_gt_cls is not None

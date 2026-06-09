@@ -23,7 +23,7 @@ provider_cfg:
 
 # Every detector; needs_spatial ones auto-skip on iid_gmm
 detectors: [AMF, Reg-AMF, CEM, GMM-Levin, Self-GMM, Spatial-GMM,
-            DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR, MCLT]
+            DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR, MCLT, E-CEM]
 
 detector_cfg:
   Self-GMM:    {K: 4}

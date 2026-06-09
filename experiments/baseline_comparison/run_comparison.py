@@ -33,6 +33,12 @@ def main():
     ap.add_argument("--detectors", default=None,
                     help="comma-separated subset (default: config 'detectors')")
     ap.add_argument("--provider", default=None, help="override config provider")
+    ap.add_argument("--pretrained_dir", default=None,
+                    help="a previous run dir to LOAD models from (scenarios + GMM "
+                         "data are deterministic, so loaded models are exactly reusable)")
+    ap.add_argument("--load", default=None,
+                    help="'all' or comma-list of detectors to LOAD from --pretrained_dir "
+                         "(the rest are trained). e.g. --load DSM,CF-Attn,MCLT")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -52,7 +58,8 @@ def main():
     print(f"Provider={cfg['provider']}  device={device}  dry_run={args.dry_run}")
     print(f"Results dir: {results_dir}", flush=True)
 
-    runner.run(cfg, results_dir, only=only, dry_run=args.dry_run, device=device)
+    runner.run(cfg, results_dir, only=only, dry_run=args.dry_run, device=device,
+               pretrained_dir=args.pretrained_dir, load=args.load)
     print(f"\nDone. Results in {results_dir}", flush=True)
 
 
