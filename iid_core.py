@@ -307,25 +307,38 @@ def _det_color(det: str):
     return DETECTOR_COLORS.get(det, '#444444')
 
 
+def _apply_log_xticks(ax, x):
+    """Force log-axis ticks at exactly the data points with clean labels."""
+    ax.set_xscale('log')
+    ax.set_xticks(x)
+    ax.xaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:g}'))
+    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    ax.tick_params(axis='x', labelsize=8, rotation=45)
+
+
 def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
-             out_pdf: str, logx: bool = False):
-    """Generic 'metric vs x' line plot. series = {det -> list of y (len==xvals)}."""
+             out_pdf: str, logx: bool = False, series_std: dict = None):
+    """Generic 'metric vs x' line plot.
+
+    series      : {det -> list of mean values}
+    series_std  : optional {det -> list of std values} — draws ±1σ shaded band
+    """
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
     x = np.asarray(xvals, dtype=float)
     for det, ys in series.items():
         if ys is None or all(v != v for v in ys):     # all-NaN
             continue
+        ys = np.asarray(ys, dtype=float)
         style = dict(marker='D', lw=2.2) if det in ('DSM', 'LRao') \
             else dict(marker='o', lw=1.4)
-        ax.plot(x, ys, color=_det_color(det), label=det, **style)
+        c = _det_color(det)
+        ax.plot(x, ys, color=c, label=det, **style)
+        if series_std and det in series_std:
+            sd = np.asarray(series_std[det], dtype=float)
+            ax.fill_between(x, ys - sd, ys + sd, alpha=0.15, color=c)
     if logx:
-        ax.set_xscale('log')
-        # Force ticks at exactly the data points with clean labels (no 2×10¹ etc.)
-        ax.set_xticks(x)
-        ax.xaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:g}'))
-        ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-        ax.tick_params(axis='x', labelsize=8, rotation=45)
+        _apply_log_xticks(ax, x)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -385,6 +398,10 @@ def plot_loss_panel(loss_curves: dict, tag: str, out_png: str):
 
 def run_iid(cfg: dict, mode: str):
     assert mode in ('single', 'multi')
+    # Auto-dispatch: if seed is a list with >1 entry, run multi-seed aggregation
+    _s = cfg.get('seed', 42)
+    if isinstance(_s, (list, tuple)) and len(_s) > 1:
+        return run_iid_multi_seed(cfg, mode)
     t_start = time.time()
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = os.path.join(cfg['results_dir'], f'iid_{mode}_{ts}')
@@ -422,7 +439,8 @@ def run_iid(cfg: dict, mode: str):
 
     # ----- load data: RAW bands everywhere (no PCA/AE). Score nets whiten
     #       internally; classical baselines consume the same raw bands. -----
-    seed = int(cfg['seed'])
+    _s = cfg['seed']
+    seed = int(_s[0] if isinstance(_s, (list, tuple)) else _s)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
     data, gt = load_and_normalize(cfg['dataset'], mode=cfg.get('norm_mode', 'none'))
@@ -591,3 +609,139 @@ def run_iid(cfg: dict, mode: str):
     elapsed_min = (time.time() - t_start) / 60.0
     print(f"\nDONE in {elapsed_min:.1f} min. Results -> {run_dir}", flush=True)
     return run_dir, metrics
+
+
+# ---------------------------------------------------------------------------
+# Multi-seed runner — aggregates mean ± std across seeds
+# ---------------------------------------------------------------------------
+
+def run_iid_multi_seed(cfg: dict, mode: str):
+    """Run run_iid once per seed; emit aggregated (mean ± std) figures.
+
+    cfg['seed'] must be a list, e.g. [42, 43, 44, 45, 46].
+    Each per-seed run goes into  <results_dir>/seed_<s>/
+    Aggregated figures + metrics land in  <results_dir>/aggregate/
+    Returns (aggregate_dir, aggregate_metrics).
+    """
+    seeds = list(cfg['seed'])
+    assert len(seeds) > 1, "use run_iid directly for a single seed"
+    t0 = time.time()
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    base_dir   = cfg['results_dir']
+    agg_dir    = os.path.join(base_dir, f'iid_{mode}_agg_{ts}')
+    fig_dir    = os.path.join(agg_dir, 'figures')
+    os.makedirs(fig_dir, exist_ok=True)
+
+    print(f"\n{'='*60}", flush=True)
+    print(f"MULTI-SEED run  mode={mode}  seeds={seeds}", flush=True)
+    print(f"{'='*60}\n", flush=True)
+
+    all_metrics = []
+    seed_dirs   = []
+    for s in seeds:
+        cfg_s = {**cfg, 'seed': int(s),
+                 'results_dir': os.path.join(agg_dir, f'seed_{s}')}
+        os.makedirs(cfg_s['results_dir'], exist_ok=True)
+        print(f"\n--- seed {s} ---", flush=True)
+        run_dir_s, m_s = run_iid(cfg_s, mode)
+        all_metrics.append(m_s)
+        seed_dirs.append(run_dir_s)
+
+    # ---- aggregate ----
+    DETS     = list(all_metrics[0]['vs_n'].keys())
+    n_list   = all_metrics[0]['n_list']
+    rho_list = all_metrics[0]['rho_list']
+    n_fixed  = all_metrics[0]['n_fixed']
+    pfa      = all_metrics[0]['pfa']
+    pauc_fpr = all_metrics[0]['pauc_fpr']
+
+    def _agg(vals_list):
+        """[array_seed0, array_seed1, ...] → (mean_arr, std_arr)"""
+        arr = np.array([[float(v) if v == v else np.nan for v in row]
+                        for row in vals_list])   # (n_seeds, n_points)
+        return arr.mean(axis=0).tolist(), arr.std(axis=0).tolist()
+
+    agg = {
+        'mode': mode, 'seeds': seeds, 'n_list': n_list, 'rho_list': rho_list,
+        'n_fixed': n_fixed, 'pfa': pfa, 'pauc_fpr': pauc_fpr,
+        'vs_n':   {d: {} for d in DETS},
+        'vs_rho': {d: {} for d in DETS},
+    }
+    for d in DETS:
+        for metric in ('auc', 'pauc', 'pd'):
+            if metric in all_metrics[0]['vs_n'][d]:
+                mu, sd = _agg([m['vs_n'][d][metric] for m in all_metrics])
+                agg['vs_n'][d][metric]     = mu
+                agg['vs_n'][d][f'{metric}_std'] = sd
+        for metric in ('auc', 'pd'):
+            mu, sd = _agg([m['vs_rho'][d][metric] for m in all_metrics])
+            agg['vs_rho'][d][metric]     = mu
+            agg['vs_rho'][d][f'{metric}_std'] = sd
+
+    # ROC: aggregate at nmax and nfixed — store per-seed + mean
+    for roc_key in ('roc_at_nmax', 'roc_at_nfixed'):
+        if roc_key in all_metrics[0]:
+            agg[roc_key] = {}
+            for d in DETS:
+                aucs = [m[roc_key][d]['auc'] for m in all_metrics if roc_key in m]
+                agg[roc_key][d] = {
+                    'auc_mean': float(np.mean(aucs)),
+                    'auc_std':  float(np.std(aucs)),
+                    'auc_per_seed': aucs,
+                }
+
+    yaml.dump({**cfg, 'seed': seeds},
+              open(os.path.join(agg_dir, 'config.yaml'), 'w'))
+    json.dump(agg, open(os.path.join(agg_dir, 'metrics_aggregate.json'), 'w'),
+              indent=2, default=str)
+
+    # ---- aggregated figures (mean ± std shading) ----
+    def _mean(sweep, metric):
+        return {d: agg[sweep][d][metric] for d in DETS}
+
+    def _std(sweep, metric):
+        return {d: agg[sweep][d].get(f'{metric}_std') for d in DETS}
+
+    n_seeds = len(seeds)
+    suf = f'  (n={n_seeds} seeds)'
+
+    _plot_vs(n_list, _mean('vs_n','auc'), 'training samples  n', 'AUC',
+             f'AUC vs n{suf}', os.path.join(fig_dir,'auc_vs_n.pdf'),
+             logx=True, series_std=_std('vs_n','auc'))
+    _plot_vs(n_list, _mean('vs_n','pauc'), 'training samples  n',
+             f'partial AUC (Pfa<{pauc_fpr})',
+             f'Partial AUC (Pfa<{pauc_fpr}) vs n{suf}',
+             os.path.join(fig_dir,'pauc_vs_n.pdf'),
+             logx=True, series_std=_std('vs_n','pauc'))
+    _plot_vs(n_list, _mean('vs_n','pd'), 'training samples  n',
+             f'Pd @ Pfa={pfa}', f'Pd @ Pfa={pfa} vs n{suf}',
+             os.path.join(fig_dir,'pd_at_fa_vs_n.pdf'),
+             logx=True, series_std=_std('vs_n','pd'))
+    _plot_vs(rho_list, _mean('vs_rho','auc'), r'DSM noise level  $\rho$', 'AUC',
+             f'AUC vs ρ (n={n_fixed}){suf}',
+             os.path.join(fig_dir,'auc_vs_rho.pdf'),
+             logx=True, series_std=_std('vs_rho','auc'))
+    _plot_vs(rho_list, _mean('vs_rho','pd'), r'DSM noise level  $\rho$',
+             f'Pd @ Pfa={pfa}', f'Pd @ Pfa={pfa} vs ρ (n={n_fixed}){suf}',
+             os.path.join(fig_dir,'pdet_at_pfa_vs_rho.pdf'),
+             logx=True, series_std=_std('vs_rho','pd'))
+
+    # ROC summary bar: mean AUC ± std at n_max
+    if 'roc_at_nmax' in agg:
+        fig, ax = plt.subplots(figsize=(5.5, 3.5))
+        dets_r = list(agg['roc_at_nmax'].keys())
+        means  = [agg['roc_at_nmax'][d]['auc_mean'] for d in dets_r]
+        stds   = [agg['roc_at_nmax'][d]['auc_std']  for d in dets_r]
+        colors = [_det_color(d) for d in dets_r]
+        bars = ax.bar(dets_r, means, yerr=stds, color=colors, capsize=4, alpha=0.85)
+        ax.set_ylabel('AUC'); ax.set_ylim(0, 1)
+        ax.set_title(f'AUC at n={n_list[-1]}  (mean±std, {n_seeds} seeds)', fontsize=9)
+        ax.grid(axis='y', alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, 'roc_auc_bar_nmax.pdf'), bbox_inches='tight')
+        plt.close(fig)
+
+    elapsed = (time.time() - t0) / 60.0
+    print(f"\nMULTI-SEED DONE  {elapsed:.1f} min  →  {agg_dir}", flush=True)
+    return agg_dir, agg
