@@ -16,7 +16,7 @@ provider_cfg:
   seed: 42
 
 detectors: [AMF, Reg-AMF, CEM, GMM-Levin, Self-GMM, Spatial-GMM,
-            DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR]
+            DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR, MCLT]
 
 detector_cfg:
   Self-GMM:    {K: 9}
@@ -30,4 +30,4 @@ seed: 42
 
 dry_run_amplitudes: [0.15]
 dry_run_provider_cfg: {scenarios: [0], n_budget: 400}
-dry_run_detector_cfg: {cfattn_epochs: 8, nmlp_epochs: 8, dsm_epochs: 20}
+dry_run_detector_cfg: {cfattn_epochs: 8, nmlp_epochs: 8, dsm_epochs: 20, mclt_epochs: 3}
