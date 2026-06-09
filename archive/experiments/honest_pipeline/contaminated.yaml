@@ -1,0 +1,65 @@
+# =========================================================================
+# Contaminated-Gaussian experiment (Ami's suggestion)
+#
+# Replicates the contaminated-Gaussian theory experiment using real
+# hyperspectral data and learned scores.
+#
+# Background = 80% Meadows (cls 2) + 20% Gravel (cls 3)
+#   → mildly non-Gaussian, two-component mixture
+# Target    = Metal sheets (cls 5)
+#   → spectrally very distinct (mean DN ~3154 vs background ~1400)
+#
+# NO PCA — score network sees all 103 raw spectral bands.
+# NO normalization — raw DN values passed directly to networks.
+#   (values roughly in [0, 8000]; divide by 10000 for numerical stability
+#    without fitting any data statistics — set scale_factor: 10000)
+#
+# Detectors:
+#   AMF          — classical Gaussian matched filter (raw data)
+#   DSM-linear   — linear score network (hidden_dims: [])
+#   DSM-small    — shallow MLP (hidden_dims: [32, 32])
+#   DSM-medium   — deeper MLP  (hidden_dims: [64, 64])
+#
+# Usage:
+#   .venv/bin/python -u experiments/honest_pipeline/run_contaminated.py \
+#       --config experiments/honest_pipeline/contaminated.yaml
+# =========================================================================
+
+dataset:     data/pavia-u.mat
+results_dir: experiments/honest_pipeline/results
+
+# ----- contaminated background -----
+bkg_majority_cls:  2        # meadows  (18 649 px)
+bkg_contam_cls:    3        # gravel   ( 2 099 px)
+bkg_contam_frac:   0.20     # 20 % contamination fraction
+target_cls:        1        # metal sheets
+
+# ----- preprocessing -----
+scale_factor:  1        # fixed divisor for numerical stability (NOT data-adaptive)
+                            # set to null to use truly raw integer DN values
+
+# ----- planted target -----
+amp_list:         [0.05, 0.10, 0.15, 0.20, 0.30]
+target_fraction:  0.10      # fraction of test pixels that contain a target
+
+# ----- sweep axes -----
+n_train_list:  [100, 200, 500, 1000, 2000]
+test_n:        2000
+
+# ----- DSM architectures (sweep) -----
+architectures:
+  linear: []            # linear score model — equivalent to regularized AMF
+  small:  [32, 32]      # shallow MLP
+  medium: [64, 64]      # medium MLP
+
+activation:   silu
+
+# ----- DSM training (shared across architectures) -----
+rho:           0.01     # sigma^2 = rho * tr(Sigma) / D
+dsm_epochs:    2000
+lr:            0.001
+weight_decay:  0.00001
+batch_size:    256
+
+# ----- reproducibility -----
+seeds:  [42, 43, 44, 45, 46]

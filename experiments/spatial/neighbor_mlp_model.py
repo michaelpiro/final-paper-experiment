@@ -27,7 +27,8 @@ class NeighborMLPDenoiser(nn.Module):
 
     def __init__(self, D: int, d_lat: int = 32, K: int = 8,
                  hidden: int = 128, n_layers: int = 3,
-                 sigma: float = 0.1, activation: str = 'silu'):
+                 sigma: float = 0.1, activation: str = 'silu',
+                 whitening=None):
         """
         Parameters
         ----------
@@ -44,6 +45,7 @@ class NeighborMLPDenoiser(nn.Module):
         self.d_lat = d_lat
         self.K     = K
         self.sigma = sigma
+        self.whitening = whitening
 
         act_cls = {'silu': nn.SiLU, 'relu': nn.ReLU}[activation]
 
@@ -60,9 +62,25 @@ class NeighborMLPDenoiser(nn.Module):
         # Denoiser: [y_i | z_i | z_j1...z_jK] -> D
         self.f = _mlp(D + d_lat * (1 + K), D, hidden, n_layers)
 
+    def whiten(self, x: torch.Tensor) -> torch.Tensor:
+        return self.whitening(x) if self.whitening is not None else x
+
+    def to_data_space(self, score_w: torch.Tensor) -> torch.Tensor:
+        """Un-whiten a whitened-space score into a DATA-SPACE score (score_w @ W)."""
+        return score_w @ self.whitening.W if self.whitening is not None else score_w
+
     def forward(self, y: torch.Tensor,
                 neighbors: torch.Tensor) -> torch.Tensor:
+        """Public forward: whiten raw y + neighbors, run the Tweedie score in
+        whitened space, then map back to DATA space (detection uses raw signature)."""
+        score_w = self._forward_inner(self.whiten(y), self.whiten(neighbors))
+        return self.to_data_space(score_w)
+
+    def _forward_inner(self, y: torch.Tensor,
+                       neighbors: torch.Tensor) -> torch.Tensor:
         """
+        Score on ALREADY-WHITENED inputs.
+
         Parameters
         ----------
         y         : (B, D)    noisy observation (corrupted for training, raw for eval)
@@ -110,10 +128,13 @@ def neighbor_mlp_dsm_loss(model: NeighborMLPDenoiser,
     Corrupts x with Gaussian noise, asks model to predict denoising direction.
     """
     sigma = model.sigma
-    eps   = torch.randn_like(x) * sigma
-    y     = x + eps
+    # Whiten first, then add DSM noise IN WHITENED SPACE.
+    x_w   = model.whiten(x)
+    nbr_w = model.whiten(neighbors)
+    eps   = torch.randn_like(x_w) * sigma
+    y     = x_w + eps
     target = -eps / (sigma ** 2)               # (B, D) — the true score direction
-    score  = model(y, neighbors)               # (B, D)
+    score  = model._forward_inner(y, nbr_w)    # (B, D)
     return ((score - target) ** 2).sum(-1).mean()
 
 

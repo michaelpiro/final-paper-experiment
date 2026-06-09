@@ -45,7 +45,6 @@ import torch
 import yaml
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from tqdm import tqdm
 
@@ -66,7 +65,7 @@ from final_paper_experiments.evaluation import (
     scores_to_spatial_map,
 )
 from final_paper_experiments.models.neighbor_adapted import extract_neighborhoods
-from dsm_model import ScoreNet, dsm_loss
+from dsm_model import ScoreNet, dsm_loss, Whitening
 from cfattn_model import (
     CFAttnGaussianScoreNet, cfattn_dsm_loss,
     score_cfattn_additive,
@@ -96,7 +95,7 @@ CLS_NAMES = {
 # ---------------------------------------------------------------------------
 DEFAULT_CFG = dict(
     dataset='data/pavia-u.mat',
-    norm_mode='global_max',
+    norm_mode='none',           # RAW sensor values — no scaling (no PCA anywhere)
     manual_boxes_path='experiments/spatial/manual_boxes.json',
     sig_dom_weight=0.8,
     sig_mean_weight=0.2,
@@ -124,6 +123,9 @@ DEFAULT_CFG = dict(
     # shared
     activation='silu',
     dsm_sigma_rho=0.01,
+    # frozen whitening front-end (replaces PCA): raw data in, nets whiten internally
+    whiten_mode='zca',          # 'zca' | 'pca' | 'cholesky'  (easy one-line swap)
+    whiten_eig_floor=1e-3,      # RELATIVE eigenvalue floor (× λ_max)
     batch_size=256,
     weight_decay=1e-4,
     seed=42,
@@ -163,18 +165,47 @@ def _crop_raw_box(data_norm, box):
     return data_norm[r0:r1, c0:c1].reshape(-1, data_norm.shape[-1])
 
 
-def _train_cfattn(D, sigma, tr_pca, tr_nbr, cfg, device, seed):
+def _make_whitening(tr_raw, cfg, device):
+    """Frozen whitening front-end fit on the RAW training background."""
+    W = Whitening.from_data(np.asarray(tr_raw, dtype=np.float32),
+                            mode=cfg.get('whiten_mode', 'zca'),
+                            eig_floor=float(cfg.get('whiten_eig_floor', 1e-3)))
+    return W.to(device)
+
+
+def _whiten_np(W, X, device):
+    with torch.no_grad():
+        t = torch.tensor(np.asarray(X, dtype=np.float32), device=device)
+        return W(t).cpu().numpy()
+
+
+def _whitened_sigma(cfg):
+    """In whitened space cov ≈ I, so σ² = ρ·1 ⇒ σ = √ρ (matches the reference)."""
+    return float(np.sqrt(cfg['dsm_sigma_rho']))
+
+
+def _placeholder_whitening(D):
+    """Identity whitening of the right shape so load_state_dict can fill its buffers."""
+    return Whitening(np.zeros(D, dtype=np.float32), np.eye(D, dtype=np.float32))
+
+
+def _train_cfattn(tr_raw, tr_nbr_raw, cfg, device, seed):
+    """Train CF-Attn on RAW data; whiten internally, kmeans init in whitened space."""
+    D = tr_raw.shape[1]
+    W = _make_whitening(tr_raw, cfg, device)
+    tr_w = _whiten_np(W, tr_raw, device)       # whitened atoms for kmeans init
+    sigma = _whitened_sigma(cfg)
     cfattn = CFAttnGaussianScoreNet(
         D=D, h=cfg['cfattn_h'], K=cfg['cfattn_K'],
-        sigma=sigma, eps=cfg.get('cfattn_eps', 1e-4)).to(device)
+        sigma=sigma, eps=cfg.get('cfattn_eps', 1e-4), whitening=W).to(device)
     km = KMeans(n_clusters=cfg['cfattn_K'], init='k-means++',
-                n_init=5, random_state=seed, max_iter=100).fit(tr_pca)
+                n_init=5, random_state=seed, max_iter=100).fit(tr_w)
     cfattn.comp_mu.data.copy_(
         torch.tensor(km.cluster_centers_, dtype=torch.float32).to(device))
     opt = torch.optim.AdamW(cfattn.parameters(), lr=cfg['cfattn_lr'],
                             weight_decay=cfg['weight_decay'])
-    Xtr = torch.tensor(tr_pca, dtype=torch.float32).to(device)
-    Ntr = torch.tensor(tr_nbr, dtype=torch.float32).to(device)
+    Xtr = torch.tensor(tr_raw, dtype=torch.float32).to(device)
+    Ntr = torch.tensor(tr_nbr_raw, dtype=torch.float32).to(device)
     P   = len(Xtr)
     pbar = tqdm(range(cfg['cfattn_epochs']), desc='CF-Attn', dynamic_ncols=True, leave=False)
     for ep in pbar:
@@ -194,15 +225,19 @@ def _train_cfattn(D, sigma, tr_pca, tr_nbr, cfg, device, seed):
     return cfattn
 
 
-def _train_nmlp(D, sigma, tr_pca, tr_nbr, cfg, device):
+def _train_nmlp(tr_raw, tr_nbr_raw, cfg, device):
+    """Train NeighborMLP on RAW data; whiten internally."""
+    D = tr_raw.shape[1]
+    W = _make_whitening(tr_raw, cfg, device)
+    sigma = _whitened_sigma(cfg)
     nmlp = NeighborMLPDenoiser(
         D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
         hidden=cfg['nmlp_hidden'], n_layers=cfg['nmlp_n_layers'],
-        sigma=sigma, activation=cfg['activation']).to(device)
+        sigma=sigma, activation=cfg['activation'], whitening=W).to(device)
     opt  = torch.optim.AdamW(nmlp.parameters(), lr=cfg['nmlp_lr'],
                               weight_decay=cfg['weight_decay'])
-    Xtr = torch.tensor(tr_pca, dtype=torch.float32).to(device)
-    Ntr = torch.tensor(tr_nbr, dtype=torch.float32).to(device)
+    Xtr = torch.tensor(tr_raw, dtype=torch.float32).to(device)
+    Ntr = torch.tensor(tr_nbr_raw, dtype=torch.float32).to(device)
     P   = len(Xtr)
     pbar = tqdm(range(cfg['nmlp_epochs']), desc='NeighborMLP', dynamic_ncols=True, leave=False)
     for ep in pbar:
@@ -215,11 +250,17 @@ def _train_nmlp(D, sigma, tr_pca, tr_nbr, cfg, device):
     return nmlp
 
 
-def _train_dsm(D, sigma, tr_pca, cfg, device):
-    dsm_net = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation']).to(device)
+def _train_dsm(tr_raw, cfg, device):
+    """Train per-pixel DSM on RAW data; whiten internally (replaces PCA + z-score)."""
+    D = tr_raw.shape[1]
+    W = _make_whitening(tr_raw, cfg, device)
+    sigma = _whitened_sigma(cfg)
+    dsm_net = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'],
+                       whitening=W).to(device)
+    dsm_net.sigma = sigma          # expose for downstream metadata
     opt     = torch.optim.Adam(dsm_net.parameters(), lr=cfg['dsm_lr'],
                                weight_decay=cfg['weight_decay'])
-    Xtr = torch.tensor(tr_pca, dtype=torch.float32).to(device)
+    Xtr = torch.tensor(tr_raw, dtype=torch.float32).to(device)
     P   = len(Xtr)
     pbar = tqdm(range(cfg['dsm_epochs']), desc='DSM', dynamic_ncols=True, leave=False)
     for ep in pbar:
@@ -256,8 +297,8 @@ def _train_thantd(D_raw, tr_raw, sig_raw, cfg, device, rng):
 # Per-scenario runner
 # ---------------------------------------------------------------------------
 
-def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
-                 data_norm, gt, sigma, results_dir,
+def run_scenario(sid, scenario, n_budget, cfg,
+                 data_norm, gt, results_dir,
                  run_thantd=True, device='cpu', dry_run=False):
     """
     Train models and evaluate all detectors for one (scenario, budget) pair.
@@ -284,49 +325,37 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
     torch.manual_seed(seed)
 
     H, W, D_raw = data_norm.shape
-    D = pca_img.shape[-1]
+    D = D_raw                       # NO PCA: nets/detectors work in raw band space
     k = int(cfg['k'])
 
-    # ---- Crop + subsample training pixels ----
-    tr_pca_full, tr_nbr_full = _crop_pca_box(pca_img, train_box, k)
-    tr_raw_full              = _crop_raw_box(data_norm, train_box)
+    # ---- Crop + subsample training pixels (RAW bands) ----
+    tr_raw_full, tr_nbr_full = _crop_pca_box(data_norm, train_box, k)
 
-    tr_pca, tr_nbr, tr_idx = _subsample(tr_pca_full, tr_nbr_full, n_budget, rng)
-    tr_raw = tr_raw_full[tr_idx]
-    print(f"  train={len(tr_pca)} px", flush=True)
+    tr_raw, tr_nbr, tr_idx = _subsample(tr_raw_full, tr_nbr_full, n_budget, rng)
+    print(f"  train={len(tr_raw)} px", flush=True)
 
-    # ---- Full test box (ALL pixels, no subsampling) ----
+    # ---- Full test box (ALL pixels, no subsampling), RAW bands ----
     r0t, r1t, c0t, c1t = test_box
     H_b, W_b = r1t - r0t, c1t - c0t
-    te_pca_full, te_nbr_full = _crop_pca_box(pca_img, test_box, k)
-    te_raw_full              = _crop_raw_box(data_norm, test_box)
+    te_raw_full, te_nbr_full = _crop_pca_box(data_norm, test_box, k)
     te_gt_full               = gt[r0t:r1t, c0t:c1t].ravel()
-    te_idx_full              = np.arange(len(te_pca_full))  # all test pixels, in order
-    print(f"  test={len(te_pca_full)} px", flush=True)
+    te_idx_full              = np.arange(len(te_raw_full))  # all test pixels, in order
+    print(f"  test={len(te_raw_full)} px", flush=True)
 
-    # ---- Target signature ----
+    # ---- Target signature (RAW band space) ----
     w_dom  = float(cfg.get('sig_dom_weight', 0.8))
     w_mean = float(cfg.get('sig_mean_weight', 0.2))
     te_raw_box = data_norm[r0t:r1t, c0t:c1t]
     sig_raw, dom_cls, dom_name = compute_signature(
         gt[r0t:r1t, c0t:c1t], te_raw_box,
         w_dom=w_dom, w_mean=w_mean)
-    s_pca = pca.transform(sig_raw[None]).flatten().astype(np.float32)
+    sig_raw = sig_raw.astype(np.float32)
     print(f"  signature: {w_dom}·{dom_name} + {w_mean}·patch_mean  "
-          f"||s_pca||={np.linalg.norm(s_pca):.4f}", flush=True)
+          f"||s_raw||={np.linalg.norm(sig_raw):.4f}", flush=True)
 
-    # ---- DSM per-band standardization (from TRAINING pixels only) ----
-    # The PCA bands have very different variances (PC1 ≫ later PCs). With
-    # isotropic DSM noise the loss is dominated by high-variance bands and the
-    # score in low-variance directions — where much discriminative structure
-    # lives — is poorly learned, collapsing DSM-LMP to ≈AMF.  Z-scoring each
-    # band equalizes the scales so the score net learns all directions.
-    # The additive offset θ·s transforms as θ·(s/σ_band) under standardization.
-    dsm_mu = tr_pca.mean(axis=0).astype(np.float32)
-    dsm_sd = (tr_pca.std(axis=0) + 1e-8).astype(np.float32)
-    tr_pca_dsm = ((tr_pca - dsm_mu) / dsm_sd).astype(np.float32)
-    s_pca_dsm  = (s_pca / dsm_sd).astype(np.float32)
-    sigma_dsm  = compute_sigma_from_data(tr_pca_dsm, cfg['dsm_sigma_rho'])
+    # ---- sigma for the classical detectors (Reg-AMF). Our score nets compute
+    #      their own whitened-space sigma (=sqrt(rho)) internally.
+    sigma = compute_sigma_from_data(tr_raw, cfg['dsm_sigma_rho'])
 
     # ---- Train models (with checkpoint save/load) ----
     def ckpt(name):
@@ -338,13 +367,14 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
         print("  [CF-Attn] loading checkpoint", flush=True)
         cfattn = CFAttnGaussianScoreNet(
             D=D, h=cfg['cfattn_h'], K=cfg['cfattn_K'],
-            sigma=sigma, eps=cfg.get('cfattn_eps', 1e-4))
+            sigma=_whitened_sigma(cfg), eps=cfg.get('cfattn_eps', 1e-4),
+            whitening=_placeholder_whitening(D))
         cfattn.load_state_dict(torch.load(cf_ckpt, map_location='cpu')['state_dict'])
         cfattn.eval()
     else:
         print("  [CF-Attn] training ...", flush=True)
         t0 = time.time()
-        cfattn = _train_cfattn(D, sigma, tr_pca, tr_nbr, cfg, device, seed)
+        cfattn = _train_cfattn(tr_raw, tr_nbr, cfg, device, seed)
         torch.save({'state_dict': cfattn.state_dict(), 'cfg': cfg}, cf_ckpt)
         print(f"  [CF-Attn] done in {time.time()-t0:.0f}s", flush=True)
 
@@ -355,13 +385,14 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
         nmlp = NeighborMLPDenoiser(
             D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
             hidden=cfg['nmlp_hidden'], n_layers=cfg['nmlp_n_layers'],
-            sigma=sigma, activation=cfg['activation'])
+            sigma=_whitened_sigma(cfg), activation=cfg['activation'],
+            whitening=_placeholder_whitening(D))
         nmlp.load_state_dict(torch.load(nmlp_ckpt, map_location='cpu')['state_dict'])
         nmlp.eval()
     else:
         print("  [NeighborMLP] training ...", flush=True)
         t0 = time.time()
-        nmlp = _train_nmlp(D, sigma, tr_pca, tr_nbr, cfg, device)
+        nmlp = _train_nmlp(tr_raw, tr_nbr, cfg, device)
         torch.save({'state_dict': nmlp.state_dict(), 'cfg': cfg}, nmlp_ckpt)
         print(f"  [NeighborMLP] done in {time.time()-t0:.0f}s", flush=True)
 
@@ -369,13 +400,14 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
     dsm_ckpt = ckpt('dsm')
     if os.path.exists(dsm_ckpt):
         print("  [DSM] loading checkpoint", flush=True)
-        dsm_net = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'])
+        dsm_net = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'],
+                           whitening=_placeholder_whitening(D))
         dsm_net.load_state_dict(torch.load(dsm_ckpt, map_location='cpu')['state_dict'])
         dsm_net.eval()
     else:
         print("  [DSM] training ...", flush=True)
         t0 = time.time()
-        dsm_net = _train_dsm(D, sigma_dsm, tr_pca_dsm, cfg, device)
+        dsm_net = _train_dsm(tr_raw, cfg, device)
         torch.save({'state_dict': dsm_net.state_dict(), 'cfg': cfg}, dsm_ckpt)
         print(f"  [DSM] done in {time.time()-t0:.0f}s", flush=True)
 
@@ -413,30 +445,27 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
     tr_nbr_f = tr_nbr.astype(np.float32)
 
     for tm in ('additive',):
-        planted_pca, labels, tgt_idx = plant_targets(
-            te_pca_full, s_pca, cfg['amplitude'], cfg['target_fraction'],
-            model=tm, seed=seed)
-        planted_raw, _, _ = plant_targets(
+        planted_raw, labels, tgt_idx = plant_targets(
             te_raw_full, sig_raw, cfg['amplitude'], cfg['target_fraction'],
             model=tm, seed=seed)
         tgt_idx_dict[tm] = tgt_idx
 
+        # our score nets: RAW input (whiten internally) + RAW signature (data-space scores)
         sc_cfa_cfar = score_cfattn_additive_cfar(
-            cfattn, planted_pca, te_nbr_f, s_pca)
+            cfattn, planted_raw, te_nbr_f, sig_raw)
         sc_cfa      = score_cfattn_additive(
-            cfattn, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
+            cfattn, planted_raw, te_nbr_f, tr_raw, tr_nbr_f, sig_raw)
         sc_nmlp     = score_nmlp_additive(
-            nmlp, planted_pca, te_nbr_f, tr_pca, tr_nbr_f, s_pca)
-        planted_pca_dsm = ((planted_pca - dsm_mu) / dsm_sd).astype(np.float32)
-        sc_dsm      = dsm_additive(planted_pca_dsm, tr_pca_dsm, dsm_net, s_pca_dsm)
+            nmlp, planted_raw, te_nbr_f, tr_raw, tr_nbr_f, sig_raw)
+        sc_dsm      = dsm_additive(planted_raw, tr_raw, dsm_net, sig_raw)
 
-        sc_amf    = amf(planted_pca, tr_pca, s_pca)
-        sc_regamf = reg_amf(planted_pca, tr_pca, s_pca, sigma)
+        sc_amf    = amf(planted_raw, tr_raw, sig_raw)
+        sc_regamf = reg_amf(planted_raw, tr_raw, sig_raw, sigma)
 
-        sc_gmmglrt = gmm_glrt(planted_pca, tr_pca, s_pca,
+        sc_gmmglrt = gmm_glrt(planted_raw, tr_raw, sig_raw,
                               K=cfg.get('gmm_K', 3),
                               theta_steps=cfg.get('gmm_steps', 50))
-        sc_levin   = gmm_glrt_levin_additive(planted_pca, tr_pca, s_pca,
+        sc_levin   = gmm_glrt_levin_additive(planted_raw, tr_raw, sig_raw,
                                               p_steps=cfg.get('gmm_steps', 50))
 
         det_scores = {
@@ -461,19 +490,19 @@ def run_scenario(sid, scenario, n_budget, cfg, pca, pca_img,
         # Use CLEAN training pixels (no planted targets) for threshold setting
         with torch.no_grad():
             tr_sc_cfar = score_cfattn_additive_cfar(
-                cfattn, tr_pca, tr_nbr_f, s_pca)
+                cfattn, tr_raw, tr_nbr_f, sig_raw)
             tr_sc_cfa  = score_cfattn_additive(
-                cfattn, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
+                cfattn, tr_raw, tr_nbr_f, tr_raw, tr_nbr_f, sig_raw)
             tr_sc_nmlp = score_nmlp_additive(
-                nmlp, tr_pca, tr_nbr_f, tr_pca, tr_nbr_f, s_pca)
-            tr_sc_dsm  = dsm_additive(tr_pca_dsm, tr_pca_dsm, dsm_net, s_pca_dsm)
+                nmlp, tr_raw, tr_nbr_f, tr_raw, tr_nbr_f, sig_raw)
+            tr_sc_dsm  = dsm_additive(tr_raw, tr_raw, dsm_net, sig_raw)
 
-        tr_sc_amf    = amf(tr_pca, tr_pca, s_pca)
-        tr_sc_regamf = reg_amf(tr_pca, tr_pca, s_pca, sigma)
-        tr_sc_gmmglrt = gmm_glrt(tr_pca, tr_pca, s_pca,
+        tr_sc_amf    = amf(tr_raw, tr_raw, sig_raw)
+        tr_sc_regamf = reg_amf(tr_raw, tr_raw, sig_raw, sigma)
+        tr_sc_gmmglrt = gmm_glrt(tr_raw, tr_raw, sig_raw,
                                  K=cfg.get('gmm_K', 3),
                                  theta_steps=cfg.get('gmm_steps', 50))
-        tr_sc_levin   = gmm_glrt_levin_additive(tr_pca, tr_pca, s_pca,
+        tr_sc_levin   = gmm_glrt_levin_additive(tr_raw, tr_raw, sig_raw,
                                                  p_steps=cfg.get('gmm_steps', 50))
         train_scores = {
             'CF-Attn-CFAR': tr_sc_cfar,
@@ -668,17 +697,10 @@ def main():
     all_flat      = data_norm.reshape(-1, D_raw)
     print(f"Image {H}×{W}×{D_raw}  norm={cfg['norm_mode']}", flush=True)
 
-    # ---- PCA (fit once on all pixels) ----
-    D   = int(cfg['latent_dim'])
-    pca = PCA(n_components=D, random_state=seed).fit(all_flat)
-    pca_img = pca.transform(all_flat).reshape(H, W, D).astype(np.float32)
-    with open(os.path.join(run_dir, 'pca.pkl'), 'wb') as fh:
-        pickle.dump(pca, fh)
-    print(f"PCA fit: {D} components  "
-          f"(explained var: {pca.explained_variance_ratio_.sum():.3f})", flush=True)
-
-    sigma   = compute_sigma_from_data(pca.transform(all_flat), cfg['dsm_sigma_rho'])
-    print(f"σ = {sigma:.5f}", flush=True)
+    # ---- NO PCA: every detector consumes raw bands; our nets whiten internally
+    #      (frozen ZCA first layer, fit per-scenario on the training box). ----
+    print(f"RAW band space: D={D_raw} (no PCA, whiten_mode={cfg.get('whiten_mode','zca')})",
+          flush=True)
 
     # ---- Load scenarios ----
     manual_path = cfg.get('manual_boxes_path',
@@ -725,11 +747,8 @@ def main():
                 scenario=scenario,
                 n_budget=n_budget,
                 cfg=cfg,
-                pca=pca,
-                pca_img=pca_img,
                 data_norm=data_norm,
                 gt=gt,
-                sigma=sigma,
                 results_dir=run_dir,
                 run_thantd=(not args.no_thantd),
                 device=device,

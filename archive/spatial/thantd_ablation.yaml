@@ -1,0 +1,117 @@
+# =========================================================================
+# Spatial models ablation — THANTD vs CF-Attn vs NeighborMLP vs DSM
+# =========================================================================
+# Sweeps key THANTD hyper-parameters to find the best configuration,
+# while keeping the other spatial models fixed at their default settings.
+#
+# Usage:
+#   .venv/bin/python -u experiments/spatial/run_thantd_ablation.py \
+#       --config experiments/spatial/thantd_ablation.yaml
+
+dataset:     data/pavia-u.mat
+norm_mode:   global_max
+results_dir: experiments/spatial/results
+
+# ----- spatial rectangles -----
+train_box:   [323, 426, 11, 167]
+test_box:    [443, 529, 87, 291]
+
+# ----- dominant-class offset signature -----
+sig_dom_weight:  0.9
+sig_mean_weight: 0.1
+
+# ----- planted target -----
+amplitude:        0.15
+target_fraction:  0.10
+train_n:          4000
+test_n:           4000
+
+# ----- PCA / neighborhood -----
+latent_dim: 5
+k:          5
+
+# ----- THANTD ablation axes -----
+# Each run trains one THANTD with this config + all non-THANTD baselines
+thantd_configs:
+  - label:         "THANTD-default"
+    thantd_m:      7
+    thantd_d:      64
+    thantd_heads:  4
+    thantd_epochs: 300
+    thantd_lr:     1.0e-4
+
+  - label:         "THANTD-large"
+    thantd_m:      7
+    thantd_d:      128
+    thantd_heads:  8
+    thantd_epochs: 300
+    thantd_lr:     1.0e-4
+
+  - label:         "THANTD-small"
+    thantd_m:      7
+    thantd_d:      32
+    thantd_heads:  2
+    thantd_epochs: 300
+    thantd_lr:     1.0e-4
+
+  - label:         "THANTD-long"
+    thantd_m:      7
+    thantd_d:      64
+    thantd_heads:  4
+    thantd_epochs: 600
+    thantd_lr:     1.0e-4
+
+  - label:         "THANTD-window11"
+    thantd_m:      11
+    thantd_d:      64
+    thantd_heads:  4
+    thantd_epochs: 300
+    thantd_lr:     1.0e-4
+
+  - label:         "THANTD-window3"
+    thantd_m:      3
+    thantd_d:      64
+    thantd_heads:  4
+    thantd_epochs: 300
+    thantd_lr:     1.0e-4
+
+# ----- THANTD shared params -----
+thantd_batch:    64
+thantd_margin:   0.3
+thantd_lambda:   0.5
+thantd_alpha:    0.5
+thantd_n_pairs:  2048
+thantd_use_secondary: false
+
+# ----- CF-Attention model -----
+cfattn_h:       64
+cfattn_K:       9
+cfattn_eps:     1.0e-4
+cfattn_epochs:  300
+cfattn_lr:      3.0e-4
+lam_ent:        0.05
+lam_div:        0.05
+lam_cov:        1.0e-5
+
+# ----- NeighborMLP -----
+nmlp_d_lat:    32
+nmlp_K:        8
+nmlp_hidden:   128
+nmlp_n_layers: 3
+nmlp_epochs:   300
+nmlp_lr:       3.0e-4
+nmlp_batch:    256
+
+# ----- DSM (global baseline) -----
+dsm_hidden:    [64, 64]
+dsm_epochs:    1000
+dsm_lr:        5.0e-4
+
+# ----- shared -----
+activation:    silu
+dsm_sigma_rho: 0.01
+batch_size:    256
+weight_decay:  1.0e-4
+
+# ----- reproducibility -----
+seed: 42

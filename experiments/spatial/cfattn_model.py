@@ -29,15 +29,19 @@ class CFAttnGaussianScoreNet(nn.Module):
     """Closed-Form Attention Gaussian Score Network."""
 
     def __init__(self, D: int, h: int = 64, K: int = 4,
-                 sigma: float = 0.1, eps: float = 1e-4):
+                 sigma: float = 0.1, eps: float = 1e-4, whitening=None):
         """
         Parameters
         ----------
-        D     : spectral / latent dimension
+        D     : spectral / latent dimension (= D_raw when a whitening layer is used)
         h     : hidden dimension for all MLPs and attention
         K     : number of learned Gaussian atoms (global components)
         sigma : DSM noise level (also used in the closed-form inverse)
         eps   : numerical stability term added to the diagonal of Sigma_i
+        whitening : optional frozen Whitening module (first layer). When present,
+                    y AND neighbors are whitened before the closed-form Gaussian;
+                    the net then operates in whitened space (comp_mu atoms live in
+                    whitened space) and detection uses the whitened signature.
         """
         super().__init__()
         self.D = D
@@ -45,6 +49,7 @@ class CFAttnGaussianScoreNet(nn.Module):
         self.K = K
         self.sigma = sigma
         self.eps = eps
+        self.whitening = whitening
 
         # Neighbor embedding: D -> h -> h (ReLU)
         self.phi = nn.Sequential(
@@ -88,9 +93,25 @@ class CFAttnGaussianScoreNet(nn.Module):
         return L @ L.transpose(-1, -2)                            # [K, D, D]
 
     # ------------------------------------------------------------------
+    def whiten(self, x: torch.Tensor) -> torch.Tensor:
+        return self.whitening(x) if self.whitening is not None else x
+
+    def to_data_space(self, score_w: torch.Tensor) -> torch.Tensor:
+        """Un-whiten a whitened-space score into a DATA-SPACE score (score_w @ W)."""
+        return score_w @ self.whitening.W if self.whitening is not None else score_w
+
     def forward(self, y: torch.Tensor,
                 neighbors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Public forward: whiten raw y + neighbors, compute the closed-form score
+        in whitened space, then map back to DATA space (detection uses raw sig)."""
+        s_w, w = self._forward_inner(self.whiten(y), self.whiten(neighbors))
+        return self.to_data_space(s_w), w
+
+    def _forward_inner(self, y: torch.Tensor,
+                       neighbors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
+        Closed-form score on ALREADY-WHITENED inputs.
+
         Parameters
         ----------
         y         : [B, D]    query pixels (may be noised for training)
@@ -174,11 +195,15 @@ def cfattn_dsm_loss(model: CFAttnGaussianScoreNet,
     dsm_item   : float (raw DSM loss, for logging)
     """
     sigma = model.sigma
-    eps_   = torch.randn_like(x) * sigma
-    y_tilde = x + eps_
+    # Whiten first, then add DSM noise IN WHITENED SPACE (consistent with the
+    # whitened-space score the closed-form head produces).
+    x_w   = model.whiten(x)
+    nbr_w = model.whiten(neighbors)
+    eps_   = torch.randn_like(x_w) * sigma
+    y_tilde = x_w + eps_
     target  = -eps_ / (sigma ** 2)                                # [B, D]
 
-    s_i, w = model(y_tilde, neighbors)
+    s_i, w = model._forward_inner(y_tilde, nbr_w)
     loss_dsm = ((s_i - target) ** 2).sum(-1).mean()
 
     # Entropy penalty: high entropy (flat attention) is penalized
@@ -288,12 +313,19 @@ def _cfattn_cfar_forward(model: CFAttnGaussianScoreNet,
     """
     model.eval()
     device = next(model.parameters()).device
-    s_t = torch.tensor(s, dtype=torch.float32).to(device)
+    # The caller passes the RAW (data-space) signature. The local-Fisher head Â_i
+    # is built in WHITENED space, so we whiten the signature here (W·s). The
+    # resulting statistic is whitening-invariant — identical to the data-space form.
+    s_use = model.whitening.transform_direction(s) if model.whitening is not None else s
+    s_t = torch.tensor(np.asarray(s_use, dtype=np.float32)).to(device)
     out = []
     with torch.no_grad():
         for i in range(0, len(y), batch_size):
             y_b   = torch.tensor(y[i:i+batch_size],   dtype=torch.float32).to(device)
             nbr_b = torch.tensor(nbr[i:i+batch_size], dtype=torch.float32).to(device)
+            # whiten raw inputs (local Fisher computed in whitened space)
+            y_b   = model.whiten(y_b)
+            nbr_b = model.whiten(nbr_b)
             B, D  = y_b.shape
 
             # Re-run the forward pass to get mu_i and A_Sigma

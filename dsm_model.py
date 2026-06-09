@@ -110,10 +110,72 @@ class Autoencoder(nn.Module):
         return self.decoder(self.encoder(x))
 
 
-class ScoreNet(nn.Module):
-    """Score network ψ_η: R^d → R^d trained via denoising score matching."""
+class Whitening(nn.Module):
+    """Frozen whitening front-end: x -> (x - mu) @ W.T, where W is computed from
+    a background covariance so cov(output) = I (full-dimensional; replaces PCA).
 
-    def __init__(self, input_dim: int, hidden_dims: list = None, activation: str = "silu"):
+    mode (configurable — keep it a one-line swap):
+      'zca'      W = V Λ^{-1/2} Vᵀ   (symmetric; stays closest to original axes)
+      'pca'      W = Λ^{-1/2} Vᵀ     (rotate to eigenbasis)
+      'cholesky' W = L^{-1}, Σ = L Lᵀ
+
+    The module is FROZEN (buffers, no grad). It also whitens the (B, M, D)
+    neighbor tensor (broadcast over the last axis).
+    """
+
+    def __init__(self, mu, W):
+        super().__init__()
+        self.register_buffer("mu", torch.as_tensor(mu, dtype=torch.float32))
+        self.register_buffer("W",  torch.as_tensor(W,  dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mu) @ self.W.t()
+
+    def transform_direction(self, s) -> np.ndarray:
+        """Whiten a DIRECTION (additive signature; no mean subtraction): s -> W·s."""
+        Wn = self.W.detach().cpu().numpy()
+        return (np.asarray(s, dtype=np.float32) @ Wn.T).astype(np.float32)
+
+    @classmethod
+    def from_data(cls, X: np.ndarray, mode: str = "zca",
+                  eig_floor: float = 1e-3, eps: float = 1e-8):
+        """Fit a frozen whitener from background pixels X.
+
+        eig_floor : RELATIVE eigenvalue floor (× λ_max). CRITICAL for raw
+            hyperspectral data whose covariance spans many orders of magnitude:
+            tiny-variance band directions would otherwise be amplified by
+            1/√(λ→0) and blow up the whitened representation. Flooring at
+            λ_max·eig_floor caps the whitening gain (this is "the whitening
+            problem" — an absolute floor is wrong on raw 103-band data).
+        eps : tiny absolute jitter for PSD safety (cholesky path).
+        """
+        X = np.asarray(X, dtype=np.float64)
+        mu = X.mean(0)
+        Xc = X - mu
+        Sigma = (Xc.T @ Xc) / max(len(X) - 1, 1)
+        Sigma = (Sigma + Sigma.T) / 2
+        if mode == "cholesky":
+            W = np.linalg.inv(np.linalg.cholesky(
+                Sigma + eps * np.eye(Sigma.shape[0])))
+        else:
+            evals, evecs = np.linalg.eigh(Sigma)
+            floor = max(float(evals.max()) * eig_floor, eps)
+            evals = np.clip(evals, floor, None)
+            inv_sqrt = np.diag(1.0 / np.sqrt(evals))
+            W = (inv_sqrt @ evecs.T) if mode == "pca" else (evecs @ inv_sqrt @ evecs.T)
+        return cls(mu.astype(np.float32), W.astype(np.float32))
+
+
+class ScoreNet(nn.Module):
+    """Score network ψ_η: R^d → R^d trained via denoising score matching.
+
+    Optional frozen `whitening` front-end (the first layer). When present the net
+    operates in WHITENED space: forward(x) = net(whiten(x)); the DSM loss whitens
+    first then adds noise in whitened space; detection uses the whitened signature.
+    """
+
+    def __init__(self, input_dim: int, hidden_dims: list = None,
+                 activation: str = "silu", whitening: "Whitening" = None):
         super().__init__()
         if hidden_dims is None:
             hidden_dims = []
@@ -129,9 +191,21 @@ class ScoreNet(nn.Module):
                 layers.append(act_cls())
 
         self.net = nn.Sequential(*layers)
+        self.whitening = whitening
+
+    def whiten(self, x: torch.Tensor) -> torch.Tensor:
+        return self.whitening(x) if self.whitening is not None else x
+
+    def to_data_space(self, score_w: torch.Tensor) -> torch.Tensor:
+        """Un-whiten a whitened-space score into a DATA-SPACE score:
+        ∇_x log p(x) = Wᵀ ∇_w log p(w)  ==  score_w @ W  (per-row)."""
+        return score_w @ self.whitening.W if self.whitening is not None else score_w
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        """Returns the DATA-SPACE score. The net runs in whitened space (for
+        conditioning), then the output is mapped back to data space via Wᵀ so the
+        detection statistic uses the RAW signature directly."""
+        return self.to_data_space(self.net(self.whiten(x)))
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -162,10 +236,14 @@ def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma,
     """
     if not torch.is_tensor(sigma):
         sigma = torch.as_tensor(sigma, dtype=batch.dtype, device=batch.device)
-    eps = torch.randn_like(batch) * sigma          # (B,d), per-band std
-    w_tilde = batch + eps
+    # If the net has a frozen whitening front-end, operate in WHITENED space:
+    # whiten first, then add the DSM noise, and score the inner net directly.
+    w = model.whiten(batch) if hasattr(model, "whiten") else batch
+    inner = model.net if hasattr(model, "net") else model
+    eps = torch.randn_like(w) * sigma              # (B,d), per-band std
+    w_tilde = w + eps
     target = -eps / (sigma ** 2)                    # (w - w̃)/Σ_n = -ε/σ_b²
-    se = (model(w_tilde) - target) ** 2             # (B,d)
+    se = (inner(w_tilde) - target) ** 2             # (B,d)
     if weighted:
         se = se * (sigma ** 2)                      # precondition per band
     return se.sum(dim=-1).mean()

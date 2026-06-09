@@ -36,10 +36,21 @@ def _amf_by_component(Y, s, comp, means, precis):
 class _GMMBase(Detector):
     def fit(self, ctx: DetectorInput) -> "Detector":
         K = int(self.cfg.get("K", 5))
+        Xtr = ctx.train_pix          # RAW bands (no PCA)
+        # Scale-aware diagonal loading: raw hyperspectral bands have large, very
+        # uneven variance, so an absolute reg_covar (1e-5) is negligible and a
+        # full-cov K=9 GMM in ~103-dim goes singular. Default reg_covar to a
+        # fraction of the mean band variance (overridable via cfg).
+        reg = self.cfg.get("reg_covar", None)
+        if reg is None:
+            reg = float(self.cfg.get("reg_covar_rel", 1e-3)
+                        * np.mean(np.var(Xtr, axis=0)))
+        else:
+            reg = float(reg)
         self._gm = GaussianMixture(n_components=K, covariance_type="full",
                                    n_init=int(self.cfg.get("n_init", 3)),
-                                   reg_covar=float(self.cfg.get("reg_covar", 1e-5)),
-                                   random_state=ctx.seed).fit(ctx.train_pix)
+                                   reg_covar=reg,
+                                   random_state=ctx.seed).fit(Xtr)
         self._means = self._gm.means_
         self._precis = np.linalg.inv(self._gm.covariances_)
         return self

@@ -1,0 +1,45 @@
+# =========================================================================
+# Honest pipeline sweep — AUC vs n, single-class, pca_elm ordering
+# =========================================================================
+# pca_elm = raw PCA → scale each PC score by 1/(p99-p1) of training scores.
+# ELM-style two-point normalization applied POST-PCA, where normalization
+# actually matters for the network's conditioning.
+# Both pca_std and pca_elm are invertible affine maps on the PC scores;
+# Proposition 1 guarantees the optimal detector is invariant to either choice.
+
+dataset:     data/pavia-u.mat
+results_dir: experiments/honest_pipeline/results
+
+# ----- normalization -----
+score_norm:  pca_elm             # raw → PCA → scale by 1/(p99-p1) per PC dim
+
+# ----- operational split -----
+target_cls:  1
+bkg_cls:     2
+test_n:      4000
+
+# ----- planted target -----
+amplitude:       0.15
+amp_list:        [0.15]
+target_fraction: 0.10
+
+# ----- sweep axes -----
+n_train_list:    [50, 100, 200, 500, 750, 1000, 2000]
+latent_dim_list: [5]
+rho_list:        [0.001]
+
+# ----- score network -----
+hidden_dims:     [64, 64]
+activation:      silu
+dsm_epochs:      3000
+lrao_epochs:     3000
+lrao_patience:   3
+lrao_val_frac:   0.2
+lfi_delta_theta: 0.001
+lfi_sigma_cutoff: 0.00001
+lr:              0.0005
+weight_decay:    0.00005
+batch_size:      256
+
+# ----- reproducibility -----
+seeds: [42, 43, 44, 45, 46]

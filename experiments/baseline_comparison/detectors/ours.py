@@ -12,14 +12,17 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from final_paper_experiments.data_utils import compute_sigma_from_data
+import numpy as np
+
 from final_paper_experiments.baselines.detectors import dsm_additive
-from dsm_model import ScoreNet
+from dsm_model import ScoreNet, Whitening
 from cfattn_model import (
     CFAttnGaussianScoreNet, score_cfattn_additive, score_cfattn_additive_cfar,
 )
 from neighbor_mlp_model import NeighborMLPDenoiser, score_nmlp_additive
-from run_colab import DEFAULT_CFG, _train_cfattn, _train_nmlp, _train_dsm
+from run_colab import (
+    DEFAULT_CFG, _train_cfattn, _train_nmlp, _train_dsm, _make_whitening,
+)
 
 from ..framework.detector_api import Detector, DetectorInput
 from ..framework.registry import register
@@ -27,6 +30,11 @@ from ..framework.registry import register
 
 def _full_cfg(cfg):
     return {**DEFAULT_CFG, **(cfg or {})}
+
+
+def _placeholder_whitening(D):
+    """Identity whitening with the right shape so load_state_dict can fill it."""
+    return Whitening(np.zeros(D, dtype=np.float32), np.eye(D, dtype=np.float32))
 
 
 class _Torch(Detector):
@@ -45,37 +53,44 @@ class _Torch(Detector):
 
 @register("CF-Attn-CFAR")
 class CFAttnCFAR(_Torch):
+    """RAW input + frozen ZCA whitening first layer; detection in whitened space."""
     needs_spatial = True
+    space = "raw"
 
     def _build(self):
         c = _full_cfg(self.cfg)
         return CFAttnGaussianScoreNet(D=self._meta["D"], h=c["cfattn_h"],
                                       K=c["cfattn_K"], sigma=self._meta["sigma"],
-                                      eps=c.get("cfattn_eps", 1e-4))
+                                      eps=c.get("cfattn_eps", 1e-4),
+                                      whitening=_placeholder_whitening(self._meta["D"]))
 
     def fit(self, ctx):
         c = _full_cfg(self.cfg)
-        self._meta = {"D": ctx.train_pix.shape[1], "sigma": ctx.sigma}
-        self._model = _train_cfattn(self._meta["D"], ctx.sigma, ctx.train_pix,
-                                    ctx.train_nbr, c, ctx.device, ctx.seed)
+        self._model = _train_cfattn(ctx.train_raw, ctx.train_nbr_raw.astype(np.float32),
+                                    c, ctx.device, ctx.seed)
+        self._meta = {"D": ctx.train_raw.shape[1], "sigma": self._model.sigma}
         return self
 
     def score(self, ctx):
-        return score_cfattn_additive_cfar(self._model, ctx.test_pix,
-                                          ctx.test_nbr.astype(np.float32),
-                                          ctx.signature)
+        # RAW signature: the model returns data-space scores; the CFAR head
+        # whitens the signature internally (whitening-invariant statistic).
+        return score_cfattn_additive_cfar(self._model, ctx.test_raw,
+                                          ctx.test_nbr_raw.astype(np.float32),
+                                          ctx.signature_raw)
 
 
 @register("CF-Attn")
 class CFAttn(CFAttnCFAR):
     def fit(self, ctx):
         super().fit(ctx)
-        self._train_pix, self._train_nbr = ctx.train_pix, ctx.train_nbr.astype(np.float32)
+        self._train_pix = ctx.train_raw.astype(np.float32)
+        self._train_nbr = ctx.train_nbr_raw.astype(np.float32)
         return self
     def score(self, ctx):
-        return score_cfattn_additive(self._model, ctx.test_pix,
-                                     ctx.test_nbr.astype(np.float32),
-                                     self._train_pix, self._train_nbr, ctx.signature)
+        return score_cfattn_additive(self._model, ctx.test_raw,
+                                     ctx.test_nbr_raw.astype(np.float32),
+                                     self._train_pix, self._train_nbr,
+                                     ctx.signature_raw)
     def state(self):
         s = super().state(); s["tr"] = (self._train_pix, self._train_nbr); return s
     def load_state(self, s):
@@ -85,26 +100,30 @@ class CFAttn(CFAttnCFAR):
 @register("NeighborMLP")
 class NeighborMLP(_Torch):
     needs_spatial = True
+    space = "raw"
 
     def _build(self):
         c = _full_cfg(self.cfg)
         return NeighborMLPDenoiser(D=self._meta["D"], d_lat=c["nmlp_d_lat"],
                                    K=c["nmlp_K"], hidden=c["nmlp_hidden"],
                                    n_layers=c["nmlp_n_layers"], sigma=self._meta["sigma"],
-                                   activation=c["activation"])
+                                   activation=c["activation"],
+                                   whitening=_placeholder_whitening(self._meta["D"]))
 
     def fit(self, ctx):
         c = _full_cfg(self.cfg)
-        self._meta = {"D": ctx.train_pix.shape[1], "sigma": ctx.sigma}
-        self._model = _train_nmlp(self._meta["D"], ctx.sigma, ctx.train_pix,
-                                  ctx.train_nbr, c, ctx.device)
-        self._train_pix, self._train_nbr = ctx.train_pix, ctx.train_nbr.astype(np.float32)
+        self._model = _train_nmlp(ctx.train_raw, ctx.train_nbr_raw.astype(np.float32),
+                                  c, ctx.device)
+        self._meta = {"D": ctx.train_raw.shape[1], "sigma": self._model.sigma}
+        self._train_pix = ctx.train_raw.astype(np.float32)
+        self._train_nbr = ctx.train_nbr_raw.astype(np.float32)
         return self
 
     def score(self, ctx):
-        return score_nmlp_additive(self._model, ctx.test_pix,
-                                   ctx.test_nbr.astype(np.float32),
-                                   self._train_pix, self._train_nbr, ctx.signature)
+        return score_nmlp_additive(self._model, ctx.test_raw,
+                                   ctx.test_nbr_raw.astype(np.float32),
+                                   self._train_pix, self._train_nbr,
+                                   ctx.signature_raw)
     def state(self):
         s = super().state(); s["tr"] = (self._train_pix, self._train_nbr); return s
     def load_state(self, s):
@@ -113,32 +132,29 @@ class NeighborMLP(_Torch):
 
 @register("DSM")
 class DSM(_Torch):
-    """Per-pixel DSM-LMP with per-band standardisation (matches the run_colab fix)."""
+    """Per-pixel DSM-LMP on RAW bands; frozen ZCA whitening replaces the old
+    PCA + per-band z-score (whitening subsumes both: decorrelate + unit-variance)."""
     needs_spatial = False
+    space = "raw"
 
     def _build(self):
         c = _full_cfg(self.cfg)
-        return ScoreNet(self._meta["D"], list(c["dsm_hidden"]), c["activation"])
+        return ScoreNet(self._meta["D"], list(c["dsm_hidden"]), c["activation"],
+                        whitening=_placeholder_whitening(self._meta["D"]))
 
     def fit(self, ctx):
         c = _full_cfg(self.cfg)
-        D = ctx.train_pix.shape[1]
-        mu = ctx.train_pix.mean(0).astype(np.float32)
-        sd = (ctx.train_pix.std(0) + 1e-8).astype(np.float32)
-        tr_z = ((ctx.train_pix - mu) / sd).astype(np.float32)
-        sigma_dsm = compute_sigma_from_data(tr_z, c["dsm_sigma_rho"])
-        self._meta = {"D": D, "sigma": sigma_dsm}
-        self._mu, self._sd, self._tr_z = mu, sd, tr_z
-        self._model = _train_dsm(D, sigma_dsm, tr_z, c, ctx.device)
+        self._model = _train_dsm(ctx.train_raw, c, ctx.device)
+        self._meta = {"D": ctx.train_raw.shape[1], "sigma": self._model.sigma}
+        self._train_raw = ctx.train_raw.astype(np.float32)
         return self
 
     def score(self, ctx):
-        z = ((ctx.test_pix - self._mu) / self._sd).astype(np.float32)
-        s = (ctx.signature / self._sd).astype(np.float32)
-        return dsm_additive(z, self._tr_z, self._model, s)
+        # model returns DATA-SPACE scores; use the RAW signature directly
+        return dsm_additive(ctx.test_raw.astype(np.float32), self._train_raw,
+                            self._model, ctx.signature_raw.astype(np.float32))
 
     def state(self):
-        s = super().state()
-        s["std"] = (self._mu, self._sd, self._tr_z); return s
+        s = super().state(); s["tr"] = self._train_raw; return s
     def load_state(self, s):
-        super().load_state(s); self._mu, self._sd, self._tr_z = s["std"]
+        super().load_state(s); self._train_raw = s["tr"]

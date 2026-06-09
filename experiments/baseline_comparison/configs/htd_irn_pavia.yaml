@@ -7,10 +7,9 @@ provider: pavia
 
 provider_cfg:
   dataset: data/pavia-u.mat
-  norm_mode: global_max
+  norm_mode: none           # RAW sensor values — no scaling (no PCA anywhere)
   manual_boxes_path: experiments/spatial/manual_boxes.json
   scenarios: [0, 1, 2, 3]
-  latent_dim: 20
   k: 5
   n_budget: 2000
   sig_dom_weight: 0.8

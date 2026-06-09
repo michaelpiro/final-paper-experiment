@@ -5,38 +5,33 @@ IID experiment core — shared pipeline for single-class and multiclass runs.
 
 What this does (in one call to run_iid(cfg, mode)):
 
+  NO PCA / NO AE: every detector consumes the RAW full bands. Our score nets
+  (DSM, LRao) carry a FROZEN ZCA whitening first layer (fit on the training
+  background, relative eigen-floor) so they take raw input, whiten internally,
+  and return DATA-SPACE scores (detection uses the raw signature).
+
   Data (raw 103-D)
   ----------------
-    1. Load + normalize.
+    1. Load raw (mode='none' — original sensor values, no scaling).
     2. Extract background / target pools (single = one bkg class multi =
        union of all non-target classes minus exclude_classes).
     3. Target signature  s_raw = mean(tgt_pix)   (NOT unit-normalized).
     4. Shuffle bkg with one seed -> train pool of size max(n_train_list)
        + held-out test pool of size test_size.
-    5. Plant targets in raw 103-D (additive + replacement) ONCE the test
-       set is shared across every (latent_dim, n_train) combination.
+    5. Plant targets in raw 103-D (additive + replacement) ONCE; the test
+       set is shared across every n_train.
 
-  Reduced spaces (per latent_dim d in cfg['latent_dim_list'])
-  -----------------------------------------------------------
-    6a. PCA-d fit on the whole image transform train pool, test sets,
-        signature (s_pca = pca.transform(s_raw[None]).flatten(), NOT
-        re-normalized).  Save pca_d{d}.pkl.
-    6b. Linear autoencoder D_RAW -> d -> D_RAW trained on the whole image
-        (MSE).  Encode train pool, test sets, signature.  Save ae_d{d}.pt
-        + per-epoch loss curve.
-
-  Sweep (for d in latent_dim_list, for n in n_train_list)
-  -------------------------------------------------------
-    7. Train 4 score models: DSM-PCA, DSM-AE, LRao-PCA, LRao-AE.
-       Local training loops per-epoch loss recorded weights saved.
-       Score test set with each (DSM has separate additive / replacement
-       statistics the LRao Mode-2 statistic is the same for both).
+  Sweep (for n in n_train_list)
+  -----------------------------
+    6. Train 2 score models on RAW bands: DSM, LRao (each with a frozen ZCA
+       whitening first layer). Per-epoch loss recorded; weights saved. Score
+       the test set with each (DSM has separate additive / replacement
+       statistics; the LRao Mode-2 statistic is the same for both).
 
   Classical baselines (raw 103-D, depend only on n)
   -------------------------------------------------
-    8. For each n: run AMF, Reg-AMF, CEM, GMM-GLRT, (DLTD, SMGLRT in multi),
-       AMF-rep, GMM-GLRT-rep, Exact-GLRT.  Cached so we don't recompute
-       inside the d loop.
+    7. For each n: run AMF, Reg-AMF, CEM, GMM-GLRT, (DLTD, SMGLRT in multi),
+       AMF-rep, GMM-GLRT-rep, Exact-GLRT.
 
   Save
   ----
@@ -52,7 +47,6 @@ import os
 import sys
 import json
 import time
-import pickle
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -63,7 +57,6 @@ import matplotlib
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score, roc_curve
 from tqdm import tqdm
 
@@ -75,13 +68,19 @@ from final_paper_experiments.data_utils import (
     load_and_normalize, compute_sigma_from_data, plant_targets,
 )
 from final_paper_experiments.baselines.detectors import (
-    amf, reg_amf, cem, dsm_additive, dsm_replacement, amf_replacement,
-    gmm_glrt, gmm_glrt_replacement, dltd, smglrt, exact_glrt_replacement,
+    amf, dsm_additive, gmm_glrt,    # ADDITIVE-only experiment
 )
-from final_paper_experiments.models.neighbor_adapted import LinearAutoencoder
+from final_paper_experiments.baselines.gmm_glrt_levin import gmm_glrt_levin_additive
 from dsm_model import (
-    ScoreNet, dsm_loss, lfi_loss_mode2, compute_lfi_detector_scores_mode2,
+    ScoreNet, Whitening, dsm_loss, lfi_loss_mode2, compute_lfi_detector_scores_mode2,
 )
+
+
+def _make_whitening(train_raw, cfg):
+    """Frozen ZCA whitener fit on the RAW training pool (relative eigen-floor)."""
+    return Whitening.from_data(np.asarray(train_raw, dtype=np.float32),
+                               mode=cfg.get('whiten_mode', 'zca'),
+                               eig_floor=float(cfg.get('whiten_eig_floor', 1e-3)))
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +101,28 @@ def _roc(labels: np.ndarray, scores: np.ndarray):
     except Exception:
         n = len(labels)
         return np.linspace(0, 1, n), np.linspace(0, 1, n), float('nan')
+
+
+def _pauc(labels: np.ndarray, scores: np.ndarray, fpr_max: float = 0.1) -> float:
+    """Partial AUC over FPR ∈ [0, fpr_max], normalized to [0,1] (so 0.5≈chance)."""
+    try:
+        fpr, tpr, _ = roc_curve(labels, scores)
+        tpr_at = float(np.interp(fpr_max, fpr, tpr))
+        keep = fpr < fpr_max
+        fpr_c = np.concatenate([fpr[keep], [fpr_max]])
+        tpr_c = np.concatenate([tpr[keep], [tpr_at]])
+        return float(np.trapz(tpr_c, fpr_c) / fpr_max)
+    except Exception:
+        return float('nan')
+
+
+def _pd_at_fa(labels: np.ndarray, scores: np.ndarray, pfa: float = 0.1) -> float:
+    """Detection probability (TPR) at a fixed false-alarm rate Pfa."""
+    try:
+        fpr, tpr, _ = roc_curve(labels, scores)
+        return float(np.interp(pfa, fpr, tpr))
+    except Exception:
+        return float('nan')
 
 
 def _safe(name: str, fn, n_out: int):
@@ -127,47 +148,25 @@ def _make_loader(X: np.ndarray, batch_size: int):
     return Xt
 
 
-def train_ae(D_raw: int, latent: int, pixels: np.ndarray, cfg: dict,
-             seed: int, label: str) -> Tuple[LinearAutoencoder, List[float]]:
-    """Train a linear autoencoder on (N, D_raw) pixels with MSE."""
-    torch.manual_seed(seed)
-    ae = LinearAutoencoder(D_raw, latent, bias=cfg['ae_bias'])
-    opt = torch.optim.Adam(ae.parameters(), lr=cfg['ae_lr'],
-                           weight_decay=cfg['ae_wd'])
-    X = torch.tensor(pixels, dtype=torch.float32)
-    N, bs = len(X), cfg['ae_batch']
-    hist = []
-    pbar = tqdm(range(1, cfg['ae_epochs'] + 1), desc=f'AE {label}',
-                dynamic_ncols=True, leave=False)
-    for _ in pbar:
-        perm = torch.randperm(N)
-        tot = 0.0
-        nb = 0
-        for i in range(0, N, bs):
-            x = X[perm[i:i + bs]]
-            x_hat, _ = ae(x)
-            loss = ((x_hat - x) ** 2).sum(dim=1).mean()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            tot += loss.item()
-            nb += 1
-        hist.append(tot / max(nb, 1))
-        pbar.set_postfix(loss=f"{hist[-1]:.4f}")
-    ae.eval()
-    return ae, hist
-
-
-def train_dsm_local(d: int, train_data: np.ndarray, sigma: float, cfg: dict,
+def train_dsm_local(train_raw: np.ndarray, cfg: dict,
                     seed: int, label: str) -> Tuple[ScoreNet, List[float]]:
-    """Local DSM training loop (returns final model + per-epoch loss)."""
+    """DSM on RAW bands with a frozen ZCA whitening first layer (no PCA/AE).
+
+    The net whitens internally, DSM noise is isotropic in whitened space
+    (σ=√ρ), and forward returns the DATA-SPACE score (detection uses raw sig).
+    Trains on GPU if cfg['device'] is set (or CUDA is available and not disabled).
+    """
     torch.manual_seed(seed)
-    model = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation'])
+    device = torch.device(cfg.get('device', 'cpu'))
+    D = train_raw.shape[1]
+    W = _make_whitening(train_raw, cfg)
+    sigma = float(np.sqrt(cfg['dsm_sigma_rho']))     # whitened cov≈I ⇒ σ²=ρ·1
+    model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                            weight_decay=cfg['weight_decay'])
-    X = torch.tensor(train_data, dtype=torch.float32)
+    X = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
     N, bs = len(X), min(cfg['batch_size'], len(X))
-    baseline = d / (sigma ** 2)
+    baseline = D / (sigma ** 2)
     hist = []
     pbar = tqdm(range(1, cfg['dsm_epochs'] + 1), desc=f'DSM {label}',
                 dynamic_ncols=True, leave=False)
@@ -186,22 +185,27 @@ def train_dsm_local(d: int, train_data: np.ndarray, sigma: float, cfg: dict,
         hist.append(tot / max(nb, 1))
         pbar.set_postfix(loss=f"{hist[-1]:.2f}",
                          ratio=f"{hist[-1] / baseline:.3f}")
-    model.eval()
+    model.cpu().eval()   # move back to CPU so scoring helpers get numpy-compatible model
     return model, hist
 
 
-def train_lrao_local(d: int, train_data: np.ndarray, cfg: dict,
+def train_lrao_local(train_raw: np.ndarray, cfg: dict,
                      seed: int, label: str) -> Tuple[ScoreNet, List[float]]:
-    """Local LRao Mode-2 training loop — fixed epochs, no early stopping.
+    """LRao Mode-2 on RAW bands with a frozen ZCA whitening first layer.
 
+    The tr(J*) objective is invariant to the whitening reparametrization, so the
+    net learns the data-space score with whitened-space conditioning.
     NaN-guarded: if the in-graph SVD blows up, abort and return what we have.
     """
     torch.manual_seed(seed)
-    model = ScoreNet(d, list(cfg['hidden_dims']), cfg['activation'])
+    device = torch.device(cfg.get('device', 'cpu'))
+    D = train_raw.shape[1]
+    W = _make_whitening(train_raw, cfg)
+    model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                               weight_decay=cfg['weight_decay'])
-    X     = torch.tensor(train_data, dtype=torch.float32)
-    N, bs = len(X), min(cfg['batch_size'], len(train_data))
+    X     = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
+    N, bs = len(X), min(cfg['batch_size'], len(train_raw))
     hist  = []
 
     pbar = tqdm(range(1, cfg['lrao_epochs'] + 1), desc=f'LRao {label}',
@@ -226,7 +230,7 @@ def train_lrao_local(d: int, train_data: np.ndarray, cfg: dict,
         hist.append(-tot / max(nb, 1))   # tr(J*)
         pbar.set_postfix(trJ=f"{hist[-1]:.2f}")
 
-    model.eval()
+    model.cpu().eval()   # back to CPU so scoring helpers receive numpy-compatible model
     return model, hist
 
 
@@ -257,10 +261,6 @@ def score_dsm_add(model, train_lat, test_lat, s_lat):
     return dsm_additive(test_lat, train_lat, model, s_lat)
 
 
-def score_dsm_rep(model, train_lat, test_lat, s_lat):
-    return dsm_replacement(test_lat, train_lat, model, s_lat)
-
-
 def score_lrao(model, train_lat, test_lat, s_lat, cfg):
     return compute_lfi_detector_scores_mode2(
         model, train_lat, test_lat, s_lat,
@@ -269,44 +269,26 @@ def score_lrao(model, train_lat, test_lat, s_lat, cfg):
 
 
 # ---------------------------------------------------------------------------
-# Classical baselines (cached by n)
+# Classical baselines (ADDITIVE only)
 # ---------------------------------------------------------------------------
 
-def run_classical_for_n(train_raw, test_raw_planted, labels, s_raw, sig_raw,
-                        cfg, mode):
-    """Returns dict {tm -> {detector -> scores}}."""
-    out = {'additive': {}, 'replacement': {}}
-    for tm in ('additive', 'replacement'):
-        traw = test_raw_planted[tm]
-        n = len(labels[tm])
-        if tm == 'additive':
-            jobs = {
-                'AMF': lambda: amf(traw, train_raw, s_raw),
-                'Reg-AMF': lambda: reg_amf(traw, train_raw, s_raw, sig_raw),
-                'CEM': lambda: cem(traw, train_raw, s_raw),
-                'GMM-GLRT': lambda: gmm_glrt(traw, train_raw, s_raw,
-                                             K=cfg['gmm_K']),
-            }
-            if mode == 'multi':
-                jobs['DLTD'] = lambda: dltd(traw, train_raw, s_raw, K=cfg['gmm_K'])
-                jobs['SMGLRT'] = lambda: smglrt(traw, train_raw, s_raw, K=cfg['gmm_K'])
-        else:
-            jobs = {
-                'G-rep-LMP': lambda: amf_replacement(traw, train_raw, s_raw),
-                'CEM': lambda: cem(traw, train_raw, s_raw),
-                'GMM-GLRT-rep': lambda: gmm_glrt_replacement(
-                    traw, train_raw, s_raw, K=cfg['gmm_K'],
-                    theta_max=cfg['gmm_theta_max'],
-                    theta_steps=cfg['gmm_theta_steps']),
-                'Exact-GLRT': lambda: exact_glrt_replacement(
-                    traw, train_raw, s_raw),
-            }
-            if mode == 'multi':
-                jobs['DLTD'] = lambda: dltd(traw, train_raw, s_raw, K=cfg['gmm_K'])
-                jobs['SMGLRT'] = lambda: smglrt(traw, train_raw, s_raw, K=cfg['gmm_K'])
-        for nm, fn in jobs.items():
-            out[tm][nm] = _safe(nm, fn, n)
-    return out
+# single-class: AMF only  (single Gaussian bkg; Reg-AMF/GMM redundant)
+# multi-class:  AMF + GMM-Levin (Levin 2019 product-GMM GLRT handles mixed bkg)
+CLASSICAL_DETS_SINGLE = ['AMF']
+CLASSICAL_DETS_MULTI  = ['AMF', 'GMM-Levin']
+
+
+def run_classical_additive(train_raw, test_planted, s_raw, reg_sigma, cfg, mode):
+    """Returns {detector -> scores} for the ADDITIVE target model on raw bands."""
+    n = len(test_planted)
+    all_jobs = {
+        'AMF':       lambda: amf(test_planted, train_raw, s_raw),
+        'GMM-Levin': lambda: gmm_glrt_levin_additive(
+                         test_planted, train_raw, s_raw,
+                         p_steps=50, p_max=1.0),
+    }
+    dets = CLASSICAL_DETS_MULTI if mode == 'multi' else CLASSICAL_DETS_SINGLE
+    return {nm: _safe(nm, all_jobs[nm], n) for nm in dets}
 
 
 # ---------------------------------------------------------------------------
@@ -314,21 +296,10 @@ def run_classical_for_n(train_raw, test_raw_planted, labels, s_raw, sig_raw,
 # ---------------------------------------------------------------------------
 
 DETECTOR_COLORS = {
-    'AMF': '#1f77b4',
-    'Reg-AMF': '#6baed6',
-    'G-rep-LMP': '#08306b',
-    'CEM': '#aec7e8',
-    'GMM-GLRT': '#9467bd',
-    'GMM-GLRT-rep': '#c5b0d5',
-    'DLTD': '#e6550d',
-    'SMGLRT': '#8c564b',
-    'Exact-GLRT': '#7f3b08',
-    'DSM-PCA': '#d62728',
-    'DSM-PCA-rep': '#fc8d59',
-    'DSM-AE': '#9e0142',
-    'DSM-AE-rep': '#f46d43',
-    'LRao-PCA': '#2ca02c',
-    'LRao-AE': '#006400',
+    'AMF':       '#1f77b4',
+    'GMM-Levin': '#9467bd',
+    'DSM':       '#d62728',
+    'LRao':      '#2ca02c',
 }
 
 
@@ -336,28 +307,29 @@ def _det_color(det: str):
     return DETECTOR_COLORS.get(det, '#444444')
 
 
-def plot_auc_vs_n(metrics: dict, d: int, tm: str, n_list: list,
-                  out_pdf: str, classical_dets: list,
-                  score_dets: list):
+def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
+             out_pdf: str, logx: bool = False):
+    """Generic 'metric vs x' line plot. series = {det -> list of y (len==xvals)}."""
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
-    x = np.arange(len(n_list))
-    for det in classical_dets:
-        ys = metrics['classical'][tm].get(det)
-        if ys is None:
+    x = np.asarray(xvals, dtype=float)
+    for det, ys in series.items():
+        if ys is None or all(v != v for v in ys):     # all-NaN
             continue
-        ax.plot(x, ys, marker='o', lw=1.4, color=_det_color(det), label=det)
-    score_branch = metrics['score'].get(f'd_{d}', {}).get(tm, {})
-    for det in score_dets:
-        ys = score_branch.get(det)
-        if ys is None:
-            continue
-        ax.plot(x, ys, marker='D', lw=2.2, color=_det_color(det), label=det)
-    ax.set_xticks(x)
-    ax.set_xticklabels([f'{n}' for n in n_list], rotation=0)
-    ax.set_xlabel('training samples  n')
-    ax.set_ylabel('AUC')
-    ax.set_title(f'AUC vs n  (latent_dim={d}, target model: {tm})')
-    ax.grid(alpha=0.3)
+        style = dict(marker='D', lw=2.2) if det in ('DSM', 'LRao') \
+            else dict(marker='o', lw=1.4)
+        ax.plot(x, ys, color=_det_color(det), label=det, **style)
+    if logx:
+        ax.set_xscale('log')
+        # Force ticks at exactly the data points with clean labels (no 2×10¹ etc.)
+        ax.set_xticks(x)
+        ax.xaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:g}'))
+        ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+        ax.tick_params(axis='x', labelsize=8, rotation=45)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(alpha=0.3, which='both')
     ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.02, 1.0),
               borderaxespad=0.)
     fig.tight_layout()
@@ -365,58 +337,45 @@ def plot_auc_vs_n(metrics: dict, d: int, tm: str, n_list: list,
     plt.close(fig)
 
 
-def plot_auc_vs_d(metrics: dict, n_idx: int, tm: str, d_list: list,
-                  out_pdf: str, score_dets: list):
-    """Score methods vs latent_dim at one fixed n (specifically the last n in the list)."""
-    fig, ax = plt.subplots(figsize=(6.0, 3.8))
-    for det in score_dets:
-        ys = [metrics['score'][f'd_{d}'][tm].get(det, [None] * (n_idx + 1))[n_idx]
-              for d in d_list]
-        ax.plot(d_list, ys, marker='D', lw=2.0, color=_det_color(det), label=det)
-    ax.set_xlabel('latent_dim  d')
-    ax.set_ylabel('AUC')
-    ax.set_title(f'AUC vs d  (n=max, target model: {tm})')
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=9, loc='best')
+def _plot_roc(det_scores: dict, labels: np.ndarray, title: str, out_pdf: str):
+    """Multi-detector ROC curve plot — all detectors on one axes."""
+    fig, ax = plt.subplots(figsize=(5.5, 5.0))
+    ax.plot([0, 1], [0, 1], 'k--', lw=0.7, label='_no_legend_')
+    for det, sc in det_scores.items():
+        fpr, tpr, auc_v = _roc(labels, sc)
+        lw  = 2.2 if det in ('DSM', 'LRao') else 1.4
+        ax.plot(fpr, tpr, color=_det_color(det), lw=lw,
+                label=f'{det}  (AUC={auc_v:.3f})')
+    ax.set_xlabel('False Alarm Rate')
+    ax.set_ylabel('Detection Rate')
+    ax.set_title(title, fontsize=9)
+    ax.legend(fontsize=7, loc='lower right')
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.grid(alpha=0.25)
     fig.tight_layout()
     fig.savefig(out_pdf, bbox_inches='tight')
     plt.close(fig)
+    print(f"  [fig] {os.path.basename(out_pdf)}", flush=True)
 
 
-def plot_loss_panel(loss_curves: dict, d: int, n_max: int, out_png: str):
+def _roc_to_dict(labels: np.ndarray, sc: np.ndarray) -> dict:
+    fpr, tpr, auc_v = _roc(labels, sc)
+    return {'fpr': fpr.tolist(), 'tpr': tpr.tolist(), 'auc': float(auc_v)}
+
+
+def plot_loss_panel(loss_curves: dict, tag: str, out_png: str):
     keys = [
-        (f'AE_d{d}', f'AE (d={d})', 'loss'),
-        (f'DSM_PCA_d{d}_n{n_max}', f'DSM-PCA (d={d}, n={n_max})', 'loss'),
-        (f'DSM_AE_d{d}_n{n_max}', f'DSM-AE  (d={d}, n={n_max})', 'loss'),
-        (f'LRao_PCA_d{d}_n{n_max}', f'LRao-PCA (d={d}, n={n_max})', 'tr(J*)'),
-        (f'LRao_AE_d{d}_n{n_max}', f'LRao-AE  (d={d}, n={n_max})', 'tr(J*)'),
+        (f'DSM_{tag}',  f'DSM  ({tag})', 'loss'),
+        (f'LRao_{tag}', f'LRao ({tag})', 'tr(J*)'),
     ]
-    fig, axes = plt.subplots(1, 5, figsize=(20, 3.5))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
     for ax, (key, ttl, ylab) in zip(axes, keys):
         hist = loss_curves.get(key, [])
         ax.plot(hist) if hist else ax.text(0.5, 0.5, 'no data', ha='center')
         ax.set_title(ttl, fontsize=9)
-        ax.set_xlabel('epoch')
-        ax.set_ylabel(ylab)
-        ax.grid(alpha=0.3)
+        ax.set_xlabel('epoch'); ax.set_ylabel(ylab); ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_png, dpi=130)
-    plt.close(fig)
-
-
-def plot_rocs(roc_dict: dict, out_pdf: str, title: str):
-    fig, ax = plt.subplots(figsize=(5.4, 4.4))
-    for det, (fpr, tpr, au) in roc_dict.items():
-        ax.plot(fpr, tpr, lw=1.5, color=_det_color(det),
-                label=f'{det} ({au:.3f})')
-    ax.plot([0, 1], [0, 1], 'k--', lw=0.6)
-    ax.set_xlabel('FPR')
-    ax.set_ylabel('TPR')
-    ax.set_title(title)
-    ax.legend(fontsize=7, loc='lower right')
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_pdf)
     plt.close(fig)
 
 
@@ -436,359 +395,198 @@ def run_iid(cfg: dict, mode: str):
     yaml.dump(cfg, open(os.path.join(run_dir, 'config.yaml'), 'w'))
     print(f"Run dir: {run_dir}", flush=True)
 
-    # ----- canonicalize sweep lists -----
-    n_list = sorted(set(_ensure_list(cfg['n_train_list'])))
-    d_list = sorted(set(_ensure_list(cfg['latent_dim_list'])))
-    print(f"n_train_list  = {n_list}", flush=True)
-    print(f"latent_dim_list = {d_list}", flush=True)
+    # ===================================================================
+    # ADDITIVE-ONLY experiment. Two 1-D sweeps (same code, single vs multi
+    # differ only in the data pools):
+    #   vs n   (at fixed ρ): AUC, partial-AUC(Pfa<pauc_fpr), Pd@Pfa
+    #   vs ρ   (at fixed n): AUC, Pd@Pfa
+    # Detectors: classical {AMF, Reg-AMF, GMM-GLRT} + score {DSM, LRao}.
+    # ===================================================================
+    n_list   = sorted(set(_ensure_list(cfg['n_train_list'])))
+    rho_list = sorted(set(_ensure_list(cfg.get(
+        'rho_list', [0.001, 0.003, 0.01, 0.03, 0.1, 0.3]))))
+    rho_fixed = float(cfg['dsm_sigma_rho'])          # ρ used for the vs-n sweep
+    n_fixed   = int(cfg.get('n_fixed_for_rho', max(n_list)))   # n for the vs-ρ sweep
+    pfa       = float(cfg.get('pfa', 0.1))           # operating Pfa for Pd@Pfa
+    pauc_fpr  = float(cfg.get('pauc_fpr', 0.1))      # partial-AUC upper FPR
 
-    # ----- load + normalize -----
+    # GPU / device selection — set cfg['device'] = 'cuda' in the notebook for GPU
+    _dev_str = cfg.get('device', None)
+    if _dev_str is None:
+        _dev_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    cfg = {**cfg, 'device': _dev_str}   # propagate to train helpers
+    print(f"device = {_dev_str}", flush=True)
+    print(f"n_train_list = {n_list}", flush=True)
+    print(f"rho_list     = {rho_list}  (vs-ρ at n={n_fixed})", flush=True)
+    print(f"Pfa={pfa}  pAUC FPR<{pauc_fpr}  (ADDITIVE only)", flush=True)
+
+    # ----- load data: RAW bands everywhere (no PCA/AE). Score nets whiten
+    #       internally; classical baselines consume the same raw bands. -----
     seed = int(cfg['seed'])
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-
-    # ----- load data: two normalizations if baseline_norm_mode differs -----
-    # Score models (DSM, LRao, AE) use cfg['norm_mode'] — optimized for training.
-    # Classical baselines use cfg['baseline_norm_mode'] — honest, unwhitened data.
-    # If both are the same, data_base == data (no duplicate work).
-    score_norm    = cfg['norm_mode']
-    baseline_norm = cfg.get('baseline_norm_mode', score_norm)
-    data, gt = load_and_normalize(cfg['dataset'], mode=score_norm)
+    data, gt = load_and_normalize(cfg['dataset'], mode=cfg.get('norm_mode', 'none'))
     H, W, D_RAW = data.shape
-    gt_flat  = gt.flatten()
-    all_flat = data.reshape(-1, D_RAW).astype(np.float32)
-    print(f"Image {H}x{W}x{D_RAW}", flush=True)
-    if baseline_norm != score_norm:
-        data_base, _ = load_and_normalize(cfg['dataset'], mode=baseline_norm)
-        print(f"  score models  → norm='{score_norm}'", flush=True)
-        print(f"  baselines     → norm='{baseline_norm}'", flush=True)
-    else:
-        data_base = data
+    gt_flat = gt.flatten()
+    print(f"Image {H}x{W}x{D_RAW}  (RAW band space, no PCA)", flush=True)
 
-    # ----- background/target pools -----
-    # Score space (PCA + AE training)
     bkg_raw, tgt_raw = build_pools(data, gt_flat, cfg, mode)
-    s_raw = tgt_raw.mean(axis=0)
+    s_raw = tgt_raw.mean(axis=0).astype(np.float32)
     if cfg.get('normalize_signature', False):
-        s_raw = s_raw / (np.linalg.norm(s_raw) + 1e-12)
-
-    # Baseline space (classical detectors)
-    bkg_base, tgt_base = build_pools(data_base, gt_flat, cfg, mode)
-    s_raw_base = tgt_base.mean(axis=0)
-    if cfg.get('normalize_signature', False):
-        s_raw_base = s_raw_base / (np.linalg.norm(s_raw_base) + 1e-12)
-
+        s_raw = (s_raw / (np.linalg.norm(s_raw) + 1e-12)).astype(np.float32)
     print(f"bkg pool: {len(bkg_raw):>6} | tgt pool: {len(tgt_raw):>6} | "
-          f"||s_raw|| = {np.linalg.norm(s_raw):.4f} (score)  "
-          f"||s_base|| = {np.linalg.norm(s_raw_base):.4f} (baseline)", flush=True)
+          f"||s_raw|| = {np.linalg.norm(s_raw):.4f}", flush=True)
 
-    # ----- shuffle — SAME indices for both spaces so same pixels are train/test -----
-    assert len(bkg_raw) == len(bkg_base), "bkg pool size mismatch between normalizations"
-    idx = np.arange(len(bkg_raw))
-    rng.shuffle(idx)
-    bkg_shuf      = bkg_raw[idx]
-    bkg_base_shuf = bkg_base[idx]
-    max_n     = max(n_list)
+    idx = np.arange(len(bkg_raw)); rng.shuffle(idx)
+    bkg_shuf  = bkg_raw[idx]
+    max_n     = max(max(n_list), n_fixed)
     test_size = int(cfg['test_size'])
     assert len(bkg_shuf) >= max_n + test_size, \
         f"need {max_n + test_size} bkg pixels, have {len(bkg_shuf)}"
-    train_pool_raw  = bkg_shuf[:max_n]          # score model training pool
-    train_pool_base = bkg_base_shuf[:max_n]     # baseline training pool
-    test_bkg_raw    = bkg_shuf[-test_size:]     # score model test set
-    test_bkg_base   = bkg_base_shuf[-test_size:]  # baseline test set
+    train_pool_raw = bkg_shuf[:max_n].astype(np.float32)
+    test_bkg_raw   = bkg_shuf[-test_size:].astype(np.float32)
 
-    # ----- plant targets — independently in each space, SAME planted indices -----
-    # The planted indices are determined by seed alone (same physical pixels get targets).
-    test_planted_raw  = {}   # score model test set (with targets)
-    test_planted_base = {}   # baseline test set (with targets)
-    labels = {}
-    for tm in ('additive', 'replacement'):
-        planted_score, lab, _ = plant_targets(
-            test_bkg_raw, s_raw, cfg['amplitude'], cfg['target_fraction'],
-            model=tm, seed=seed)
-        planted_base, _, _ = plant_targets(
-            test_bkg_base, s_raw_base, cfg['amplitude'], cfg['target_fraction'],
-            model=tm, seed=seed)          # same seed → same indices → same labels
-        test_planted_raw[tm]  = planted_score
-        test_planted_base[tm] = planted_base
-        labels[tm] = lab
-    n_pos = int(labels['additive'].sum())
-    print(f"planted {n_pos} targets in test (amp={cfg['amplitude']})\n",
+    # ----- plant ADDITIVE targets -----
+    test_planted, labels, _ = plant_targets(
+        test_bkg_raw, s_raw, cfg['amplitude'], cfg['target_fraction'],
+        model='additive', seed=seed)
+    test_planted = test_planted.astype(np.float32)
+    print(f"planted {int(labels.sum())} targets in test (amp={cfg['amplitude']})\n",
           flush=True)
 
-    # ----- per-dim setup: PCA + AE -----
+    _cls = CLASSICAL_DETS_MULTI if mode == 'multi' else CLASSICAL_DETS_SINGLE
+    DETS = _cls + ['DSM', 'LRao']
     loss_curves: Dict[str, list] = {}
-    per_d = {}  # d -> dict of artifacts
-    for d in d_list:
-        print(f"=== Setting up d={d} ===", flush=True)
-        # PCA
-        pca = PCA(n_components=d).fit(all_flat)
-        evr = pca.explained_variance_ratio_.sum()
-        print(f"  PCA d={d}  explained var = {evr:.4f}", flush=True)
-        pickle.dump(pca, open(os.path.join(mdl_dir, f'pca_d{d}.pkl'), 'wb'))
-
-        train_pool_pca = pca.transform(train_pool_raw).astype(np.float32)
-        test_pca = {tm: pca.transform(test_planted_raw[tm]).astype(np.float32)
-                    for tm in test_planted_raw}
-        # Two signature vectors for PCA space:
-        #   additive  y = w + θs  →  z = z_w + θ·(s @ V.T)   (no centering!)
-        #   replacement y=(1-θ)w+θs → z=(1-θ)z_w + θ·(s-μ)@V.T  (with centering)
-        s_pca_add = (pca.components_ @ s_raw).astype(np.float32)
-        s_pca_rep = pca.transform(s_raw[None]).flatten().astype(np.float32)
-
-        # AE
-        ae, ae_hist = train_ae(D_RAW, d, all_flat, cfg, seed=seed,
-                               label=f'd={d}')
-        torch.save({'state_dict': ae.state_dict(),
-                    'D': D_RAW, 'latent': d, 'bias': cfg['ae_bias']},
-                   os.path.join(mdl_dir, f'ae_d{d}.pt'))
-        loss_curves[f'AE_d{d}'] = ae_hist
-        with torch.no_grad():
-            train_pool_aelat = ae.encode(
-                torch.tensor(train_pool_raw, dtype=torch.float32)).numpy().astype(np.float32)
-            test_aelat = {tm: ae.encode(
-                torch.tensor(test_planted_raw[tm], dtype=torch.float32)
-            ).numpy().astype(np.float32) for tm in test_planted_raw}
-            # AE signature:
-            #   additive  enc(w + θs) = enc(w) + θ·(s @ W.T)   → no bias term
-            #   replacement enc((1-θ)w+θs) = (1-θ)enc(w) + θ·enc(s)  → enc(s) correct
-            if cfg.get('ae_bias', True):
-                # W has shape (latent, D_raw) W @ s_raw = enc(s) - bias
-                W = ae.enc.weight.detach().cpu().numpy()  # (latent, D_raw)
-                s_aelat_add = (W @ s_raw).astype(np.float32)
-            else:
-                s_aelat_add = ae.encode(
-                    torch.tensor(s_raw[None], dtype=torch.float32)
-                ).numpy().flatten().astype(np.float32)
-            s_aelat_rep = ae.encode(
-                torch.tensor(s_raw[None], dtype=torch.float32)
-            ).numpy().flatten().astype(np.float32)
-
-        per_d[d] = dict(pca=pca, train_pool_pca=train_pool_pca,
-                        test_pca=test_pca,
-                        s_pca_add=s_pca_add, s_pca_rep=s_pca_rep,
-                        ae=ae, train_pool_aelat=train_pool_aelat,
-                        test_aelat=test_aelat,
-                        s_aelat_add=s_aelat_add, s_aelat_rep=s_aelat_rep)
-
-    # ----- structured metrics + scores stores -----
     metrics = {
-        'n_train_list': n_list,
-        'latent_dim_list': d_list,
-        'classical': {'additive': {}, 'replacement': {}},
-        'score': {f'd_{d}': {'additive': {}, 'replacement': {}} for d in d_list},
+        'n_list': n_list, 'rho_list': rho_list, 'n_fixed': n_fixed,
+        'rho_fixed': rho_fixed, 'pfa': pfa, 'pauc_fpr': pauc_fpr, 'mode': mode,
+        'vs_n':   {d: {'auc': [], 'pauc': [], 'pd': []} for d in DETS},
+        'vs_rho': {d: {'auc': [], 'pd': []} for d in DETS},
     }
-    scores = {
-        'labels_additive': labels['additive'].astype(np.int8),
-        'labels_replacement': labels['replacement'].astype(np.int8),
-    }
+    store = {'labels': labels.astype(np.int8)}
 
-    # ----- classical baselines once per n (cache) -----
-    print("\n=== CLASSICAL baselines (raw 103-D) ===", flush=True)
-    classical_dets_add = [
-        'AMF',
-        'Reg-AMF',
-        # 'CEM',
-        'GMM-GLRT'
-    ]
-    classical_dets_rep = [
-        'G-rep-LMP',
-        # 'CEM',
-        'GMM-GLRT-rep',
-        'Exact-GLRT'
-    ]
-    if mode == 'multi':
-        pass
-        # classical_dets_add += ['DLTD', 'SMGLRT']
-        # classical_dets_rep += ['DLTD', 'SMGLRT']
-    for det in classical_dets_add:
-        metrics['classical']['additive'][det] = []
-    for det in classical_dets_rep:
-        metrics['classical']['replacement'][det] = []
+    def _mtr(sc):
+        return (_auc(labels, sc), _pauc(labels, sc, pauc_fpr),
+                _pd_at_fa(labels, sc, pfa))
 
+    def _train_score_models(train_raw_n, cfg_rho, tag):
+        """Train DSM (at cfg_rho's ρ) + LRao on train_raw_n; return their scores."""
+        dsm_net, h_dsm = train_dsm_local(train_raw_n, cfg_rho, seed, tag)
+        loss_curves[f'DSM_{tag}'] = h_dsm
+        torch.save({'state_dict': dsm_net.state_dict(), 'tag': tag},
+                   os.path.join(mdl_dir, f'dsm_{tag}.pt'))
+        sc_dsm = score_dsm_add(dsm_net, train_raw_n, test_planted, s_raw)
+        lrao_net, h_lrao = train_lrao_local(train_raw_n, cfg, seed, tag)
+        loss_curves[f'LRao_{tag}'] = h_lrao
+        torch.save({'state_dict': lrao_net.state_dict(), 'tag': tag},
+                   os.path.join(mdl_dir, f'lrao_{tag}.pt'))
+        sc_lrao = _safe(f'LRao {tag}',
+                        lambda: score_lrao(lrao_net, train_raw_n, test_planted,
+                                           s_raw, cfg),
+                        len(labels))
+        return sc_dsm, sc_lrao
+
+    # ------------------------------------------------------------------ vs n
+    print(f"\n=== SWEEP vs n  (ρ={rho_fixed}) ===", flush=True)
     for n in n_list:
         t0 = time.time()
-        train_raw_n  = train_pool_base[:n]                  # baseline normalization
-        sig_raw = compute_sigma_from_data(train_raw_n, cfg['dsm_sigma_rho'])
-        cl = run_classical_for_n(train_raw_n, test_planted_base, labels,
-                                 s_raw_base, sig_raw, cfg, mode)
-        for tm in ('additive', 'replacement'):
-            for det, sc in cl[tm].items():
-                metrics['classical'][tm].setdefault(det, []).append(
-                    _auc(labels[tm], sc))
-                scores[f'classical/{det}_n{n}_{tm}'] = sc.astype(np.float32)
-        line_add = " ".join(f"{d}={metrics['classical']['additive'][d][-1]:.3f}"
-                            for d in classical_dets_add)
-        line_rep = " ".join(f"{d}={metrics['classical']['replacement'][d][-1]:.3f}"
-                            for d in classical_dets_rep)
-        print(f"  n={n:>4}  ({time.time() - t0:.0f}s)", flush=True)
-        print(f"     add: {line_add}", flush=True)
-        print(f"     rep: {line_rep}", flush=True)
+        tr = train_pool_raw[:n]
+        reg_sigma = compute_sigma_from_data(tr, rho_fixed)
+        cl = run_classical_additive(tr, test_planted, s_raw, reg_sigma, cfg, mode)
+        sc_dsm, sc_lrao = _train_score_models(tr, cfg, f'n{n}')
+        det_scores = {**cl, 'DSM': sc_dsm, 'LRao': sc_lrao}
+        for det, sc in det_scores.items():
+            au, pa, pd = _mtr(sc)
+            metrics['vs_n'][det]['auc'].append(au)
+            metrics['vs_n'][det]['pauc'].append(pa)
+            metrics['vs_n'][det]['pd'].append(pd)
+            store[f'vsN/{det}_n{n}'] = np.asarray(sc, np.float32)
+        line = "  ".join(f"{d}={metrics['vs_n'][d]['auc'][-1]:.3f}" for d in DETS)
+        print(f"  n={n:>4}  ({time.time()-t0:.0f}s)  AUC: {line}", flush=True)
+        json.dump(metrics, open(os.path.join(run_dir, 'metrics.json'), 'w'),
+                  indent=2, default=str)
+        json.dump(loss_curves, open(os.path.join(run_dir, 'loss_curves.json'), 'w'),
+                  default=str)
 
-    # ----- sweep (d, n) for score methods -----
-    print("\n=== SCORE METHODS (PCA-d + AE-d) ===", flush=True)
-    score_dets_add = ['DSM-PCA', 'DSM-AE', 'LRao-PCA', 'LRao-AE']
-    score_dets_rep = ['DSM-PCA-rep', 'DSM-AE-rep', 'LRao-PCA', 'LRao-AE']
+    # ROC at n_max (largest training set from vs-n sweep)
+    n_roc = n_list[-1]
+    roc_n = {d: store[f'vsN/{d}_n{n_roc}'] for d in DETS}
+    _plot_roc(roc_n, labels,
+              f'ROC  n={n_roc}, ρ={rho_fixed}  (additive)',
+              os.path.join(fig_dir, 'roc_at_nmax.pdf'))
+    metrics['roc_at_nmax'] = {d: _roc_to_dict(labels, sc) for d, sc in roc_n.items()}
+    json.dump(metrics, open(os.path.join(run_dir, 'metrics.json'), 'w'),
+              indent=2, default=str)
 
-    for d in d_list:
-        for det in score_dets_add:
-            metrics['score'][f'd_{d}']['additive'].setdefault(det, [])
-        for det in score_dets_rep:
-            metrics['score'][f'd_{d}']['replacement'].setdefault(det, [])
+    # ----------------------------------------------------------------- vs ρ
+    # classical + LRao are ρ-independent → computed once at n_fixed, drawn flat.
+    print(f"\n=== SWEEP vs ρ  (n={n_fixed}) ===", flush=True)
+    tr_f = train_pool_raw[:n_fixed]
+    reg_sigma_f = compute_sigma_from_data(tr_f, rho_fixed)
+    cl_f = run_classical_additive(tr_f, test_planted, s_raw, reg_sigma_f, cfg, mode)
+    lrao_f, h_lrao_f = train_lrao_local(tr_f, cfg, seed, f'rhofix_n{n_fixed}')
+    loss_curves[f'LRao_rhofix_n{n_fixed}'] = h_lrao_f
+    sc_lrao_f = _safe('LRao vsρ ref',
+                      lambda: score_lrao(lrao_f, tr_f, test_planted, s_raw, cfg),
+                      len(labels))
+    flat = {**cl_f, 'LRao': sc_lrao_f}            # ρ-independent reference scores
 
-        for n in n_list:
-            t0 = time.time()
-            train_pca_n = per_d[d]['train_pool_pca'][:n]
-            train_aelat_n = per_d[d]['train_pool_aelat'][:n]
-            sigma_pca = compute_sigma_from_data(train_pca_n, cfg['dsm_sigma_rho'])
-            sigma_ae = compute_sigma_from_data(train_aelat_n, cfg['dsm_sigma_rho'])
+    for rho in rho_list:
+        t0 = time.time()
+        cfg_rho = {**cfg, 'dsm_sigma_rho': float(rho)}
+        dsm_net, h = train_dsm_local(tr_f, cfg_rho, seed, f'rho{rho}_n{n_fixed}')
+        loss_curves[f'DSM_rho{rho}_n{n_fixed}'] = h
+        torch.save({'state_dict': dsm_net.state_dict(), 'rho': rho, 'n': n_fixed},
+                   os.path.join(mdl_dir, f'dsm_rho{rho}_n{n_fixed}.pt'))
+        sc_dsm = score_dsm_add(dsm_net, tr_f, test_planted, s_raw)
+        det_scores = {**flat, 'DSM': sc_dsm}
+        for det, sc in det_scores.items():
+            au, _, pd = _mtr(sc)
+            metrics['vs_rho'][det]['auc'].append(au)
+            metrics['vs_rho'][det]['pd'].append(pd)
+            store[f'vsRho/{det}_rho{rho}'] = np.asarray(sc, np.float32)
+        print(f"  ρ={rho:<6}  ({time.time()-t0:.0f}s)  "
+              f"DSM auc={metrics['vs_rho']['DSM']['auc'][-1]:.3f} "
+              f"pd@{pfa}={metrics['vs_rho']['DSM']['pd'][-1]:.3f}", flush=True)
+        json.dump(metrics, open(os.path.join(run_dir, 'metrics.json'), 'w'),
+                  indent=2, default=str)
 
-            # ---- DSM-PCA ----
-            dsm_pca, hist = train_dsm_local(
-                d, train_pca_n, sigma_pca, cfg, seed, f'PCA d={d} n={n}')
-            loss_curves[f'DSM_PCA_d{d}_n{n}'] = hist
-            torch.save({'state_dict': dsm_pca.state_dict(),
-                        'd': d, 'n': n, 'sigma': sigma_pca,
-                        'hidden_dims': cfg['hidden_dims'],
-                        'activation': cfg['activation']},
-                       os.path.join(mdl_dir, f'dsm_pca_d{d}_n{n}.pt'))
-            sc_dsm_pca_add = score_dsm_add(
-                dsm_pca, train_pca_n, per_d[d]['test_pca']['additive'], per_d[d]['s_pca_add'])
-            sc_dsm_pca_rep = score_dsm_rep(
-                dsm_pca, train_pca_n, per_d[d]['test_pca']['replacement'], per_d[d]['s_pca_rep'])
-
-            # ---- DSM-AE ----
-            dsm_ae, hist = train_dsm_local(
-                d, train_aelat_n, sigma_ae, cfg, seed, f'AE  d={d} n={n}')
-            loss_curves[f'DSM_AE_d{d}_n{n}'] = hist
-            torch.save({'state_dict': dsm_ae.state_dict(),
-                        'd': d, 'n': n, 'sigma': sigma_ae,
-                        'hidden_dims': cfg['hidden_dims'],
-                        'activation': cfg['activation']},
-                       os.path.join(mdl_dir, f'dsm_ae_d{d}_n{n}.pt'))
-            sc_dsm_ae_add = score_dsm_add(
-                dsm_ae, train_aelat_n, per_d[d]['test_aelat']['additive'], per_d[d]['s_aelat_add'])
-            sc_dsm_ae_rep = score_dsm_rep(
-                dsm_ae, train_aelat_n, per_d[d]['test_aelat']['replacement'], per_d[d]['s_aelat_rep'])
-
-            # ---- LRao-PCA ----
-            lrao_pca, hist = train_lrao_local(
-                d, train_pca_n, cfg, seed, f'PCA d={d} n={n}')
-            loss_curves[f'LRao_PCA_d{d}_n{n}'] = hist
-            torch.save({'state_dict': lrao_pca.state_dict(),
-                        'd': d, 'n': n,
-                        'hidden_dims': cfg['hidden_dims'],
-                        'activation': cfg['activation']},
-                       os.path.join(mdl_dir, f'lrao_pca_d{d}_n{n}.pt'))
-            sc_lrao_pca_add = _safe(
-                f'LRao-PCA d={d} n={n} add',
-                lambda: score_lrao(lrao_pca, train_pca_n,
-                                   per_d[d]['test_pca']['additive'],
-                                   per_d[d]['s_pca_add'], cfg),
-                len(labels['additive']))
-            sc_lrao_pca_rep = _safe(
-                f'LRao-PCA d={d} n={n} rep',
-                lambda: score_lrao(lrao_pca, train_pca_n,
-                                   per_d[d]['test_pca']['replacement'],
-                                   per_d[d]['s_pca_rep'], cfg),
-                len(labels['replacement']))
-
-            # ---- LRao-AE ----
-            lrao_ae, hist = train_lrao_local(
-                d, train_aelat_n, cfg, seed, f'AE  d={d} n={n}')
-            loss_curves[f'LRao_AE_d{d}_n{n}'] = hist
-            torch.save({'state_dict': lrao_ae.state_dict(),
-                        'd': d, 'n': n,
-                        'hidden_dims': cfg['hidden_dims'],
-                        'activation': cfg['activation']},
-                       os.path.join(mdl_dir, f'lrao_ae_d{d}_n{n}.pt'))
-            sc_lrao_ae_add = _safe(
-                f'LRao-AE d={d} n={n} add',
-                lambda: score_lrao(lrao_ae, train_aelat_n,
-                                   per_d[d]['test_aelat']['additive'],
-                                   per_d[d]['s_aelat_add'], cfg),
-                len(labels['additive']))
-            sc_lrao_ae_rep = _safe(
-                f'LRao-AE d={d} n={n} rep',
-                lambda: score_lrao(lrao_ae, train_aelat_n,
-                                   per_d[d]['test_aelat']['replacement'],
-                                   per_d[d]['s_aelat_rep'], cfg),
-                len(labels['replacement']))
-
-            # ---- collect AUCs + scores ----
-            sc = {
-                'additive': {
-                    'DSM-PCA': sc_dsm_pca_add,
-                    'DSM-AE': sc_dsm_ae_add,
-                    'LRao-PCA': sc_lrao_pca_add,
-                    'LRao-AE': sc_lrao_ae_add,
-                },
-                'replacement': {
-                    'DSM-PCA-rep': sc_dsm_pca_rep,
-                    'DSM-AE-rep': sc_dsm_ae_rep,
-                    'LRao-PCA': sc_lrao_pca_rep,
-                    'LRao-AE': sc_lrao_ae_rep,
-                },
-            }
-            for tm in ('additive', 'replacement'):
-                for det, arr in sc[tm].items():
-                    metrics['score'][f'd_{d}'][tm][det].append(
-                        _auc(labels[tm], arr))
-                    scores[f'score/d{d}_n{n}_{det}_{tm}'] = arr.astype(np.float32)
-
-            elapsed = time.time() - t0
-            line_add = " ".join(
-                f"{k}={metrics['score'][f'd_{d}']['additive'][k][-1]:.3f}"
-                for k in score_dets_add)
-            line_rep = " ".join(
-                f"{k}={metrics['score'][f'd_{d}']['replacement'][k][-1]:.3f}"
-                for k in score_dets_rep)
-            print(f"  d={d} n={n:>4}  ({elapsed:.0f}s)", flush=True)
-            print(f"     add: {line_add}", flush=True)
-            print(f"     rep: {line_rep}", flush=True)
-            # incremental save so we never lose all progress
-            json.dump(metrics, open(os.path.join(run_dir, 'metrics.json'), 'w'),
-                      indent=2, default=str)
-            json.dump(loss_curves,
-                      open(os.path.join(run_dir, 'loss_curves.json'), 'w'),
-                      default=str)
+    # ROC at rho_fixed (use the ρ in rho_list closest to dsm_sigma_rho)
+    rho_roc = min(rho_list, key=lambda r: abs(r - rho_fixed))
+    roc_rho = {d: store[f'vsRho/{d}_rho{rho_roc}'] for d in DETS}
+    _plot_roc(roc_rho, labels,
+              f'ROC  n={n_fixed}, ρ={rho_roc}  (additive)',
+              os.path.join(fig_dir, 'roc_at_nfixed.pdf'))
+    metrics['roc_at_nfixed'] = {d: _roc_to_dict(labels, sc) for d, sc in roc_rho.items()}
+    json.dump(metrics, open(os.path.join(run_dir, 'metrics.json'), 'w'),
+              indent=2, default=str)
 
     # ---- final saves ----
-    np.savez_compressed(os.path.join(run_dir, 'scores.npz'), **scores)
+    np.savez_compressed(os.path.join(run_dir, 'scores.npz'), **store)
 
-    # ---- figures ----
-    n_max = max(n_list)
-    n_idx_max = n_list.index(n_max)
-    for d in d_list:
-        plot_auc_vs_n(metrics, d, 'additive', n_list,
-                      os.path.join(fig_dir, f'auc_vs_n_additive_d{d}.pdf'),
-                      classical_dets_add, score_dets_add)
-        plot_auc_vs_n(metrics, d, 'replacement', n_list,
-                      os.path.join(fig_dir, f'auc_vs_n_replacement_d{d}.pdf'),
-                      classical_dets_rep, score_dets_rep)
-        plot_loss_panel(loss_curves, d, n_max,
-                        os.path.join(fig_dir, f'loss_curves_d{d}_n{n_max}.png'))
-        # ROC at (d, n_max)
-        for tm, score_dets in (('additive', score_dets_add),
-                               ('replacement', score_dets_rep)):
-            cl_dets = classical_dets_add if tm == 'additive' else classical_dets_rep
-            roc_dict = {}
-            for det in cl_dets:
-                roc_dict[det] = _roc(labels[tm], scores[f'classical/{det}_n{n_max}_{tm}'])
-            for det in score_dets:
-                key = f'score/d{d}_n{n_max}_{det}_{tm}'
-                if key in scores:
-                    roc_dict[det] = _roc(labels[tm], scores[key])
-            plot_rocs(roc_dict,
-                      os.path.join(fig_dir, f'roc_d{d}_n{n_max}_{tm}.pdf'),
-                      title=f'ROC  d={d}, n={n_max}, {tm}')
+    # ---- figures (additive only) ----
+    auc_n  = {d: metrics['vs_n'][d]['auc']  for d in DETS}
+    pauc_n = {d: metrics['vs_n'][d]['pauc'] for d in DETS}
+    pd_n   = {d: metrics['vs_n'][d]['pd']   for d in DETS}
+    auc_r  = {d: metrics['vs_rho'][d]['auc'] for d in DETS}
+    pd_r   = {d: metrics['vs_rho'][d]['pd']  for d in DETS}
 
-    plot_auc_vs_d(metrics, n_idx_max, 'additive', d_list,
-                  os.path.join(fig_dir, f'auc_vs_d_n{n_max}_additive.pdf'),
-                  score_dets_add)
-    plot_auc_vs_d(metrics, n_idx_max, 'replacement', d_list,
-                  os.path.join(fig_dir, f'auc_vs_d_n{n_max}_replacement.pdf'),
-                  score_dets_rep)
+    _plot_vs(n_list, auc_n, 'training samples  n', 'AUC',
+             'AUC vs n (additive)', os.path.join(fig_dir, 'auc_vs_n.pdf'), logx=True)
+    _plot_vs(n_list, pauc_n, 'training samples  n', f'partial AUC (Pfa<{pauc_fpr})',
+             f'Partial AUC (Pfa<{pauc_fpr}) vs n',
+             os.path.join(fig_dir, 'pauc_vs_n.pdf'), logx=True)
+    _plot_vs(n_list, pd_n, 'training samples  n', f'Pd @ Pfa={pfa}',
+             f'Pd @ Pfa={pfa} vs n', os.path.join(fig_dir, 'pd_at_fa_vs_n.pdf'),
+             logx=True)
+    _plot_vs(rho_list, auc_r, r'DSM noise level  $\rho$', 'AUC',
+             f'AUC vs ρ (n={n_fixed}, additive)',
+             os.path.join(fig_dir, 'auc_vs_rho.pdf'), logx=True)
+    _plot_vs(rho_list, pd_r, r'DSM noise level  $\rho$', f'Pd @ Pfa={pfa}',
+             f'Pd @ Pfa={pfa} vs ρ (n={n_fixed})',
+             os.path.join(fig_dir, 'pdet_at_pfa_vs_rho.pdf'), logx=True)
+    plot_loss_panel(loss_curves, f'n{n_fixed}',
+                    os.path.join(fig_dir, f'loss_curves_n{n_fixed}.png'))
 
     elapsed_min = (time.time() - t_start) / 60.0
     print(f"\nDONE in {elapsed_min:.1f} min. Results -> {run_dir}", flush=True)

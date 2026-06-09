@@ -1,65 +1,68 @@
 # =========================================================================
 # IID single-class experiment configuration  (Pavia-U)
 # =========================================================================
-# Pipeline: data + planting in RAW 103-D; classical baselines run in raw;
-# score-based methods (DSM, LRao Mode-2) run in two latent spaces in
-# parallel (PCA-d and a learned linear AE of the same dim).  Sweeps over
-# latent_dim and n_train; all artifacts (config, AUCs, loss curves,
-# scores, models, figures) saved to disk for offline re-plotting.
+# ADDITIVE target only. EVERY detector consumes raw 103-D bands. Score methods
+# (DSM, LRao Mode-2) carry a frozen ZCA whitening first layer (fit on the
+# TRAINING background) and return data-space scores. NO PCA, NO autoencoder.
+# Two sweeps: vs n (at fixed rho) and vs rho (at fixed n).
+# Metrics: AUC, partial-AUC(Pfa<pauc_fpr), Pd@Pfa.
 
 dataset: data/pavia-u.mat
-norm_mode: global_max          # score models use this normalization
-baseline_norm_mode: global_max  # classical baselines use this (set to global_max for honest comparison)
+norm_mode: none                # RAW sensor values — no scaling (no PCA anywhere)
+whiten_mode: zca               # frozen whitening first layer: zca | pca | cholesky
+whiten_eig_floor: 0.001        # relative eigenvalue floor (× λ_max)
 
 # ----- classes (single-class: ONE background class vs ONE target class) -----
 bkg_cls: 1                # asphalt
 target_cls: 3                # trees
 exclude_classes: [ ]               # ignored for single
 
-# ----- planted target -----
+# ----- planted target (additive) -----
 amplitude: 0.15
 target_fraction: 0.10
 test_size: 1000
 
 # ----- sweep axes -----
-n_train_list:    [20, 40, 60, 100, 200, 500, 1000, 2000]
+n_train_list: [
+  20, 40, 60, 100, 200,
+#  500,
+#  1000,
+#  2000
+]   # vs-n  (at rho = dsm_sigma_rho)
+rho_list:     [
+#  0.001, 0.003,
+  0.01,
+#  0.03, 0.1, 0.3
+]      # vs-rho (at n = n_fixed_for_rho)
+n_fixed_for_rho: 400                                   # n used for the vs-rho sweep
 
-latent_dim_list: [ 5 ]
+# ----- metric operating points -----
+pfa: 0.1                       # Pd @ this Pfa
+pauc_fpr: 0.1                  # partial AUC over Pfa < this
 
 # ----- score network architecture (DSM + LRao share this) -----
-hidden_dims: [ 64, 64 ]
+hidden_dims: [ ]
 activation: silu
 
 # ----- training budgets -----
 dsm_epochs: 2000
-lrao_epochs: 100
-ae_epochs: 150
+lrao_epochs: 1
 
 # ----- optimizer (DSM, LRao) -----
-lr: 0.001
+lr: 0.0005
 weight_decay: 0.00005
 batch_size: 256
 
 # ----- DSM specifics -----
-dsm_sigma_rho: 0.01             # σ² = ρ · (1/d) · tr(Σ̂)
+dsm_sigma_rho: 0.01            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
 
 # ----- LRao Mode-2 specifics -----
 lfi_delta_theta: 0.01
 lfi_sigma_cutoff: 0.001
-lfi_detach_sigma: false            # Σ in graph (matches original LRao code)
-lrao_val_frac: 0.2                 # fraction of train data held out for early stopping
-lrao_patience: 3                   # epochs without val improvement before stopping
-
-# ----- linear AE training -----
-ae_lr: 0.005
-ae_wd: 0.00001
-ae_batch: 512
-ae_bias: false
+lfi_detach_sigma: false        # Sigma in graph (matches original LRao code)
 
 # ----- GMM-family detectors -----
 gmm_K: 2
-gmm_theta_max: 0.5
-gmm_theta_steps: 50
 
 # ----- reproducibility -----
 seed: 42

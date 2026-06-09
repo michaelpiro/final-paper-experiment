@@ -82,22 +82,22 @@ class PaviaScenarioProvider:
     spatial = True
 
     def scenarios(self, cfg) -> Iterator[Scenario]:
-        from sklearn.decomposition import PCA
+        # NO PCA: every detector gets the RAW full-band data. Our score nets
+        # whiten internally (frozen ZCA first layer); classical/deep baselines
+        # consume raw bands directly. pix == raw, signature == signature_raw.
         seed = int(cfg.get("seed", 42))
         k = int(cfg.get("k", 5))
-        latent = int(cfg.get("latent_dim", 20))
         rho = float(cfg.get("dsm_sigma_rho", 0.01))
         n_budget = int(cfg.get("n_budget", 2000))
 
         ds = cfg["dataset"]
         if not os.path.isabs(ds):
             ds = os.path.join(_ROOT, ds)
-        data_norm, gt = load_and_normalize(ds, cfg.get("norm_mode", "global_max"))
+        # 'none' == original .mat sensor values (no scaling/normalization)
+        data_norm, gt = load_and_normalize(ds, cfg.get("norm_mode", "none"))
         H, W, D_raw = data_norm.shape
         flat = data_norm.reshape(-1, D_raw)
-        pca = PCA(n_components=latent, random_state=seed).fit(flat)
-        pca_img = pca.transform(flat).reshape(H, W, -1)
-        sigma = compute_sigma_from_data(pca.transform(flat), rho)
+        sigma = compute_sigma_from_data(flat, rho)
 
         boxes_path = cfg.get("manual_boxes_path",
                              "experiments/spatial/manual_boxes.json")
@@ -111,13 +111,11 @@ class PaviaScenarioProvider:
             tb, te = sc["train_box"], sc["test_box"]
             rng = np.random.default_rng(seed + idx * 100)
 
-            tr_c, tr_n = _nbr(pca_img[tb[0]:tb[1], tb[2]:tb[3], :], k)
             tr_cr, tr_nr = _nbr(data_norm[tb[0]:tb[1], tb[2]:tb[3], :], k)
-            if len(tr_c) > n_budget:
-                sub = rng.choice(len(tr_c), n_budget, replace=False)
-                tr_c, tr_n, tr_cr, tr_nr = tr_c[sub], tr_n[sub], tr_cr[sub], tr_nr[sub]
+            if len(tr_cr) > n_budget:
+                sub = rng.choice(len(tr_cr), n_budget, replace=False)
+                tr_cr, tr_nr = tr_cr[sub], tr_nr[sub]
 
-            te_c, te_n = _nbr(pca_img[te[0]:te[1], te[2]:te[3], :], k)
             te_cr, te_nr = _nbr(data_norm[te[0]:te[1], te[2]:te[3], :], k)
             te_gt = gt[te[0]:te[1], te[2]:te[3]].ravel()
             Hb, Wb = te[1] - te[0], te[3] - te[2]
@@ -128,18 +126,21 @@ class PaviaScenarioProvider:
                 gt[te[0]:te[1], te[2]:te[3]], data_norm[te[0]:te[1], te[2]:te[3]],
                 float(cfg.get("sig_dom_weight", 0.8)),
                 float(cfg.get("sig_mean_weight", 0.2)))
-            s_pca = pca.transform(sig_raw[None]).flatten().astype(np.float32)
-            signatures = {f"paper-{dom_name}": (s_pca, sig_raw.astype(np.float32))}
+            sig_raw = sig_raw.astype(np.float32)
+            # raw == feature: pix and signature live in the same raw band space
+            signatures = {f"paper-{dom_name}": (sig_raw, sig_raw)}
 
+            tr_cr = tr_cr.astype(np.float32); tr_nr = tr_nr.astype(np.float32)
+            te_cr = te_cr.astype(np.float32); te_nr = te_nr.astype(np.float32)
             yield Scenario(
                 name=f"pavia_s{idx}", spatial=True,
-                train_pix=tr_c.astype(np.float32), test_pix=te_c.astype(np.float32),
-                train_raw=tr_cr.astype(np.float32), test_raw=te_cr.astype(np.float32),
+                train_pix=tr_cr, test_pix=te_cr,
+                train_raw=tr_cr, test_raw=te_cr,
                 sigma=sigma, signatures=signatures,
-                train_nbr=tr_n.astype(np.float32), test_nbr=te_n.astype(np.float32),
-                train_nbr_raw=tr_nr.astype(np.float32), test_nbr_raw=te_nr.astype(np.float32),
+                train_nbr=tr_nr, test_nbr=te_nr,
+                train_nbr_raw=tr_nr, test_nbr_raw=te_nr,
                 test_coords=coords, box_shape=(Hb, Wb), test_gt_cls=te_gt,
-                meta={"dataset": "pavia", "D": tr_c.shape[1], "D_raw": D_raw,
+                meta={"dataset": "pavia", "D": D_raw, "D_raw": D_raw,
                       "spatial": True, "dom_cls": int(dom_cls)},
             )
 

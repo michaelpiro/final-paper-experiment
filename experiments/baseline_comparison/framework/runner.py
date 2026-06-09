@@ -36,7 +36,9 @@ def _ctx(sc: Scenario, device, seed, test_pix=None, test_raw=None,
         train_nbr=sc.train_nbr,
         test_nbr=sc.test_nbr if test_nbr is None else test_nbr,
         train_nbr_raw=sc.train_nbr_raw,
-        test_nbr_raw=sc.test_nbr_raw if test_nbr is None else sc.test_nbr_raw,
+        # when the caller overrides test_nbr (e.g. the train-pixel CFAR pass),
+        # the matching raw neighbors must follow it (raw == feature post-no-PCA)
+        test_nbr_raw=sc.test_nbr_raw if test_nbr is None else test_nbr,
         test_coords=sc.test_coords, box_shape=sc.box_shape,
         meta=sc.meta,
     )
