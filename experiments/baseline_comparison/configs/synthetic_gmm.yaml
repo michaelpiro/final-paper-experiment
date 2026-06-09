@@ -23,12 +23,13 @@ provider_cfg:
 
 # Every detector; needs_spatial ones auto-skip on iid_gmm
 detectors: [AMF, Reg-AMF, CEM, GMM-Levin, Self-GMM, Spatial-GMM,
-            DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR, MCLT, E-CEM, HTD-IRN]
+            DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR, MCLT, E-CEM, HTD-IRN, TSTTD]
 
 detector_cfg:
   Self-GMM:    {K: 4}
   Spatial-GMM: {K: 4}
   HTD-IRN:     {iters: 5000, m: 30, eta1: 10}   # paper hyperparams (transductive, heavy)
+  TSTTD:       {epoch: 20}                     # paper hyperparams (inductive)
 
 # Sweep both target models incl. FULL replacement (theta=1) as a "did it train" check,
 # across several signatures and amplitudes.
@@ -41,4 +42,4 @@ seed: 42
 # tiny overrides for --dry-run
 dry_run_amplitudes: [0.2, 1.0]
 dry_run_provider_cfg: {train_shape: [24, 24], test_shape: [24, 24], n_train: 600, n_test: 600}
-dry_run_detector_cfg: {cfattn_epochs: 8, nmlp_epochs: 8, dsm_epochs: 20, mclt_epochs: 3, iters: 40}
+dry_run_detector_cfg: {cfattn_epochs: 8, nmlp_epochs: 8, dsm_epochs: 20, mclt_epochs: 3, iters: 40, epoch: 3}

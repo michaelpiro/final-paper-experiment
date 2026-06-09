@@ -16,12 +16,13 @@ provider_cfg:
   seed: 42
 
 detectors: [AMF, Reg-AMF, CEM, GMM-Levin, Self-GMM, Spatial-GMM,
-            DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR, MCLT, E-CEM, HTD-IRN]
+            DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR, MCLT, E-CEM, HTD-IRN, TSTTD]
 
 detector_cfg:
   Self-GMM:    {K: 9}
   Spatial-GMM: {K: 9}
   HTD-IRN:     {iters: 5000, m: 30, eta1: 10}   # paper hyperparams (transductive, heavy)
+  TSTTD:       {epoch: 20}                     # paper hyperparams (inductive)
 
 # additive = paper setting; replacement (incl. full theta=1) tests MCLT / spectral
 # detectors in their NATIVE full-pixel regime on REAL data.
@@ -33,4 +34,4 @@ seed: 42
 
 dry_run_amplitudes: [0.15, 1.0]
 dry_run_provider_cfg: {scenarios: [0], n_budget: 400}
-dry_run_detector_cfg: {cfattn_epochs: 8, nmlp_epochs: 8, dsm_epochs: 20, mclt_epochs: 3, iters: 40}
+dry_run_detector_cfg: {cfattn_epochs: 8, nmlp_epochs: 8, dsm_epochs: 20, mclt_epochs: 3, iters: 40, epoch: 3}
