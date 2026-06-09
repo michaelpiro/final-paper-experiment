@@ -68,7 +68,8 @@ from final_paper_experiments.data_utils import (
     load_and_normalize, compute_sigma_from_data, plant_targets,
 )
 from final_paper_experiments.baselines.detectors import (
-    amf, dsm_additive, gmm_glrt,    # ADDITIVE-only experiment
+    amf, dsm_additive, gmm_glrt,            # ADDITIVE-only experiment
+    _fit_gmm_shared_cov, _dltd_score, _smglrt_score,  # multi-class GLRT (fit once, score twice)
 )
 from final_paper_experiments.baselines.gmm_glrt_levin import gmm_glrt_levin_additive
 from dsm_model import (
@@ -273,21 +274,34 @@ def score_lrao(model, train_lat, test_lat, s_lat, cfg):
 # ---------------------------------------------------------------------------
 
 # single-class: AMF only  (single Gaussian bkg; Reg-AMF/GMM redundant)
-# multi-class:  AMF + GMM-Levin (Levin 2019 product-GMM GLRT handles mixed bkg)
+# multi-class:  AMF + GMM-Levin + DLTD + SMGLRT
+#   GMM-Levin: Levin 2019 product-of-GMMs GLRT — handles mixed background
+#   DLTD/SMGLRT: shared-cov K-component GMM GLRT variants (Ma 2025/2026)
+#                K clamped to ≥ 3 (K=1 is degenerate constant score)
 CLASSICAL_DETS_SINGLE = ['AMF']
-CLASSICAL_DETS_MULTI  = ['AMF', 'GMM-Levin']
+CLASSICAL_DETS_MULTI  = ['AMF', 'GMM-Levin', 'DLTD', 'SMGLRT']
 
 
 def run_classical_additive(train_raw, test_planted, s_raw, reg_sigma, cfg, mode):
     """Returns {detector -> scores} for the ADDITIVE target model on raw bands."""
-    n = len(test_planted)
+    dets = CLASSICAL_DETS_MULTI if mode == 'multi' else CLASSICAL_DETS_SINGLE
+    n    = len(test_planted)
+    K    = max(int(cfg.get('gmm_K', 6)), 3)   # DLTD/SMGLRT require K ≥ 3
+
+    # Pre-fit the shared-cov GMM ONCE and share between DLTD + SMGLRT.
+    # Both detectors need the same model; fitting twice wastes ~2× time.
+    _gmm = None
+    if 'DLTD' in dets or 'SMGLRT' in dets:
+        _gmm = _fit_gmm_shared_cov(train_raw, K)
+
     all_jobs = {
         'AMF':       lambda: amf(test_planted, train_raw, s_raw),
         'GMM-Levin': lambda: gmm_glrt_levin_additive(
                          test_planted, train_raw, s_raw,
                          p_steps=50, p_max=1.0),
+        'DLTD':      lambda: _dltd_score(test_planted, *_gmm, s_raw),
+        'SMGLRT':    lambda: _smglrt_score(test_planted, *_gmm, s_raw),
     }
-    dets = CLASSICAL_DETS_MULTI if mode == 'multi' else CLASSICAL_DETS_SINGLE
     return {nm: _safe(nm, all_jobs[nm], n) for nm in dets}
 
 
@@ -298,6 +312,8 @@ def run_classical_additive(train_raw, test_planted, s_raw, reg_sigma, cfg, mode)
 DETECTOR_COLORS = {
     'AMF':       '#1f77b4',
     'GMM-Levin': '#9467bd',
+    'DLTD':      '#e6550d',   # orange
+    'SMGLRT':    '#8c564b',   # brown
     'DSM':       '#d62728',
     'LRao':      '#2ca02c',
 }

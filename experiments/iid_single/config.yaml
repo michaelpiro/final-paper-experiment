@@ -13,22 +13,24 @@ whiten_mode: zca               # frozen whitening first layer: zca | pca | chole
 whiten_eig_floor: 0.001        # relative eigenvalue floor (× λ_max)
 
 # ----- classes (single-class: ONE background class vs ONE target class) -----
-bkg_cls: 1                     # asphalt
-target_cls: 3                  # trees
+bkg_cls: 2                     # asphalt
+target_cls: 1                  # trees
 exclude_classes: []
 
 # ----- planted target (additive) -----
 amplitude: 0.15
 target_fraction: 0.10
-test_size: 1000
+test_size: 2000
 
 # ----- sweep axes -----
 # Full paper sweep — trim for quick tests by editing the lists below
-# n full: [20, 40, 60, 100, 200, 500, 1000, 2000]
-n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000]
-# rho full: [0.001, 0.003, 0.01, 0.03, 0.1, 0.3]
-rho_list: [0.00001,0.00005,0.0001,0.0005, 0.001, 0.002, 0.003,0.005, 0.007, 0.01,0.02, 0.03,0.05, 0.07, 0.1,0.2, 0.3, 1.0]
-n_fixed_for_rho: 400           # n used for the vs-rho sweep
+n_train_list: [
+    20,
+    40, 60, 100, 200, 500, 1000, 2000
+]
+
+rho_list: [0.00001, 0.001,0.005,0.01, 0.07, 0.1,0.5, 1.0, 3.0,5.0]
+n_fixed_for_rho: 1000           # n used for the vs-rho sweep
 
 # ----- metric operating points -----
 pfa: 0.1                       # Pd @ this Pfa
@@ -39,8 +41,8 @@ hidden_dims: []
 activation: silu
 
 # ----- training budgets -----
-dsm_epochs: 3000
-lrao_epochs: 100
+dsm_epochs: 2000
+lrao_epochs: 1
 
 # ----- optimizer (DSM, LRao) -----
 lr: 0.0005
@@ -48,7 +50,7 @@ weight_decay: 0.00005
 batch_size: 512
 
 # ----- DSM specifics -----
-dsm_sigma_rho: 0.01            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
+dsm_sigma_rho: 1.0            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
 
 # ----- LRao Mode-2 specifics -----
 lfi_delta_theta: 0.01
