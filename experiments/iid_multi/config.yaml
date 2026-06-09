@@ -11,26 +11,22 @@ whiten_mode: zca               # frozen whitening first layer: zca | pca | chole
 whiten_eig_floor: 0.001        # relative eigenvalue floor (× λ_max)
 
 # ----- target + background -----
-target_cls: 3                  # detect this class (trees)
+target_cls: 1                  # detect this class (trees)
 bkg_cls: null                  # ignored in multi — all other classes form background
-exclude_classes: [ ]           # leave [] to include class 0 (unlabeled) in background
+exclude_classes: [0,2,9 ]           # leave [] to include class 0 (unlabeled) in background
 
 # ----- planted target (additive) -----
 amplitude: 0.15
 target_fraction: 0.10
-test_size: 1000
+test_size: 2000
 
 # ----- sweep axes -----
 n_train_list: [
   20, 40, 60, 100,
-#  200, 500, 1000, 2000
+  200, 500, 1000, 2000
 ]   # vs-n  (at rho = dsm_sigma_rho)
-rho_list:     [
-#  0.001, 0.003,
-  0.01,
-#  0.03, 0.1, 0.3
-]      # vs-rho (at n = n_fixed_for_rho)
-n_fixed_for_rho: 400                                      # n used for the vs-rho sweep
+rho_list: [0.0005, 0.001, 0.002, 0.003,0.005, 0.007, 0.01,0.02, 0.03,0.05, 0.07, 0.1,0.2, 0.3, 1.0]
+n_fixed_for_rho: 1000                                      # n used for the vs-rho sweep
 
 # ----- metric operating points -----
 pfa: 0.1                       # Pd @ this Pfa
@@ -41,13 +37,13 @@ hidden_dims: [ 64, 64 ]
 activation: silu
 
 # ----- training budgets -----
-dsm_epochs: 2000
-lrao_epochs: 100
+dsm_epochs: 3000
+lrao_epochs: 500
 
 # ----- optimizer (DSM, LRao) -----
 lr: 0.0005
 weight_decay: 0.00005
-batch_size: 256
+batch_size: 512
 
 # ----- DSM specifics -----
 dsm_sigma_rho: 0.01            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
@@ -61,7 +57,7 @@ lfi_detach_sigma: false        # Sigma in graph (matches original LRao code)
 gmm_K: 9
 
 # ----- reproducibility -----
-seed: 42
+seed: [42, 43, 44, 45, 46]   # list of seeds for multiple runs (with different train/test splits)
 
 # ----- output -----
 results_dir: experiments/iid_multi/results

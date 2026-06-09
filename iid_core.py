@@ -307,6 +307,12 @@ def _det_color(det: str):
     return DETECTOR_COLORS.get(det, '#444444')
 
 
+def _savefig(fig, pdf_path: str, dpi: int = 150):
+    """Save as PDF (paper) + PNG (inline display) side by side."""
+    fig.savefig(pdf_path, bbox_inches='tight')
+    fig.savefig(pdf_path.replace('.pdf', '.png'), dpi=dpi, bbox_inches='tight')
+
+
 def _apply_log_xticks(ax, x):
     """Force log-axis ticks at exactly the data points with clean labels."""
     ax.set_xscale('log')
@@ -346,7 +352,7 @@ def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
     ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.02, 1.0),
               borderaxespad=0.)
     fig.tight_layout()
-    fig.savefig(out_pdf, bbox_inches='tight')
+    _savefig(fig, out_pdf)
     plt.close(fig)
 
 
@@ -366,7 +372,7 @@ def _plot_roc(det_scores: dict, labels: np.ndarray, title: str, out_pdf: str):
     ax.set_xlim(0, 1); ax.set_ylim(0, 1)
     ax.grid(alpha=0.25)
     fig.tight_layout()
-    fig.savefig(out_pdf, bbox_inches='tight')
+    _savefig(fig, out_pdf)
     plt.close(fig)
     print(f"  [fig] {os.path.basename(out_pdf)}", flush=True)
 
@@ -739,7 +745,7 @@ def run_iid_multi_seed(cfg: dict, mode: str):
         ax.set_title(f'AUC at n={n_list[-1]}  (mean±std, {n_seeds} seeds)', fontsize=9)
         ax.grid(axis='y', alpha=0.3)
         fig.tight_layout()
-        fig.savefig(os.path.join(fig_dir, 'roc_auc_bar_nmax.pdf'), bbox_inches='tight')
+        _savefig(fig, os.path.join(fig_dir, 'roc_auc_bar_nmax.pdf'))
         plt.close(fig)
 
     elapsed = (time.time() - t0) / 60.0
