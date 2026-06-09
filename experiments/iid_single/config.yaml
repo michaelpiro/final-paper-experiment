@@ -13,9 +13,9 @@ whiten_mode: zca               # frozen whitening first layer: zca | pca | chole
 whiten_eig_floor: 0.001        # relative eigenvalue floor (× λ_max)
 
 # ----- classes (single-class: ONE background class vs ONE target class) -----
-bkg_cls: 1                # asphalt
-target_cls: 3                # trees
-exclude_classes: [ ]               # ignored for single
+bkg_cls: 1                     # asphalt
+target_cls: 3                  # trees
+exclude_classes: []
 
 # ----- planted target (additive) -----
 amplitude: 0.15
@@ -23,33 +23,27 @@ target_fraction: 0.10
 test_size: 1000
 
 # ----- sweep axes -----
-n_train_list: [
-  20, 40, 60, 100, 200,
-#  500,
-#  1000,
-#  2000
-]   # vs-n  (at rho = dsm_sigma_rho)
-rho_list:     [
-#  0.001, 0.003,
-  0.01,
-#  0.03, 0.1, 0.3
-]      # vs-rho (at n = n_fixed_for_rho)
-n_fixed_for_rho: 400                                   # n used for the vs-rho sweep
+# Full paper sweep — trim for quick tests by editing the lists below
+# n full: [20, 40, 60, 100, 200, 500, 1000, 2000]
+n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000]
+# rho full: [0.001, 0.003, 0.01, 0.03, 0.1, 0.3]
+rho_list: [0.001, 0.003, 0.01, 0.03, 0.1, 0.3]
+n_fixed_for_rho: 400           # n used for the vs-rho sweep
 
 # ----- metric operating points -----
 pfa: 0.1                       # Pd @ this Pfa
 pauc_fpr: 0.1                  # partial AUC over Pfa < this
 
 # ----- score network architecture (DSM + LRao share this) -----
-hidden_dims: [ ]
+hidden_dims: [64, 64]
 activation: silu
 
 # ----- training budgets -----
 dsm_epochs: 2000
-lrao_epochs: 1
+lrao_epochs: 100
 
 # ----- optimizer (DSM, LRao) -----
-lr: 0.0005
+lr: 0.001
 weight_decay: 0.00005
 batch_size: 256
 
