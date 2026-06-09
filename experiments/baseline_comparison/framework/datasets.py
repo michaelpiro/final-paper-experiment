@@ -148,13 +148,20 @@ class PaviaScenarioProvider:
 # synthetic GMM core
 # ---------------------------------------------------------------------------
 
-def _make_gmm(D: int, K: int, sep: float, rng) -> tuple:
-    """Return (means (K,D), covs (K,D,D), weights (K,))."""
+def _make_gmm(D: int, K: int, sep: float, rng, cov_scale: float = 1.0) -> tuple:
+    """Return (means (K,D), covs (K,D,D), weights (K,)).
+
+    `cov_scale` shrinks the WITHIN-component covariance. Tight components
+    (small cov_scale) that are well separated (large sep) make the POOLED
+    covariance dominated by between-mode scatter — exactly the regime where a
+    single-Gaussian whitener (AMF) breaks while per-component detectors
+    (Self-GMM, GMM-Levin) stay sharp.
+    """
     means = rng.normal(0, sep, size=(K, D)).astype(np.float64)
     covs = np.empty((K, D, D))
     for k in range(K):
         A = rng.normal(0, 1, size=(D, D)) / np.sqrt(D)
-        covs[k] = A @ A.T + 0.1 * np.eye(D)        # SPD, moderate scale
+        covs[k] = cov_scale * (A @ A.T + 0.1 * np.eye(D))     # SPD, tunable scale
     weights = rng.dirichlet(np.ones(K) * 2.0)
     return means, covs, weights
 
@@ -196,14 +203,18 @@ class IIDGMMProvider:
         seed = int(cfg.get("seed", 0))
         rng = np.random.default_rng(seed)
         D = int(cfg.get("dim", 8)); K = int(cfg.get("K", 4))
-        sep = float(cfg.get("separation", 2.0))
+        sep = float(cfg.get("separation", 2.0)); cov_scale = float(cfg.get("cov_scale", 1.0))
         n_tr = int(cfg.get("n_train", 4000)); n_te = int(cfg.get("n_test", 4000))
         rho = float(cfg.get("dsm_sigma_rho", 0.01))
 
-        means, covs, weights = _make_gmm(D, K, sep, rng)
+        means, covs, weights = _make_gmm(D, K, sep, rng, cov_scale)
         train, _ = _sample_gmm(means, covs, weights, n_tr, rng)
         test, te_comp = _sample_gmm(means, covs, weights, n_te, rng)
-        ref = float(np.linalg.norm(means[int(np.argmax(weights))]))
+        # Scale signatures to the WITHIN-component clutter (not the giant
+        # comp-mean norm) so the amplitude sweep spans the weak->strong regime
+        # where single-Gaussian AMF lags the per-component GMM detectors.
+        within = float(np.sqrt(np.mean([np.mean(np.diag(c)) for c in covs])))
+        ref = float(cfg.get("sig_norm_scale", 4.0)) * within
         sigs_f = _gmm_signatures(means, weights, rng, ref)
         signatures = {nm: (s, s) for nm, s in sigs_f.items()}   # raw == feature
         sigma = compute_sigma_from_data(train, rho)
@@ -240,13 +251,13 @@ class SpatialGMMProvider:
         seed = int(cfg.get("seed", 0))
         rng = np.random.default_rng(seed)
         D = int(cfg.get("dim", 8)); K = int(cfg.get("K", 4))
-        sep = float(cfg.get("separation", 2.0))
+        sep = float(cfg.get("separation", 2.0)); cov_scale = float(cfg.get("cov_scale", 1.0))
         Htr, Wtr = cfg.get("train_shape", [60, 60])
         Hte, Wte = cfg.get("test_shape", [60, 60])
         smooth = float(cfg.get("spatial_smooth", 3.0))
         k = int(cfg.get("k", 5)); rho = float(cfg.get("dsm_sigma_rho", 0.01))
 
-        means, covs, weights = _make_gmm(D, K, sep, rng)
+        means, covs, weights = _make_gmm(D, K, sep, rng, cov_scale)
         tr_img, _ = self._image(means, covs, weights, Htr, Wtr, smooth, k, rng)
         te_img, te_lab = self._image(means, covs, weights, Hte, Wte, smooth, k, rng)
 
@@ -254,7 +265,11 @@ class SpatialGMMProvider:
         te_c, te_n = _nbr(te_img, k)
         coords = np.stack(np.meshgrid(np.arange(Hte), np.arange(Wte), indexing="ij"),
                           -1).reshape(-1, 2)
-        ref = float(np.linalg.norm(means[int(np.argmax(weights))]))
+        # Scale signatures to the WITHIN-component clutter (not the giant
+        # comp-mean norm) so the amplitude sweep spans the weak->strong regime
+        # where single-Gaussian AMF lags the per-component GMM detectors.
+        within = float(np.sqrt(np.mean([np.mean(np.diag(c)) for c in covs])))
+        ref = float(cfg.get("sig_norm_scale", 4.0)) * within
         sigs_f = _gmm_signatures(means, weights, rng, ref)
         signatures = {nm: (s, s) for nm, s in sigs_f.items()}
         sigma = compute_sigma_from_data(tr_c, rho)

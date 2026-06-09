@@ -129,7 +129,7 @@ class MCLT(Detector):
                         queue[:, ptr:] = k.T[:, :K - ptr]
                         queue[:, :bsz - (K - ptr)] = k.T[:, K - ptr:]
                     ptr = (ptr + bsz) % K
-                tot += float(loss); nb += 1
+                tot += float(loss.detach()); nb += 1
             log[ep] = tot / max(nb, 1)
         self.base.eval(); self._log = log
         return self

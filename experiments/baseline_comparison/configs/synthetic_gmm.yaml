@@ -5,15 +5,20 @@ provider: spatial_gmm
 
 provider_cfg:
   seed: 0
-  dim: 6                 # LOW dimension -> fast
-  K: 4                   # GMM components
-  separation: 2.5        # component mean spread
+  dim: 20                # higher dim (still fast)
+  K: 6                   # GMM components
+  separation: 4.0        # well-separated means
+  cov_scale: 0.4         # TIGHT components -> pooled cov dominated by between-mode
+                         # scatter -> single-Gaussian AMF BREAKS while Self-GMM/
+                         # GMM-Levin (per-component) stay sharp.
+  sig_norm_scale: 4.0    # signatures scaled to 4x within-component std (clutter),
+                         # so the amplitude sweep spans weak->strong vs the clutter.
   spatial_smooth: 3.0    # spatial coherence of the component-label field
-  train_shape: [60, 60]
-  test_shape:  [60, 60]
+  train_shape: [70, 70]
+  test_shape:  [70, 70]
   k: 5                   # KxK spatial neighbourhood
-  n_train: 4000          # (iid_gmm only)
-  n_test:  4000          # (iid_gmm only)
+  n_train: 8000          # (iid_gmm only)
+  n_test:  8000          # (iid_gmm only)
   dsm_sigma_rho: 0.01
 
 # Every detector; needs_spatial ones auto-skip on iid_gmm
