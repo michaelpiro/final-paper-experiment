@@ -78,6 +78,8 @@ class HTDIRN(Detector):
         et = torch.tile(t_tensor, (1, 1, H, W))                                # (1,C,H,W)
 
         model = SRN(C, m).to(dev); model.train()
+        print(f"      [HTD-IRN] training on {next(model.parameters()).device} "
+              f"| {iters} iters | image {H}x{W}x{C}", flush=True)
         opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
         for i in range(1, iters + 1):
             opt.zero_grad()
@@ -88,6 +90,8 @@ class HTDIRN(Detector):
             if i % 1000 == 0:
                 for g in opt.param_groups:
                     g['lr'] *= 0.5
+                print(f"        iter {i}/{iters}  loss={float(loss.detach()):.4f}",
+                      flush=True)
 
         model.eval()
         with torch.no_grad():

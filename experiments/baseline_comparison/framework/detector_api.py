@@ -94,6 +94,11 @@ class Detector(ABC):
     #: the runner skips fit + the train-pixel CFAR threshold for it, and calls
     #: score() once per planting cell. Implies needs a 2D image (box_shape).
     transductive: bool = False
+    #: if True, the detector operates on the 2D test IMAGE (not arbitrary pixel
+    #: sets): fit() trains once on the clean image, score() forwards on the planted
+    #: image. The runner skips the train-pixel CFAR threshold (can't reshape the
+    #: subsampled train pixels into an image). Requires box_shape.
+    image_based: bool = False
     #: which input space the detector consumes ('pca' or 'raw') — informational
     space: str = "pca"
 

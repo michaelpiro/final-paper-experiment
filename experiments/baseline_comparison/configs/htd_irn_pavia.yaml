@@ -23,10 +23,11 @@ detectors: [HTD-IRN]
 detector_cfg:
   HTD-IRN: {iters: 5000, m: 30, eta1: 10}   # paper hyperparams (transductive, heavy)
 
-# lean sweep: weak (paper), strong, full-pixel
+# lean sweep: weak (paper) + full-pixel. HTD-IRN is TRANSDUCTIVE (trains on the
+# image per cell), so keep the sweep short. 2 amps x 2 models x 4 scenarios.
 target_models: [additive, replacement]
 signatures: all
-amplitudes: [0.15, 0.4, 1.0]
+amplitudes: [0.15, 1.0]
 target_fraction: 0.10
 seed: 42
 

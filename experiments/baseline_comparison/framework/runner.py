@@ -90,8 +90,8 @@ def run(cfg: dict, results_dir: str, only=None, dry_run=False, device="cpu",
             if det.needs_spatial and not sc.spatial:
                 print(f"  [{dname}] skipped (needs spatial)", flush=True)
                 continue
-            if det.transductive and sc.box_shape is None:
-                print(f"  [{dname}] skipped (transductive needs a 2D image)", flush=True)
+            if (det.transductive or det.image_based) and sc.box_shape is None:
+                print(f"  [{dname}] skipped (needs a 2D image)", flush=True)
                 continue
             dcfg = dict(det_cfgs.get(dname, {}))
             if dry_run:
@@ -128,8 +128,9 @@ def run(cfg: dict, results_dir: str, only=None, dry_run=False, device="cpu",
             for sig in sig_names:
                 s_f, s_r = sc.signatures[sig]
                 ctx_sig = _with_sig(base, s_f, s_r)
-                # CFAR threshold from CLEAN training pixels only (inductive only)
-                if det.transductive:
+                # CFAR threshold from CLEAN training pixels only. Skip for image-
+                # based detectors (their input is the box image, not a pixel set).
+                if det.transductive or det.image_based:
                     tr_scores = None
                 else:
                     train_ctx = _with_sig(
