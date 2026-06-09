@@ -21,31 +21,40 @@ score_norm: per_band_std     # score models: per-band standardization (robust)
 # ----- operational split -----
 target_cls: 1                 # asphalt (removed from background)
 bkg_cls: 2                 # meadows
-test_n: 4000
+test_n: 2000
 
 # ----- planted target -----
 amplitude: 0.15
-amp_list: [0.15]
+amp_list: [ 0.15 ]
 target_fraction: 0.10
 
+# ----- PCA / normalization -----
+# skip_pca: true  → skip PCA entirely; score network sees full normalized space
+#                   latent_dim_list is ignored (d = D_raw = 103)
+# skip_pca: false → normal PCA reduction to latent_dim_list dims (default)
+# score_norm: none → no normalization (pass raw pixel values)
+skip_pca: false
+
 # ----- sweep axes -----
-n_train_list: [ 50, 100, 200, 500, 750, 1000, 2000]
-latent_dim_list: [ 5 ]
-rho_list: [ 0.001 ]   # DSM noise level rho (sigma^2 = rho * tr(Sigma)/d)
+n_train_list: [ 400 ]
+#n_train_list: [ 50, 100, 200, 500, 750, 1000, 2000]
+latent_dim_list: [ 20 ]
+rho_list: [0.0001,0.0005 ,0.001, 0.002, 0.003, 0.005, 0.008, 0.01, 0.02, 0.05, 0.075, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 ]   # DSM noise level rho (sigma^2 = rho * tr(Sigma)/d)
+#rho_list: [0.01]   # DSM noise level rho (sigma^2 = rho * tr(Sigma)/d)
 
 # ----- score network -----
-hidden_dims: [ 64, 64 ]
+hidden_dims: []
 activation: silu
-dsm_epochs: 3000
+dsm_epochs: 1500
 lrao_epochs: 500
 lrao_patience: 3
 lrao_val_frac: 0.2
 lfi_delta_theta: 0.001
 lfi_sigma_cutoff: 0.00001
-lr: 0.0005
-weight_decay: 0.00005
-batch_size: 256
+lr: 0.001
+weight_decay: 0.00001
+batch_size: 512
 
 
 # ----- reproducibility -----
-seeds: [ 42, 43, 44, 45, 46 ]   # 5 independent seeds → mean ± std
+seeds: [ 42, 43, 44,45, 46 ]   # 5 independent seeds → mean ± std
