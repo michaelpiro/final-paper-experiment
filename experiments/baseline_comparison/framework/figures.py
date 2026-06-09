@@ -23,25 +23,41 @@ COLORS = {
 
 
 # --------------------------------------------------------------------- loading
+# `run` may be a single run dir OR a list of run dirs (merged: detectors from a
+# heavy/transductive baseline run can be overlaid with the main comparison run).
+def _runs(run):
+    return list(run) if isinstance(run, (list, tuple)) else [run]
+
+
 def _provider_root(run_dir):
     subs = [d for d in glob.glob(os.path.join(run_dir, "*")) if os.path.isdir(d)]
     return subs[0] if subs else run_dir
 
 
-def scenarios(run_dir):
-    pr = _provider_root(run_dir)
-    return sorted(os.path.basename(d) for d in glob.glob(os.path.join(pr, "*"))
-                  if os.path.isdir(d))
+def scenarios(run):
+    out = set()
+    for rd in _runs(run):
+        pr = _provider_root(rd)
+        out.update(os.path.basename(d) for d in glob.glob(os.path.join(pr, "*"))
+                   if os.path.isdir(d))
+    return sorted(out)
 
 
-def detectors(run_dir, scenario):
-    pr = _provider_root(run_dir)
-    return sorted(os.path.basename(d) for d in
-                  glob.glob(os.path.join(pr, scenario, "*")) if os.path.isdir(d))
+def detectors(run, scenario):
+    out = set()
+    for rd in _runs(run):
+        pr = _provider_root(rd)
+        out.update(os.path.basename(d) for d in
+                   glob.glob(os.path.join(pr, scenario, "*")) if os.path.isdir(d))
+    return sorted(out)
 
 
-def _det_dir(run_dir, scenario, det):
-    return os.path.join(_provider_root(run_dir), scenario, det)
+def _det_dir(run, scenario, det):
+    for rd in _runs(run):
+        d = os.path.join(_provider_root(rd), scenario, det)
+        if os.path.isdir(d):
+            return d
+    return os.path.join(_provider_root(_runs(run)[0]), scenario, det)
 
 
 def load_metrics(run_dir, scenario, det):

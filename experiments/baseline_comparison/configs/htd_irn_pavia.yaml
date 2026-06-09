@@ -1,0 +1,35 @@
+# DEDICATED config for the heavy TRANSDUCTIVE deep baseline (HTD-IRN).
+# HTD-IRN trains a subspace network on the test image for 5000 iters PER amplitude
+# cell, so it gets its own lean sweep (few amplitudes) on the SAME Pavia scenarios
+# as the main comparison. Run it separately, then MERGE its run dir with the main
+# run dir in the figure cells (figures.* accept a list of run dirs).
+provider: pavia
+
+provider_cfg:
+  dataset: data/pavia-u.mat
+  norm_mode: global_max
+  manual_boxes_path: experiments/spatial/manual_boxes.json
+  scenarios: [0, 1, 2, 3]
+  latent_dim: 20
+  k: 5
+  n_budget: 2000
+  sig_dom_weight: 0.8
+  sig_mean_weight: 0.2
+  dsm_sigma_rho: 0.01
+  seed: 42
+
+detectors: [HTD-IRN]
+
+detector_cfg:
+  HTD-IRN: {iters: 5000, m: 30, eta1: 10}   # paper hyperparams (transductive, heavy)
+
+# lean sweep: weak (paper), strong, full-pixel
+target_models: [additive, replacement]
+signatures: all
+amplitudes: [0.15, 0.4, 1.0]
+target_fraction: 0.10
+seed: 42
+
+dry_run_amplitudes: [0.15, 1.0]
+dry_run_provider_cfg: {scenarios: [0], n_budget: 400}
+dry_run_detector_cfg: {iters: 40}
