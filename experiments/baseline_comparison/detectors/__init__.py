@@ -2,6 +2,7 @@
 
 from . import classical          # noqa: F401  AMF, Reg-AMF, CEM, GMM-Levin
 from . import gmm_variants       # noqa: F401  Self-GMM, Spatial-GMM
+from . import glrt               # noqa: F401  DLTD, SMGLRT
 from . import ecem               # noqa: F401  E-CEM (ensemble cascaded CEM)
 from . import ours               # noqa: F401  CF-Attn(-CFAR), NeighborMLP, DSM
 

@@ -23,11 +23,14 @@ provider_cfg:
 
 # Every detector; needs_spatial ones auto-skip on iid_gmm
 detectors: [AMF, Reg-AMF, CEM, GMM-Levin, Self-GMM, Spatial-GMM,
+            DLTD, SMGLRT,
             DSM, NeighborMLP, CF-Attn, CF-Attn-CFAR, MCLT, E-CEM, TSTTD]
 
 detector_cfg:
   Self-GMM:    {K: 4}
   Spatial-GMM: {K: 4}
+  DLTD:        {K: 4}       # K ≥ 3; matches K used for Self-GMM on easy data
+  SMGLRT:      {K: 4}       # K ≥ 3; n_segments defaults to d//2
   HTD-IRN:     {iters: 5000, m: 30, eta1: 10}   # paper hyperparams (transductive, heavy)
   TSTTD:       {epoch: 20}                     # paper hyperparams (inductive)
 
