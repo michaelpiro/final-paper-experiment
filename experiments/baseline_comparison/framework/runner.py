@@ -90,26 +90,34 @@ def run(cfg: dict, results_dir: str, only=None, dry_run=False, device="cpu",
             if det.needs_spatial and not sc.spatial:
                 print(f"  [{dname}] skipped (needs spatial)", flush=True)
                 continue
+            if det.transductive and sc.box_shape is None:
+                print(f"  [{dname}] skipped (transductive needs a 2D image)", flush=True)
+                continue
             dcfg = dict(det_cfgs.get(dname, {}))
             if dry_run:
                 dcfg.update(cfg.get("dry_run_detector_cfg", {}))
                 det = registry.build(dname, dcfg)
 
-            # LOAD a pretrained model instead of training (scenarios + GMM data are
-            # deterministic across runs, so a saved model is exactly reusable).
-            mpath = (os.path.join(pretrained_dir, cfg["provider"], sc.name, dname,
-                                  "model.pkl") if pretrained_dir else None)
-            if _should_load(dname, load) and mpath and os.path.exists(mpath):
-                det.load(mpath); fit_t = 0.0
-                print(f"  [{dname}] LOADED {mpath}", flush=True)
+            if det.transductive:
+                # trains on the test image each call -> no fit, no train-threshold
+                fit_t = 0.0
+                print(f"  [{dname}] transductive (per-cell train+detect)", flush=True)
             else:
-                if _should_load(dname, load) and mpath:
-                    print(f"  [{dname}] no pretrained at {mpath} -> training", flush=True)
-                t0 = time.time()
-                det.fit(_with_sig(base, sc.signatures[sig_names[0]][0],
-                                  sc.signatures[sig_names[0]][1]))
-                fit_t = time.time() - t0
-                print(f"  [{dname}] fit {fit_t:.1f}s", flush=True)
+                # LOAD a pretrained model instead of training (scenarios + GMM data
+                # are deterministic across runs, so a saved model is exactly reusable).
+                mpath = (os.path.join(pretrained_dir, cfg["provider"], sc.name, dname,
+                                      "model.pkl") if pretrained_dir else None)
+                if _should_load(dname, load) and mpath and os.path.exists(mpath):
+                    det.load(mpath); fit_t = 0.0
+                    print(f"  [{dname}] LOADED {mpath}", flush=True)
+                else:
+                    if _should_load(dname, load) and mpath:
+                        print(f"  [{dname}] no pretrained at {mpath} -> training", flush=True)
+                    t0 = time.time()
+                    det.fit(_with_sig(base, sc.signatures[sig_names[0]][0],
+                                      sc.signatures[sig_names[0]][1]))
+                    fit_t = time.time() - t0
+                    print(f"  [{dname}] fit {fit_t:.1f}s", flush=True)
 
             metr, scores_npz, maps_npz = {}, {}, {}
             scores_npz["gt_cls"] = (sc.test_gt_cls if sc.test_gt_cls is not None
@@ -120,12 +128,15 @@ def run(cfg: dict, results_dir: str, only=None, dry_run=False, device="cpu",
             for sig in sig_names:
                 s_f, s_r = sc.signatures[sig]
                 ctx_sig = _with_sig(base, s_f, s_r)
-                # CFAR threshold from CLEAN training pixels only
-                train_ctx = _with_sig(
-                    _ctx(sc, device, seed, test_pix=sc.train_pix,
-                         test_raw=sc.train_raw, test_nbr=sc.train_nbr), s_f, s_r)
-                tr_scores = det.score(train_ctx)
-                scores_npz[f"trainscore|{sig}"] = tr_scores
+                # CFAR threshold from CLEAN training pixels only (inductive only)
+                if det.transductive:
+                    tr_scores = None
+                else:
+                    train_ctx = _with_sig(
+                        _ctx(sc, device, seed, test_pix=sc.train_pix,
+                             test_raw=sc.train_raw, test_nbr=sc.train_nbr), s_f, s_r)
+                    tr_scores = det.score(train_ctx)
+                    scores_npz[f"trainscore|{sig}"] = tr_scores
 
                 for model in models:
                     for amp in amps:

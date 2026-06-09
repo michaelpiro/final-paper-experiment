@@ -64,6 +64,15 @@ class DetectorInput:
     def spatial(self) -> bool:
         return bool(self.meta.get("spatial", self.test_nbr is not None))
 
+    def test_image(self, raw: bool = True):
+        """Reshape the (planted) test pixels back into an (H, W, C) image using
+        box_shape. Used by transductive image-based detectors. None if no box."""
+        if self.box_shape is None:
+            return None
+        H, W = self.box_shape
+        arr = self.test_raw if raw else self.test_pix
+        return arr.reshape(int(H), int(W), arr.shape[-1])
+
     def with_test(self, test_pix=None, test_raw=None) -> "DetectorInput":
         """Return a shallow copy with the test pixels swapped (planting)."""
         kw = {}
@@ -81,6 +90,10 @@ class Detector(ABC):
     name: str = "detector"
     #: if True, the detector is skipped on non-spatial datasets
     needs_spatial: bool = False
+    #: if True, the detector is TRANSDUCTIVE (trains on the test image each call);
+    #: the runner skips fit + the train-pixel CFAR threshold for it, and calls
+    #: score() once per planting cell. Implies needs a 2D image (box_shape).
+    transductive: bool = False
     #: which input space the detector consumes ('pca' or 'raw') — informational
     space: str = "pca"
 
