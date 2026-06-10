@@ -222,6 +222,9 @@ def _train_cfattn(tr_raw, tr_nbr_raw, cfg, device, seed):
             ep_loss += float(di); nb += 1
         last = ep_loss / max(nb, 1)
         pbar.set_postfix(loss=f'{last:.4f}')
+        E = cfg['cfattn_epochs']
+        if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
+            print(f"    [CF-Attn] epoch {ep+1}/{E}  loss={last:.4f}", flush=True)
     cfattn._final_loss = last
     cfattn.eval()
     return cfattn
@@ -253,6 +256,9 @@ def _train_nmlp(tr_raw, tr_nbr_raw, cfg, device):
             ep_loss += float(loss.item()); nb += 1
         last = ep_loss / max(nb, 1)
         pbar.set_postfix(loss=f'{last:.4f}')
+        E = cfg['nmlp_epochs']
+        if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
+            print(f"    [NeighborMLP] epoch {ep+1}/{E}  loss={last:.4f}", flush=True)
     nmlp._final_loss = last
     nmlp.eval()
     return nmlp
@@ -282,6 +288,9 @@ def _train_dsm(tr_raw, cfg, device):
             ep_loss += float(loss.item()); nb += 1
         last = ep_loss / max(nb, 1)
         pbar.set_postfix(loss=f'{last:.4f}')
+        E = cfg['dsm_epochs']
+        if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
+            print(f"    [DSM] epoch {ep+1}/{E}  loss={last:.4f}", flush=True)
     dsm_net._final_loss = last
     dsm_net.eval()
     return dsm_net

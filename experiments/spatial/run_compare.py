@@ -243,7 +243,8 @@ def _train_ridge(tr_raw, tr_nbr, cfg, device, seed):
     pbar = tqdm(range(int(cfg.get('ridge_epochs', 300))), desc='NeighborRidge',
                 dynamic_ncols=True, leave=False)
     last = float('nan')
-    for _ in pbar:
+    E = int(cfg.get('ridge_epochs', 300))
+    for ep in pbar:
         perm = torch.randperm(P, device=device)
         ep_loss = 0.0; nb = 0
         for i in range(0, P, bs):
@@ -253,6 +254,8 @@ def _train_ridge(tr_raw, tr_nbr, cfg, device, seed):
             ep_loss += float(loss.item()); nb += 1
         last = ep_loss / max(nb, 1)
         pbar.set_postfix(loss=f'{last:.4f}')
+        if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
+            print(f"    [NeighborRidge] epoch {ep+1}/{E}  loss={last:.4f}", flush=True)
     model._final_loss = last
     model._whitening = W
     model.eval()
