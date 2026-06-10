@@ -219,7 +219,7 @@ def cfattn_dsm_loss(model: CFAttnGaussianScoreNet,
     loss_cov = (torch.tril(model.comp_L_raw) ** 2).sum()
 
     total = loss_dsm + lam_ent * H_w - lam_div * H_comp + lam_cov * loss_cov
-    return total, float(loss_dsm)
+    return total, loss_dsm.item()
 
 
 # ---------------------------------------------------------------------------
