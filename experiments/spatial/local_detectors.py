@@ -32,7 +32,7 @@ def amf_cem_local_scm(test_pix: np.ndarray,
                       test_nbr: np.ndarray,
                       s: np.ndarray,
                       device: str = 'cpu',
-                      loading: float = 0.1,
+                      loading: float = 1e-8,
                       chunk: int = 1024):
     """
     Compute AMF-local and CEM-local scores from per-pixel k×k-window SCMs.
@@ -87,3 +87,38 @@ def amf_cem_local_scm(test_pix: np.ndarray,
         cem_out[i0:i0 + chunk] = (yb * w).sum(-1).cpu()
 
     return amf_out.numpy().astype(np.float32), cem_out.numpy().astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Global classical baselines with an explicit (minimal) eigenvalue floor.
+# These mirror baselines.detectors.amf / .cem but expose `eig_floor` so the
+# comparison can run the baselines at near-zero regularization (e.g. 1e-12)
+# WITHOUT editing the shared detectors.py. Floor is RELATIVE (× λ_max).
+# ---------------------------------------------------------------------------
+
+def amf_global(test_data: np.ndarray, train_data: np.ndarray,
+               s: np.ndarray, eig_floor: float = 1e-12) -> np.ndarray:
+    """AMF with a relative eigenvalue floor on the background covariance."""
+    mu    = train_data.mean(axis=0)
+    Sigma = np.cov(train_data, rowvar=False)
+    Sigma = (Sigma + Sigma.T) / 2
+    eigv, eigvec = np.linalg.eigh(Sigma)
+    eigv = np.clip(eigv, eigv.max() * float(eig_floor), None)
+    Si   = eigvec @ np.diag(1.0 / eigv) @ eigvec.T
+    Si_s = Si @ s
+    norm = np.sqrt(float(s @ Si_s) + 1e-18)
+    return (test_data - mu) @ Si_s / norm
+
+
+def cem_global(test_data: np.ndarray, train_data: np.ndarray,
+               s: np.ndarray, eig_floor: float = 1e-12) -> np.ndarray:
+    """CEM (autocorrelation, no mean subtraction) with a relative eigenvalue floor."""
+    n, d = train_data.shape
+    R    = (train_data.T @ train_data) / n
+    R    = (R + R.T) / 2
+    eigv, eigvec = np.linalg.eigh(R)
+    eigv = np.clip(eigv, eigv.max() * float(eig_floor), None)
+    Ri   = eigvec @ np.diag(1.0 / eigv) @ eigvec.T
+    Ri_s = Ri @ s
+    w    = Ri_s / (float(s @ Ri_s) + 1e-12)
+    return test_data @ w

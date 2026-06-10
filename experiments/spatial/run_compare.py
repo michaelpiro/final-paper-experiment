@@ -56,7 +56,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgb
 
 from final_paper_experiments.data_utils import load_and_normalize, plant_targets
-from final_paper_experiments.baselines.detectors import amf, cem, dsm_additive
+from final_paper_experiments.baselines.detectors import dsm_additive
 from final_paper_experiments.baselines.gmm_glrt_levin import gmm_glrt_levin_additive
 from final_paper_experiments.evaluation import (
     partial_auc, dr_at_fpr, auc_safe, roc_safe, cfar_threshold, per_class_fpr,
@@ -64,11 +64,11 @@ from final_paper_experiments.evaluation import (
 )
 from cfattn_model import score_cfattn_additive, score_cfattn_additive_cfar
 from neighbor_mlp_model import score_nmlp_additive
-from local_detectors import amf_cem_local_scm
+from local_detectors import amf_cem_local_scm, amf_global, cem_global
 
 # Reuse the (whitening-aware, GPU) training helpers from the main runner.
 from run_colab import (
-    _crop_pca_box, _subsample, _train_dsm, _train_cfattn, _train_nmlp,
+    _crop_pca_box, _train_dsm, _train_cfattn, _train_nmlp,
 )
 
 CLS_NAMES = {
@@ -106,9 +106,12 @@ DEFAULT_CFG = dict(
     random_scenario_seeds=[42, 123, 456, 789],
     sig_dom_weight=0.8, sig_mean_weight=0.2,
     amplitude=0.15, target_fraction=0.10,
-    n_budget=2000,               # training-pixel budget
+    n_budget=None,               # None = use the FULL train box (no subsampling).
+                                 # int  = cut pixels from the SIDES only to a
+                                 #        contiguous sub-box (spatial context kept).
     k=5,                         # spatial window (k×k) for nbr nets + local SCM
-    local_scm_loading=0.1,       # diagonal loading for local SCMs
+    local_scm_loading=1e-8,      # minimal diagonal loading for local SCMs (≈ no loading)
+    baseline_eig_floor=1e-12,    # relative eigenvalue floor for AMF/CEM global (baselines)
     # CF-Attn
     cfattn_h=64, cfattn_K=9, cfattn_epochs=300, cfattn_lr=3e-4, cfattn_eps=1e-4,
     lam_ent=0.05, lam_div=0.05, lam_cov=1e-5,
@@ -119,7 +122,7 @@ DEFAULT_CFG = dict(
     dsm_hidden=[64, 64], dsm_epochs=1000, dsm_lr=5e-4,
     # shared
     activation='silu', dsm_sigma_rho=0.01,
-    whiten_mode='zca', whiten_eig_floor=1e-3,
+    whiten_mode='zca', whiten_eig_floor=1e-3,   # OUR nets' whitening floor (unchanged)
     batch_size=256, weight_decay=1e-4,
     gmm_steps=50, gmm_K=3,
     pfa_target=0.05,
@@ -129,8 +132,25 @@ DEFAULT_CFG = dict(
 
 DRYRUN_OVERRIDES = dict(
     cfattn_epochs=8, nmlp_epochs=8, dsm_epochs=20,
-    cfattn_K=4, nmlp_K=4, n_budget=400,
+    cfattn_K=4, nmlp_K=4,
+    n_budget=400,   # dry-run only: contiguous side-crop for speed (still spatial)
 )
+
+
+# ---------------------------------------------------------------------------
+def _side_crop_box(box, budget):
+    """Cut pixels from the SIDES only → a contiguous, centered sub-box of about
+    `budget` pixels. Preserves spatial context (no random subsampling).
+    budget None/0/>=box ⇒ the full box is returned unchanged."""
+    r0, r1, c0, c1 = box
+    H, Wd = r1 - r0, c1 - c0
+    if not budget or H * Wd <= int(budget):
+        return [r0, r1, c0, c1]
+    scale = (float(budget) / (H * Wd)) ** 0.5
+    newH = max(int(round(H * scale)), 1)
+    newW = max(int(round(Wd * scale)), 1)
+    dr, dc = (H - newH) // 2, (Wd - newW) // 2
+    return [r0 + dr, r0 + dr + newH, c0 + dc, c0 + dc + newW]
 
 
 # ---------------------------------------------------------------------------
@@ -163,17 +183,18 @@ def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
     pix = pix.astype(np.float32); nbr = nbr.astype(np.float32)
     cfattn, nmlp, dsm_net = models['cfattn'], models['nmlp'], models['dsm']
     out = {}
+    floor = float(cfg.get('baseline_eig_floor', 1e-12))
     out['DSM']          = dsm_additive(pix, tr_raw, dsm_net, sig)
     out['CF-Attn']      = score_cfattn_additive(cfattn, pix, nbr, tr_raw, tr_nbr, sig)
     out['CF-Attn-CFAR'] = score_cfattn_additive_cfar(cfattn, pix, nbr, sig)
     out['NeighborMLP']  = score_nmlp_additive(nmlp, pix, nbr, tr_raw, tr_nbr, sig)
-    out['AMF']          = amf(pix, tr_raw, sig)
-    out['CEM']          = cem(pix, tr_raw, sig)
+    out['AMF']          = amf_global(pix, tr_raw, sig, eig_floor=floor)
+    out['CEM']          = cem_global(pix, tr_raw, sig, eig_floor=floor)
     out['GMM-Levin']    = gmm_glrt_levin_additive(pix, tr_raw, sig,
                                                   p_steps=cfg.get('gmm_steps', 50))
     amf_loc, cem_loc = amf_cem_local_scm(
         pix, nbr, sig, device=device,
-        loading=float(cfg.get('local_scm_loading', 0.1)))
+        loading=float(cfg.get('local_scm_loading', 1e-8)))
     out['AMF-local'] = amf_loc
     out['CEM-local'] = cem_loc
     return out
@@ -232,10 +253,13 @@ def main():
     k = int(cfg['k'])
 
     # ---- Crop train / test (raw bands + k×k neighbors) ----
-    tr_raw_full, tr_nbr_full = _crop_pca_box(data_norm, train_box, k)
-    tr_raw, tr_nbr, _ = _subsample(tr_raw_full, tr_nbr_full, int(cfg['n_budget']), rng)
+    # NO subsampling: use the full train box. If n_budget is set we cut pixels
+    # from the SIDES only (contiguous sub-box) so spatial context is preserved.
+    tr_box_eff = _side_crop_box(train_box, cfg.get('n_budget'))
+    tr_raw, tr_nbr = _crop_pca_box(data_norm, tr_box_eff, k)
     tr_raw = tr_raw.astype(np.float32); tr_nbr = tr_nbr.astype(np.float32)
-    print(f"train={len(tr_raw)} px", flush=True)
+    print(f"train={len(tr_raw)} px  (box {tr_box_eff}, full={cfg.get('n_budget') is None})",
+          flush=True)
 
     r0, r1, c0, c1 = test_box
     H_b, W_b = r1 - r0, c1 - c0

@@ -2,7 +2,7 @@
 # Run:  python -u run_colab.py --config colab.yaml --results_dir /drive/MyDrive/spatial_results
 
 dataset:     data/pavia-u.mat
-norm_mode:   global_max
+norm_mode:   none
 manual_boxes_path: experiments/spatial/manual_boxes.json
 
 # Target signature: s = sig_dom_weight * dominant_class_mean + sig_mean_weight * patch_mean
@@ -11,18 +11,28 @@ sig_mean_weight: 0.2
 
 # Random scenario seeds (one per random scenario)
 random_scenario_seeds: [42, 123, 456, 789]
-min_pixels: 2000
+min_pixels: 4000
 
 # Box-size ablation: try these minimum box sizes (training pixels subsampled to each)
-box_size_ablation: [2000, 4000, 8000]
+box_size_ablation: [
+#  2000,
+  4000,
+#  8000
+]
 
 # Target planting
 amplitude:        0.15
 target_fraction:  0.10
 
-# PCA
-latent_dim: 20
+# spatial window
 k: 5                  # spatial neighborhood window size (k×k - 1 neighbors)
+
+# ----- spatial-comparison (run_compare.py) regularization knobs -----
+n_budget:            null      # null = FULL train box (no subsampling);
+                               # int  = cut SIDES only → contiguous sub-box
+local_scm_loading:   1.0e-8    # AMF-local / CEM-local diagonal loading (≈ no loading)
+whiten_eig_floor:    1.0e-3    # OUR score nets' ZCA whitening floor (× λ_max)
+baseline_eig_floor:  1.0e-12   # AMF / CEM (baselines) covariance eigenvalue floor (× λ_max)
 
 # ------- CF-Attn -------
 cfattn_h:      64
@@ -57,19 +67,19 @@ thantd_n_pairs:         2048
 thantd_use_secondary:   true   # HONEST: train on clean secondary, not CEM pseudo-targets
 
 # ------- DSM (global baseline) -------
-dsm_hidden:    [64, 64]
+dsm_hidden:    [128]
 dsm_epochs:    1000
 dsm_lr:        5.0e-4
 
 # ------- Shared -------
-activation:    silu
+activation:    relu
 dsm_sigma_rho: 0.01
 batch_size:    256
 weight_decay:  1.0e-4
 seed:          42
 
 # ------- GMM baselines -------
-gmm_K:     3     # number of GMM components for GMM-GLRT
+gmm_K:     5     # number of GMM components for GMM-GLRT
 gmm_steps: 50    # grid-search steps for fill factor p
 
-results_dir:   final_paper_experiments/results
+results_dir:   final_paper_experiments/results/spatial
