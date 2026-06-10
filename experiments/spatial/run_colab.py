@@ -125,7 +125,7 @@ DEFAULT_CFG = dict(
     dsm_sigma_rho=0.01,
     # frozen whitening front-end (replaces PCA): raw data in, nets whiten internally
     whiten_mode='zca',          # 'zca' | 'pca' | 'cholesky'  (easy one-line swap)
-    whiten_eig_floor=1e-3,      # RELATIVE eigenvalue floor (× λ_max)
+    whiten_eig_floor=1e-5,      # RELATIVE eigenvalue floor (× λ_max)
     batch_size=256,
     weight_decay=1e-4,
     seed=42,
@@ -169,7 +169,7 @@ def _make_whitening(tr_raw, cfg, device):
     """Frozen whitening front-end fit on the RAW training background."""
     W = Whitening.from_data(np.asarray(tr_raw, dtype=np.float32),
                             mode=cfg.get('whiten_mode', 'zca'),
-                            eig_floor=float(cfg.get('whiten_eig_floor', 1e-3)))
+                            eig_floor=float(cfg.get('whiten_eig_floor', 1e-5)))
     return W.to(device)
 
 

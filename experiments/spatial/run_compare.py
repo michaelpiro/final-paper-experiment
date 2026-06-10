@@ -122,7 +122,7 @@ DEFAULT_CFG = dict(
     dsm_hidden=[64, 64], dsm_epochs=1000, dsm_lr=5e-4,
     # shared
     activation='silu', dsm_sigma_rho=0.01,
-    whiten_mode='zca', whiten_eig_floor=1e-3,   # OUR nets' whitening floor (unchanged)
+    whiten_mode='zca', whiten_eig_floor=1e-5,   # OUR nets' whitening floor (× λ_max)
     batch_size=256, weight_decay=1e-4,
     gmm_steps=50, gmm_K=3,
     pfa_target=0.05,

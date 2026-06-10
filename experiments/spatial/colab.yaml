@@ -31,7 +31,7 @@ k: 5                  # spatial neighborhood window size (k×k - 1 neighbors)
 n_budget:            null      # null = FULL train box (no subsampling);
                                # int  = cut SIDES only → contiguous sub-box
 local_scm_loading:   1.0e-8    # AMF-local / CEM-local diagonal loading (≈ no loading)
-whiten_eig_floor:    1.0e-3    # OUR score nets' ZCA whitening floor (× λ_max)
+whiten_eig_floor:    1.0e-5    # OUR score nets' ZCA whitening floor (× λ_max)
 baseline_eig_floor:  1.0e-12   # AMF / CEM (baselines) covariance eigenvalue floor (× λ_max)
 
 # ------- CF-Attn -------
