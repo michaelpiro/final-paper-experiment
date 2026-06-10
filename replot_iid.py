@@ -22,12 +22,13 @@ DETECTOR_COLORS = {
     'GMM-Levin': '#9467bd',
     'DLTD':      '#e6550d',
     'SMGLRT':    '#8c564b',
-    'DSM':       '#d62728',
-    'DSM-lin':   '#9b2226',
-    'DSM-MLP':   '#e07070',
+    'DSM':       '#d62728',   # nonlinear DSM
+    'LDSM':      '#9b2226',   # linear DSM
+    'DSM-lin':   '#9b2226',   # legacy alias
+    'DSM-MLP':   '#e07070',   # legacy alias
     'LRao':      '#2ca02c',
 }
-OUR_DETS = {'DSM', 'DSM-lin', 'DSM-MLP', 'LRao'}
+OUR_DETS = {'DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao'}
 
 def _color(det):
     return DETECTOR_COLORS.get(det, '#444444')

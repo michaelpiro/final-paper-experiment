@@ -323,9 +323,10 @@ DETECTOR_COLORS = {
     'GMM-Levin': '#9467bd',
     'DLTD':      '#e6550d',   # orange
     'SMGLRT':    '#8c564b',   # brown
-    'DSM':       '#d62728',   # red   — primary DSM (architecture set by hidden_dims)
-    'DSM-lin':   '#9b2226',   # dark red  — linear variant
-    'DSM-MLP':   '#e07070',   # light red — MLP variant
+    'DSM':       '#d62728',   # red   — nonlinear DSM
+    'LDSM':      '#9b2226',   # dark red — linear DSM
+    'DSM-lin':   '#9b2226',   # dark red  — legacy alias
+    'DSM-MLP':   '#e07070',   # light red — legacy alias
     'LRao':      '#2ca02c',
 }
 
@@ -368,7 +369,7 @@ def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
         if ys is None or all(v != v for v in ys):     # all-NaN
             continue
         ys = np.asarray(ys, dtype=float)
-        style = dict(marker='D', lw=2.2) if det in ('DSM', 'DSM-lin', 'DSM-MLP', 'LRao') \
+        style = dict(marker='D', lw=2.2) if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao') \
             else dict(marker='o', lw=1.4)
         c = _det_color(det)
         ax.plot(x, ys, color=c, label=det, **style)
@@ -394,7 +395,7 @@ def _plot_roc(det_scores: dict, labels: np.ndarray, title: str, out_pdf: str):
     ax.plot([0, 1], [0, 1], 'k--', lw=0.7, label='_no_legend_')
     for det, sc in det_scores.items():
         fpr, tpr, auc_v = _roc(labels, sc)
-        lw  = 2.2 if det in ('DSM', 'DSM-lin', 'DSM-MLP', 'LRao') else 1.4
+        lw  = 2.2 if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao') else 1.4
         ax.plot(fpr, tpr, color=_det_color(det), lw=lw,
                 label=f'{det}  (AUC={auc_v:.3f})')
     ax.set_xlabel('False Alarm Rate')
@@ -514,9 +515,10 @@ def run_iid(cfg: dict, mode: str):
 
     _cls = CLASSICAL_DETS_MULTI if mode == 'multi' else CLASSICAL_DETS_SINGLE
 
-    # DSM variant names: always 'DSM' for the primary (hidden_dims/activation).
+    # DSM variant names: primary label from 'dsm_label' (default 'DSM').
     # If hidden_dims_2 is set in config, a second DSM is also run.
-    _dsm_names = ['DSM']
+    _dsm1_label = cfg.get('dsm_label', 'DSM')
+    _dsm_names = [_dsm1_label]
     if cfg.get('hidden_dims_2') is not None:
         _h2 = list(cfg['hidden_dims_2'])
         _dsm2_label = cfg.get('dsm2_label', 'DSM-MLP' if _h2 else 'DSM-lin')
