@@ -179,19 +179,28 @@ def _savefig(fig, path):
 
 # ---------------------------------------------------------------------------
 def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
-    """Score every detector on (pix, nbr).  Returns {det_name: scores}."""
+    """Score every AVAILABLE detector on (pix, nbr).  Returns {det_name: scores}.
+
+    Deep detectors are skipped gracefully if their model is absent from `models`
+    (e.g. CF-Attn disabled in run_scenario), so the rest of the comparison still
+    runs. Classical detectors are always computed.
+    """
     pix = pix.astype(np.float32); nbr = nbr.astype(np.float32)
-    cfattn, nmlp, dsm_net = models['cfattn'], models['nmlp'], models['dsm']
     out = {}
     floor = float(cfg.get('baseline_eig_floor', 1e-12))
-    out['DSM']          = dsm_additive(pix, tr_raw, dsm_net, sig)
-    out['CF-Attn']      = score_cfattn_additive(cfattn, pix, nbr, tr_raw, tr_nbr, sig)
-    out['CF-Attn-CFAR'] = score_cfattn_additive_cfar(cfattn, pix, nbr, sig)
-    out['NeighborMLP']  = score_nmlp_additive(nmlp, pix, nbr, tr_raw, tr_nbr, sig)
-    out['AMF']          = amf_global(pix, tr_raw, sig, eig_floor=floor)
-    out['CEM']          = cem_global(pix, tr_raw, sig, eig_floor=floor)
-    out['GMM-Levin']    = gmm_glrt_levin_additive(pix, tr_raw, sig,
-                                                  p_steps=cfg.get('gmm_steps', 50))
+    # --- our deep detectors (only if their model was trained) ---
+    if models.get('dsm') is not None:
+        out['DSM'] = dsm_additive(pix, tr_raw, models['dsm'], sig)
+    if models.get('cfattn') is not None:
+        out['CF-Attn']      = score_cfattn_additive(models['cfattn'], pix, nbr, tr_raw, tr_nbr, sig)
+        out['CF-Attn-CFAR'] = score_cfattn_additive_cfar(models['cfattn'], pix, nbr, sig)
+    if models.get('nmlp') is not None:
+        out['NeighborMLP'] = score_nmlp_additive(models['nmlp'], pix, nbr, tr_raw, tr_nbr, sig)
+    # --- classical baselines (always) ---
+    out['AMF']       = amf_global(pix, tr_raw, sig, eig_floor=floor)
+    out['CEM']       = cem_global(pix, tr_raw, sig, eig_floor=floor)
+    out['GMM-Levin'] = gmm_glrt_levin_additive(pix, tr_raw, sig,
+                                               p_steps=cfg.get('gmm_steps', 50))
     amf_loc, cem_loc = amf_cem_local_scm(
         pix, nbr, sig, device=device,
         loading=float(cfg.get('local_scm_loading', 1e-8)))
@@ -301,12 +310,17 @@ def main():
     print("Scoring detectors (train, for CFAR threshold) ...", flush=True)
     train_scores = score_all(tr_raw, tr_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
 
+    # Only the detectors that were actually produced (deep ones may be disabled),
+    # in the canonical display order.
+    DETS = [d for d in DET_ORDER if d in test_scores]
+    print(f"Active detectors: {DETS}", flush=True)
+
     # ---- Metrics ----
     pfa_t = float(cfg.get('pfa_target', 0.05))
     rows = []
     pfa_per_class = {}
     roc_curves = {}
-    for det in DET_ORDER:
+    for det in DETS:
         sc = np.asarray(test_scores[det], dtype=np.float64)
         thr = cfar_threshold(np.asarray(train_scores[det], dtype=np.float64),
                              target_fpr=pfa_t)
@@ -348,7 +362,7 @@ def main():
                'dom_cls': dom_cls, 'dom_name': dom_name, 'pfa_target': pfa_t,
                'rows': rows, 'pfa_per_class': pfa_per_class},
               open(os.path.join(run_dir, 'metrics.json'), 'w'), indent=2, default=str)
-    npz = {f'score_{d}': test_scores[d] for d in DET_ORDER}
+    npz = {f'score_{d}': test_scores[d] for d in DETS}
     npz['labels'] = labels; npz['te_gt'] = te_gt; npz['tgt_idx'] = tgt_idx
     np.savez(os.path.join(run_dir, 'scores.npz'), **npz)
 
@@ -373,17 +387,17 @@ def main():
 
     # detection maps grid
     ncol = 3
-    nrow = int(np.ceil(len(DET_ORDER) / ncol))
+    nrow = int(np.ceil(len(DETS) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3.4 * nrow))
     axes = np.atleast_1d(axes).ravel()
-    for j, det in enumerate(DET_ORDER):
+    for j, det in enumerate(DETS):
         smap = scores_to_spatial_map(test_scores[det], te_idx, (H_b, W_b))
         ax = axes[j]
         im = ax.imshow(smap, cmap='inferno')
         ax.set_title(f'{det}  (AUC={roc_curves[det][2]:.3f})', fontsize=8)
         ax.axis('off')
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    for j in range(len(DET_ORDER), len(axes)):
+    for j in range(len(DETS), len(axes)):
         axes[j].axis('off')
     fig.suptitle(f'Detection score maps — scenario {sidx}', fontsize=11)
     fig.tight_layout()
@@ -392,7 +406,7 @@ def main():
     # ROC overlay
     fig, ax = plt.subplots(figsize=(5.5, 5))
     ax.plot([0, 1], [0, 1], 'k--', lw=0.7)
-    for det in DET_ORDER:
+    for det in DETS:
         fpr, tpr, auc_v = roc_curves[det]
         ax.plot(fpr, tpr, color=DET_COLORS[det], lw=1.6,
                 label=f'{det} (AUC={auc_v:.3f})')
@@ -403,11 +417,11 @@ def main():
     _savefig(fig, os.path.join(run_dir, 'roc.pdf'))
 
     # per-class Pfa grouped bars
-    classes = sorted({c for d in DET_ORDER for c in pfa_per_class[d]})
+    classes = sorted({c for d in DETS for c in pfa_per_class[d]})
     fig, ax = plt.subplots(figsize=(max(7, 1.0 * len(classes)), 4))
-    bw = 0.8 / len(DET_ORDER)
+    bw = 0.8 / len(DETS)
     xpos = np.arange(len(classes))
-    for di, det in enumerate(DET_ORDER):
+    for di, det in enumerate(DETS):
         vals = [pfa_per_class[det].get(c, 0.0) for c in classes]
         ax.bar(xpos + di * bw, vals, bw, label=det, color=DET_COLORS[det])
     ax.axhline(pfa_t, color='k', ls=':', lw=1, label=f'target Pfa={pfa_t}')
