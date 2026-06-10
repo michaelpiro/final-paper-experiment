@@ -17,7 +17,7 @@ min_pixels: 4000
 box_size_ablation: [
 #  2000,
   4000,
-#  8000
+  8000
 ]
 
 # Target planting
@@ -35,10 +35,10 @@ whiten_eig_floor:    1.0e-3    # OUR score nets' ZCA whitening floor (× λ_max)
 baseline_eig_floor:  1.0e-12   # AMF / CEM (baselines) covariance eigenvalue floor (× λ_max)
 
 # ------- CF-Attn -------
-cfattn_h:      64
+cfattn_h:      128
 cfattn_K:      9
 cfattn_eps:    1.0e-4
-cfattn_epochs: 300
+cfattn_epochs: 1000
 cfattn_lr:     3.0e-4
 lam_ent:       0.05
 lam_div:       0.05
@@ -48,8 +48,8 @@ lam_cov:       1.0e-5
 nmlp_d_lat:    32
 nmlp_K:        8
 nmlp_hidden:   128
-nmlp_n_layers: 3
-nmlp_epochs:   300
+nmlp_n_layers: 2
+nmlp_epochs:   1000
 nmlp_lr:       3.0e-4
 nmlp_batch:    256
 

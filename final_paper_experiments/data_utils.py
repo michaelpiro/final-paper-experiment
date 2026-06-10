@@ -21,7 +21,7 @@ from sklearn.decomposition import PCA
 # Loading & normalization
 # ---------------------------------------------------------------------------
 
-def load_and_normalize(path: str, mode: str = 'global'):
+def load_and_normalize(path: str, mode: str = 'none'):
     """
     Load a .mat hyperspectral dataset and normalize to [0, 1].
 
