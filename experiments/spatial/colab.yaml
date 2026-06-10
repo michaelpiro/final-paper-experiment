@@ -34,7 +34,8 @@ local_scm_loading:   1.0e-8    # AMF-local / CEM-local diagonal loading (≈ no 
 whiten_eig_floor:    1.0e-5    # OUR score nets' ZCA whitening floor (× λ_max)
 baseline_eig_floor:  1.0e-12   # AMF / CEM (baselines) covariance eigenvalue floor (× λ_max)
 cfar_bg_window:      11        # NeighborMLP/Ridge local-CFAR background window (odd)
-cfar_guard:          3         # local-CFAR guard window (odd; excluded from bg stats)
+cfar_guard:          1         # local-CFAR guard window (odd; excluded from bg stats)
+cfar_lam:            0.0       # Fisher blend: 0=pure local, 1=pure global, (0,1)=mix
 
 # ------- CF-Attn -------
 cfattn_h:      128

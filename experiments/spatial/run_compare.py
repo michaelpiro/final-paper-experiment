@@ -146,6 +146,7 @@ DEFAULT_CFG = dict(
     # local-CFAR (windowed score-map normalization) for NeighborMLP/Ridge
     cfar_bg_window=11,   # background window side (odd)
     cfar_guard=3,        # guard window side (odd, excluded from the bg stats)
+    cfar_lam=0.0,        # blend: 0=pure local, 1=pure global, (0,1)=mix
     # CF-Attn
     cfattn_h=64, cfattn_K=9, cfattn_epochs=300, cfattn_lr=3e-4, cfattn_eps=1e-4,
     lam_ent=0.05, lam_div=0.05, lam_cov=1e-5,
@@ -230,18 +231,21 @@ def _pick_foreign_class(gt, present):
     return max(cand, key=lambda c: int((gt == c).sum()))
 
 
-def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6):
+def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6, cfar_lam=0.0):
     """Local-CFAR normalization of a projected-score MAP (paper Eq 70/80).
 
-    Standardize each pixel by the LOCAL mean/std of the score over a bg×bg
-    window EXCLUDING a guard×guard center (so the cell / a target can't inflate
-    its own background estimate):
+    Standardize each pixel by a BLENDED mean/std:
 
-        T_i = (q_i - mean_annulus(q)) / (std_annulus(q) + eps)
+        mean_eff = (1 - lam) * mean_annulus(q)  +  lam * mean_global(q)
+        std_eff  = (1 - lam) * std_annulus(q)   +  lam * std_global(q)
+        T_i      = (q_i - mean_eff) / (std_eff + eps)
 
-    This is the 1-D ("along s") empirical local Fisher: a scalar variance of the
-    already-projected score, so there is NO matrix inverse and NO rank/loading
-    issue (unlike the SCM detectors). Cheap windowed stats via uniform_filter.
+    cfar_lam=0  → pure local annulus (standard CFAR; default)
+    cfar_lam=1  → pure global mean/std (same as original LMP normalization)
+    cfar_lam∈(0,1) → smoothly interpolates (robust near boundaries)
+
+    The local component is a 1-D scalar variance of the already-projected score
+    (NO matrix inverse, NO rank issue). Cheap windowed stats via uniform_filter.
     """
     H, W = shape
     q = np.asarray(flat_scores, dtype=np.float64).reshape(H, W)
@@ -254,23 +258,35 @@ def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6):
     else:
         m_g = s2_g = 0.0
     denom = max(nb - ng, 1)
-    mean_a = (nb * m_bg - ng * m_g) / denom          # annulus mean
-    e2_a   = (nb * s2_bg - ng * s2_g) / denom         # annulus E[q^2]
-    std_a  = np.sqrt(np.maximum(e2_a - mean_a ** 2, 0.0)) + eps
-    return ((q - mean_a) / std_a).reshape(-1).astype(np.float32)
+    mean_local = (nb * m_bg - ng * m_g) / denom          # annulus mean
+    e2_local   = (nb * s2_bg - ng * s2_g) / denom         # annulus E[q^2]
+    std_local  = np.sqrt(np.maximum(e2_local - mean_local ** 2, 0.0))
+
+    # Global stats (over the whole map)
+    mean_global = float(q.mean())
+    std_global  = float(q.std()) + eps
+
+    lam = float(cfar_lam)
+    mean_eff = (1.0 - lam) * mean_local + lam * mean_global
+    std_eff  = (1.0 - lam) * std_local  + lam * std_global + eps
+    return ((q - mean_eff) / std_eff).reshape(-1).astype(np.float32)
 
 
-def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6):
+def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_lam=0.0):
     """Local-Fisher CFAR for NeighborMLP using the model's OWN top-K selected
     neighbors (not a spatial window). For each pixel, standardize its projected
-    score q_i by the mean/std of q over the K latent-nearest neighbors the model
-    picked — q at the neighbor positions is read straight off the score map
-    (no extra forward passes):
+    score q_i by a BLENDED mean/std:
 
-        T_i = (q_i - mean_{kNN}(q)) / (std_{kNN}(q) + eps)
+        mean_eff = (1-lam) * mean_{kNN}(q)  +  lam * mean_global(q)
+        std_eff  = (1-lam) * std_{kNN}(q)   +  lam * std_global(q)
+        T_i = (q_i - mean_eff) / (std_eff + eps)
 
-    The k×k window order here matches extract_neighborhoods, so the model's
-    selection indices line up with the unfolded neighbor scores.
+    cfar_lam=0  → pure kNN local (default)
+    cfar_lam=1  → pure global mean/std
+
+    q at neighbor positions is read straight off the score map via unfold
+    (no extra forward passes). The k×k window order matches extract_neighborhoods
+    so model selection indices line up correctly.
     """
     H, W = shape
     dev = next(model.parameters()).device
@@ -288,9 +304,17 @@ def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6):
         torch.tensor(np.asarray(pix, np.float32), device=dev),
         torch.tensor(np.asarray(nbr, np.float32), device=dev))               # (HW, K)
     q_topk = torch.gather(q_neigh, 1, idx)                                    # (HW, K)
-    mu = q_topk.mean(dim=1)
-    std = q_topk.var(dim=1, unbiased=False).sqrt() + eps
-    return ((q_i - mu) / std).cpu().numpy().astype(np.float32)
+    mu_local  = q_topk.mean(dim=1)
+    std_local = q_topk.var(dim=1, unbiased=False).sqrt()
+
+    # Global stats (over the whole score map)
+    mu_global  = q_i.mean()
+    std_global = q_i.std() + eps
+
+    lam = float(cfar_lam)
+    mu_eff  = (1.0 - lam) * mu_local  + lam * mu_global
+    std_eff = (1.0 - lam) * std_local + lam * std_global + eps
+    return ((q_i - mu_eff) / std_eff).cpu().numpy().astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -440,21 +464,24 @@ def run_detection(sig, sig_label, out_dir, ctx):
     # ---- Local-CFAR siblings for the score nets ----
     bg = int(cfg.get('cfar_bg_window', 11))
     guard = int(cfg.get('cfar_guard', 3))
+    lam = float(cfg.get('cfar_lam', 0.0))
     k_win = int(cfg['k'])
     tr0, tr1, tc0, tc1 = ctx['train_box']
     tr_shape = (tr1 - tr0, tc1 - tc0)
     # NeighborMLP-CFAR: local Fisher from the model's OWN top-K selected neighbors.
     if 'NeighborMLP' in test_scores and models.get('nmlp') is not None:
         test_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
-            test_scores['NeighborMLP'], models['nmlp'], planted, te_nbr, (H_b, W_b), k_win)
+            test_scores['NeighborMLP'], models['nmlp'], planted, te_nbr, (H_b, W_b), k_win,
+            cfar_lam=lam)
         train_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
-            train_scores['NeighborMLP'], models['nmlp'], tr_raw, tr_nbr, tr_shape, k_win)
+            train_scores['NeighborMLP'], models['nmlp'], tr_raw, tr_nbr, tr_shape, k_win,
+            cfar_lam=lam)
     # NeighborRidge-CFAR: windowed score-map normalization (ridge uses all neighbors).
     if 'NeighborRidge' in test_scores:
         test_scores['NeighborRidge-CFAR'] = _cfar_normalize_map(
-            test_scores['NeighborRidge'], (H_b, W_b), bg, guard)
+            test_scores['NeighborRidge'], (H_b, W_b), bg, guard, cfar_lam=lam)
         train_scores['NeighborRidge-CFAR'] = _cfar_normalize_map(
-            train_scores['NeighborRidge'], tr_shape, bg, guard)
+            train_scores['NeighborRidge'], tr_shape, bg, guard, cfar_lam=lam)
 
     DETS = [d for d in DET_ORDER if d in test_scores]
     print(f"Active detectors: {DETS}", flush=True)
@@ -657,7 +684,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
 # Keys safe to override when re-extracting from saved models (they don't change
 # the trained nets or the train/test boxes — only scoring / planting / plots).
 RELOAD_OVERRIDE_KEYS = [
-    'cfar_bg_window', 'cfar_guard', 'pfa_target', 'amplitude', 'target_fraction',
+    'cfar_bg_window', 'cfar_guard', 'cfar_lam', 'pfa_target', 'amplitude', 'target_fraction',
     'ridge_n_mc', 'gmm_steps', 'gmm_K', 'local_scm_loading', 'baseline_eig_floor',
 ]
 
