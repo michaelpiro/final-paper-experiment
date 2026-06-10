@@ -89,9 +89,15 @@ def dsm_additive(test_data: np.ndarray, train_data: np.ndarray,
     model.eval()
     z_train = compute_scores(model, train_data)        # (n, d)
     z_bar   = z_train.mean(axis=0)
-    C_psi   = np.cov(z_train, rowvar=False)
-    if C_psi.ndim == 0:
-        C_psi = np.array([[float(C_psi)]])
+    D = s.shape[0]
+    if z_train.shape[0] < 2:
+        C_psi = np.eye(D)
+    else:
+        C_psi = np.cov(z_train, rowvar=False)
+        if C_psi.ndim == 0:
+            C_psi = float(C_psi) * np.eye(D)
+        elif C_psi.shape[0] != D:
+            C_psi = np.eye(D)
     z_test  = compute_scores(model, test_data)         # (n_test, d)
     norm    = np.sqrt(max(float(s @ C_psi @ s), 1e-12))
     # return -((z_test - z_bar) @ s) / norm
