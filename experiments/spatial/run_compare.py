@@ -111,6 +111,7 @@ DET_COLORS = {
 
 # Pfa levels for the false-alarm overlays.
 PFA_LEVELS = [0.01, 0.05, 0.10]
+FIGSIZE = (11, 7)   # every saved figure uses this exact size
 
 DEFAULT_CFG = dict(
     dataset='data/pavia-u.mat',
@@ -207,8 +208,12 @@ def _pick_foreign_class(gt, present):
 
 
 def _savefig(fig, path):
-    fig.savefig(path, bbox_inches='tight')
-    fig.savefig(path.replace('.pdf', '.png'), dpi=160, bbox_inches='tight')
+    # NO bbox_inches='tight' — that crops each figure to its content and breaks
+    # the uniform size. Save the full FIGSIZE canvas at a fixed dpi so every
+    # output file has identical dimensions (FIGSIZE inches; FIGSIZE×150 px PNG).
+    fig.tight_layout()
+    fig.savefig(path)
+    fig.savefig(path.replace('.pdf', '.png'), dpi=150)
     plt.close(fig)
     print(f"  [fig] {os.path.relpath(path)}", flush=True)
 
@@ -326,29 +331,28 @@ def run_detection(sig, sig_label, out_dir, ctx):
     fc = _false_color(data_norm, test_box)
     lm = _gt_colorimage(gt[r0:r1, c0:c1])
     t_r, t_c = _rc(tgt_idx, W_b)
-    aspect = 5 * H_b / max(W_b, 1)
 
     # false color (plain)
-    fig, ax = plt.subplots(figsize=(5, aspect))
+    fig, ax = plt.subplots(figsize=FIGSIZE)
     ax.imshow(fc); ax.axis('off')
     ax.set_title(f'False color — scen {sidx}', fontsize=9)
     _savefig(fig, os.path.join(out_dir, 'false_color.pdf'))
 
     # (1) label map + target locations (cyan, not a label color)
-    fig, ax = plt.subplots(figsize=(5, aspect))
+    fig, ax = plt.subplots(figsize=FIGSIZE)
     ax.imshow(lm); ax.axis('off')
     ax.scatter(t_c, t_r, s=12, facecolors='none', edgecolors=TARGET_MARK, linewidths=0.8)
     present = sorted(np.unique(te_gt))
     handles = [mpatches.Patch(color=CLS_COLORS_HEX.get(int(c), '#777'),
                               label=CLS_NAMES.get(int(c), f'cls{c}')) for c in present]
     handles.append(Line2D([], [], marker='o', ls='', mfc='none', mec=TARGET_MARK, label='target'))
-    ax.legend(handles=handles, fontsize=6, loc='center left', bbox_to_anchor=(1.0, 0.5))
+    ax.legend(handles=handles, fontsize=6, loc='upper right', framealpha=0.75, ncol=2)
     ax.set_title(f'Label map + targets — {sig_label}', fontsize=9)
     _savefig(fig, os.path.join(out_dir, 'label_map_targets.pdf'))
 
     # (7) class signatures + target signature
     means = _bg_class_means(te_raw, te_gt)
-    fig, ax = plt.subplots(figsize=(7, 4))
+    fig, ax = plt.subplots(figsize=FIGSIZE)
     x = np.arange(te_raw.shape[1])
     for c, mu in means.items():
         ax.plot(x, mu, color=CLS_COLORS_HEX.get(c, '#777'), lw=1.0,
@@ -362,7 +366,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
     # (2) detection score maps + target locations (cyan)
     ncol = 3
     nrow = int(np.ceil(len(DETS) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3.4 * nrow))
+    fig, axes = plt.subplots(nrow, ncol, figsize=FIGSIZE)
     axes = np.atleast_1d(axes).ravel()
     for j, det in enumerate(DETS):
         smap = scores_to_spatial_map(test_scores[det], te_idx, (H_b, W_b))
@@ -378,7 +382,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
     _savefig(fig, os.path.join(out_dir, 'detection_maps.pdf'))
 
     # (5) detected pixels @ Pfa=0.05 — hits (green) vs false alarms (red)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3.2 * nrow))
+    fig, axes = plt.subplots(nrow, ncol, figsize=FIGSIZE)
     axes = np.atleast_1d(axes).ravel()
     for j, det in enumerate(DETS):
         sc = np.asarray(test_scores[det], float)
@@ -402,7 +406,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
     # (3,4) false-alarm pixels @ Pfa∈{.01,.05,.1} on false color AND on label map
     for bg_img, tag in [(fc, 'falsecolor'), (lm, 'labelmap')]:
         nr, nc = len(DETS), len(PFA_LEVELS)
-        fig, axes = plt.subplots(nr, nc, figsize=(3.0 * nc, 2.7 * nr), squeeze=False)
+        fig, axes = plt.subplots(nr, nc, figsize=FIGSIZE, squeeze=False)
         for i, det in enumerate(DETS):
             sc = np.asarray(test_scores[det], float)
             for jj, p in enumerate(PFA_LEVELS):
@@ -420,7 +424,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
         _savefig(fig, os.path.join(out_dir, f'false_alarms_{tag}.pdf'))
 
     # ROC overlay
-    fig, ax = plt.subplots(figsize=(5.5, 5))
+    fig, ax = plt.subplots(figsize=FIGSIZE)
     ax.plot([0, 1], [0, 1], 'k--', lw=0.7)
     for det in DETS:
         fpr, tpr, auc_v = roc_curves[det]
@@ -433,7 +437,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
 
     # (6) per-class Pfa grouped bars (ALL classes incl. class 0)
     classes = sorted({c for d in DETS for c in pfa_per_class[d]})
-    fig, ax = plt.subplots(figsize=(max(7, 1.0 * len(classes)), 4))
+    fig, ax = plt.subplots(figsize=FIGSIZE)
     bw = 0.8 / max(len(DETS), 1)
     xpos = np.arange(len(classes))
     for di, det in enumerate(DETS):
