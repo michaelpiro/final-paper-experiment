@@ -67,8 +67,11 @@ from final_paper_experiments.evaluation import (
     partial_auc, dr_at_fpr, auc_safe, roc_safe, cfar_threshold, per_class_fpr,
     compute_signature, generate_random_boxes, scores_to_spatial_map,
 )
-from cfattn_model import score_cfattn_additive, score_cfattn_additive_cfar
-from neighbor_mlp_model import score_nmlp_additive
+from dsm_model import ScoreNet
+from cfattn_model import (
+    CFAttnGaussianScoreNet, score_cfattn_additive, score_cfattn_additive_cfar,
+)
+from neighbor_mlp_model import NeighborMLPDenoiser, score_nmlp_additive
 from local_detectors import amf_cem_local_scm, amf_global, cem_global
 from final_paper_experiments.models.neighbor_adapted import (
     NeighborAdaptedScore, dsm_loss as ridge_dsm_loss, adapted_score_field,
@@ -78,7 +81,7 @@ from tqdm import tqdm
 # Reuse the (whitening-aware, GPU) training helpers from the main runner.
 from run_colab import (
     _crop_pca_box, _train_dsm, _train_cfattn, _train_nmlp,
-    _make_whitening, _whiten_np, _whitened_sigma,
+    _make_whitening, _whiten_np, _whitened_sigma, _placeholder_whitening,
 )
 
 CLS_NAMES = {
@@ -646,6 +649,60 @@ def run_detection(sig, sig_label, out_dir, ctx):
 
 
 # ---------------------------------------------------------------------------
+# Save / load the trained models so plots can be re-extracted WITHOUT retraining.
+# The whitening front-end is a registered submodule of every net, so it is
+# already inside each state_dict.
+# ---------------------------------------------------------------------------
+
+# Keys safe to override when re-extracting from saved models (they don't change
+# the trained nets or the train/test boxes — only scoring / planting / plots).
+RELOAD_OVERRIDE_KEYS = [
+    'cfar_bg_window', 'cfar_guard', 'pfa_target', 'amplitude', 'target_fraction',
+    'ridge_n_mc', 'gmm_steps', 'gmm_K', 'local_scm_loading', 'baseline_eig_floor',
+]
+
+
+def _save_models(run_dir, models, cfg, sidx, train_box, test_box):
+    torch.save({
+        'cfg': cfg, 'sidx': sidx, 'train_box': train_box, 'test_box': test_box,
+        'dsm':    models['dsm'].state_dict(),
+        'cfattn': models['cfattn'].state_dict(),
+        'nmlp':   models['nmlp'].state_dict(),
+        'ridge':  models['ridge'].state_dict(),
+    }, os.path.join(run_dir, 'models.pt'))
+    print(f"  saved models -> {os.path.join(run_dir, 'models.pt')}", flush=True)
+
+
+def _build_models_from_ckpt(ckpt, D, cfg, device):
+    """Reconstruct the 4 nets and load their weights (incl. frozen whitening)."""
+    dsm = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'],
+                   whitening=_placeholder_whitening(D))
+    dsm.load_state_dict(ckpt['dsm']); dsm.to(device).eval()
+
+    cf = CFAttnGaussianScoreNet(
+        D=D, h=cfg['cfattn_h'], K=cfg['cfattn_K'],
+        sigma=_whitened_sigma(cfg), eps=cfg.get('cfattn_eps', 1e-4),
+        whitening=_placeholder_whitening(D))
+    cf.load_state_dict(ckpt['cfattn']); cf.to(device).eval()
+
+    nm = NeighborMLPDenoiser(
+        D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
+        hidden=cfg['nmlp_hidden'], n_layers=cfg['nmlp_n_layers'],
+        sigma=_whitened_sigma(cfg), activation=cfg['activation'],
+        whitening=_placeholder_whitening(D))
+    nm.load_state_dict(ckpt['nmlp']); nm.to(device).eval()
+
+    rg = NeighborAdaptedScore(
+        D=D, M=int(cfg.get('ridge_M', 256)),
+        hidden=tuple(cfg.get('ridge_hidden', [128, 128])),
+        k=int(cfg['k']), lam_init=float(cfg.get('ridge_lam_init', 0.1)))
+    rg._whitening = _placeholder_whitening(D)   # so the buffers exist for load
+    rg.load_state_dict(ckpt['ridge']); rg.to(device).eval()
+
+    return {'dsm': dsm, 'cfattn': cf, 'nmlp': nm, 'ridge': rg}
+
+
+# ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default=os.path.join(_EXP, 'colab.yaml'))
@@ -653,6 +710,9 @@ def main():
     ap.add_argument('--scenario', type=int, default=None,
                     help='Override scenario_index from config')
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--from-models', default=None,
+                    help='Path to a models.pt: load trained nets and re-extract '
+                         'all plots WITHOUT retraining.')
     args = ap.parse_args()
 
     cfg = dict(DEFAULT_CFG)
@@ -666,6 +726,19 @@ def main():
         cfg['results_dir'] = args.results_dir
     if args.scenario is not None:
         cfg['scenario_index'] = args.scenario
+
+    # ---- Reload mode: use the SAVED training cfg (same scenario/boxes/nets),
+    #      but let a whitelist of scoring/plot keys be overridden from --config. ----
+    ckpt = None
+    if args.from_models:
+        ckpt = torch.load(args.from_models, map_location='cpu')
+        base = dict(ckpt['cfg'])
+        for kk in RELOAD_OVERRIDE_KEYS:
+            if kk in cfg:
+                base[kk] = cfg[kk]
+        base['results_dir'] = cfg['results_dir']
+        cfg = base
+        print(f"Reload mode: models from {args.from_models}", flush=True)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}", flush=True)
@@ -733,23 +806,28 @@ def main():
     else:
         print("No labeled class is absent from the patch — skipping foreign run.", flush=True)
 
-    # ---- Train deep nets ONCE (signature-independent) ----
-    print("Training deep nets ...", flush=True)
-    def _fl(m):
-        return getattr(m, '_final_loss', float('nan'))
-    t0 = time.time()
-    dsm_net = _train_dsm(tr_raw, cfg, device)
-    print(f"  DSM done ({time.time() - t0:.0f}s)  final loss={_fl(dsm_net):.4f}", flush=True)
-    t0 = time.time()
-    cfattn = _train_cfattn(tr_raw, tr_nbr, cfg, device, seed)
-    print(f"  CF-Attn done ({time.time() - t0:.0f}s)  final loss={_fl(cfattn):.4f}", flush=True)
-    t0 = time.time()
-    nmlp = _train_nmlp(tr_raw, tr_nbr, cfg, device)
-    print(f"  NeighborMLP done ({time.time() - t0:.0f}s)  final loss={_fl(nmlp):.4f}", flush=True)
-    t0 = time.time()
-    ridge = _train_ridge(tr_raw, tr_nbr, cfg, device, seed)
-    print(f"  NeighborRidge done ({time.time() - t0:.0f}s)  final loss={_fl(ridge):.4f}", flush=True)
-    models = {'dsm': dsm_net, 'cfattn': cfattn, 'nmlp': nmlp, 'ridge': ridge}
+    # ---- Models: LOAD (reload mode) or TRAIN once (signature-independent) ----
+    if ckpt is not None:
+        print("Loading trained nets (no training) ...", flush=True)
+        models = _build_models_from_ckpt(ckpt, D, cfg, device)
+    else:
+        print("Training deep nets ...", flush=True)
+        def _fl(m):
+            return getattr(m, '_final_loss', float('nan'))
+        t0 = time.time()
+        dsm_net = _train_dsm(tr_raw, cfg, device)
+        print(f"  DSM done ({time.time() - t0:.0f}s)  final loss={_fl(dsm_net):.4f}", flush=True)
+        t0 = time.time()
+        cfattn = _train_cfattn(tr_raw, tr_nbr, cfg, device, seed)
+        print(f"  CF-Attn done ({time.time() - t0:.0f}s)  final loss={_fl(cfattn):.4f}", flush=True)
+        t0 = time.time()
+        nmlp = _train_nmlp(tr_raw, tr_nbr, cfg, device)
+        print(f"  NeighborMLP done ({time.time() - t0:.0f}s)  final loss={_fl(nmlp):.4f}", flush=True)
+        t0 = time.time()
+        ridge = _train_ridge(tr_raw, tr_nbr, cfg, device, seed)
+        print(f"  NeighborRidge done ({time.time() - t0:.0f}s)  final loss={_fl(ridge):.4f}", flush=True)
+        models = {'dsm': dsm_net, 'cfattn': cfattn, 'nmlp': nmlp, 'ridge': ridge}
+        _save_models(run_dir, models, cfg, sidx, tr_box_eff, test_box)
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
                tr_raw=tr_raw, tr_nbr=tr_nbr, te_raw=te_raw, te_nbr=te_nbr,
