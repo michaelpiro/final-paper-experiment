@@ -15,23 +15,24 @@ Detectors
 
 Deep nets train on GPU (cuda) when available.
 
-Metrics (per detector)
-----------------------
-  pAUC@0.05      — partial AUC over Pfa < 0.05
-  AUC            — full ROC AUC
-  Pd@Pfa=0.05    — detection rate at Pfa = 0.05
-  Pfa per class  — false-alarm rate on each background class (CFAR thr @ 0.05)
-  Pfa_avg/max    — macro-average / worst-class background false-alarm rate
+Detection is run TWICE (per scenario):
+  1. in-patch  : target signature = dominant class of the test patch (as before)
+  2. foreign   : target signature = a class NOT present in the patch, scaled so
+                 ||s|| equals the mean per-pixel norm of the patch.
+The in-patch outputs land in   <run>/ ,  the foreign outputs in  <run>/foreign/.
 
-Deliverables (saved in <results_dir>/compare_<ts>/)
----------------------------------------------------
-  false_color.pdf        — RGB false color of the test box
-  label_map.pdf          — ground-truth class map of the test box
-  detection_maps.pdf     — per-detector spatial score maps
-  roc.pdf                — all-detector ROC overlay
-  pfa_per_class.pdf      — grouped per-class Pfa bars
-  summary_table.csv/.md  — metric comparison table
-  metrics.json, scores.npz
+Per-run deliverables
+--------------------
+  false_color.pdf             — RGB false color of the test box
+  label_map_targets.pdf       — GT class map + planted-target locations (cyan)
+  signatures.pdf              — per-class mean spectra + the target signature
+  detection_maps.pdf          — per-detector score maps + target locations (cyan)
+  detected_pfa.pdf            — detected pixels @ Pfa=0.05 (hits green / FA red)
+  false_alarms_falsecolor.pdf — false-alarm pixels @ Pfa∈{.01,.05,.1} on false color
+  false_alarms_labelmap.pdf   — false-alarm pixels @ Pfa∈{.01,.05,.1} on label map
+  roc.pdf                     — all-detector ROC overlay
+  pfa_per_class.pdf           — grouped per-class Pfa bars (ALL classes incl. 0)
+  summary_table.csv/.md, metrics.json, scores.npz
 
 Usage
 -----
@@ -42,7 +43,7 @@ Usage
 import argparse, json, os, sys, time
 from datetime import datetime
 
-_EXP  = os.path.dirname(os.path.abspath(__file__))
+_EXP = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_EXP))
 sys.path.insert(0, _EXP)
 sys.path.insert(0, _ROOT)
@@ -54,6 +55,8 @@ import yaml
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgb
+from matplotlib.lines import Line2D
+import matplotlib.patches as mpatches
 
 from final_paper_experiments.data_utils import load_and_normalize, plant_targets
 from final_paper_experiments.baselines.detectors import dsm_additive
@@ -73,8 +76,8 @@ from run_colab import (
 
 CLS_NAMES = {
     0: 'unlabeled', 1: 'asphalt', 2: 'meadows', 3: 'gravel',
-    4: 'trees',     5: 'metal_sheets', 6: 'bare_soil', 7: 'bitumen',
-    8: 'bricks',    9: 'shadows',
+    4: 'trees', 5: 'metal_sheets', 6: 'bare_soil', 7: 'bitumen',
+    8: 'bricks', 9: 'shadows',
 }
 CLS_COLORS_HEX = {
     0: '#000000', 1: '#808080', 2: '#00cc44', 3: '#d2691e',
@@ -82,36 +85,46 @@ CLS_COLORS_HEX = {
     8: '#ff4500', 9: '#00008b',
 }
 
-# Fixed display order + colors for the 9 detectors.
-DET_ORDER = ['DSM', 'CF-Attn', 'CF-Attn-CFAR', 'NeighborMLP',
-             'AMF', 'AMF-local', 'CEM', 'CEM-local', 'GMM-Levin']
+# Overlay colors — chosen distinct from BOTH the label palette and inferno.
+TARGET_MARK = '#00ffff'   # cyan — planted target locations
+FA_MARK     = '#ff2d2d'   # red  — false alarms
+HIT_MARK    = '#39ff14'   # lime — true detections
+
+# Fixed display order + colors for the detectors.
+DET_ORDER = [
+    'DSM', 'CF-Attn', 'CF-Attn-CFAR', 'NeighborMLP',
+    'AMF', 'AMF-local',
+    # 'CEM', 'CEM-local',
+    'GMM-Levin'
+]
 DET_COLORS = {
-    'DSM':          '#ff7f0e',
-    'CF-Attn':      '#aec7e8',
+    'DSM': '#ff7f0e',
+    'CF-Attn': '#aec7e8',
     'CF-Attn-CFAR': '#1f77b4',
-    'NeighborMLP':  '#2ca02c',
-    'AMF':          '#9467bd',
-    'AMF-local':    '#c5b0d5',
-    'CEM':          '#8c564b',
-    'CEM-local':    '#e7969c',
-    'GMM-Levin':    '#e377c2',
+    'NeighborMLP': '#2ca02c',
+    'AMF': '#9467bd',
+    'AMF-local': '#c5b0d5',
+    'CEM': '#8c564b',
+    'CEM-local': '#e7969c',
+    'GMM-Levin': '#e377c2',
 }
+
+# Pfa levels for the false-alarm overlays.
+PFA_LEVELS = [0.01, 0.05, 0.10]
 
 DEFAULT_CFG = dict(
     dataset='data/pavia-u.mat',
     norm_mode='none',
     manual_boxes_path='experiments/spatial/manual_boxes.json',
-    scenario_index=0,            # which manual/random scenario to compare on
+    scenario_index=0,
     min_pixels=2000,
     random_scenario_seeds=[42, 123, 456, 789],
     sig_dom_weight=0.8, sig_mean_weight=0.2,
     amplitude=0.15, target_fraction=0.10,
-    n_budget=None,               # None = use the FULL train box (no subsampling).
-                                 # int  = cut pixels from the SIDES only to a
-                                 #        contiguous sub-box (spatial context kept).
-    k=5,                         # spatial window (k×k) for nbr nets + local SCM
-    local_scm_loading=1e-8,      # minimal diagonal loading for local SCMs (≈ no loading)
-    baseline_eig_floor=1e-12,    # relative eigenvalue floor for AMF/CEM global (baselines)
+    n_budget=None,               # None = full train box (no subsampling); int = side-crop
+    k=5,
+    local_scm_loading=1e-8,
+    baseline_eig_floor=1e-12,
     # CF-Attn
     cfattn_h=64, cfattn_K=9, cfattn_epochs=300, cfattn_lr=3e-4, cfattn_eps=1e-4,
     lam_ent=0.05, lam_div=0.05, lam_cov=1e-5,
@@ -122,7 +135,7 @@ DEFAULT_CFG = dict(
     dsm_hidden=[64, 64], dsm_epochs=1000, dsm_lr=5e-4,
     # shared
     activation='silu', dsm_sigma_rho=0.01,
-    whiten_mode='zca', whiten_eig_floor=1e-5,   # OUR nets' whitening floor (× λ_max)
+    whiten_mode='zca', whiten_eig_floor=1e-5,
     batch_size=256, weight_decay=1e-4,
     gmm_steps=50, gmm_K=3,
     pfa_target=0.05,
@@ -140,8 +153,7 @@ DRYRUN_OVERRIDES = dict(
 # ---------------------------------------------------------------------------
 def _side_crop_box(box, budget):
     """Cut pixels from the SIDES only → a contiguous, centered sub-box of about
-    `budget` pixels. Preserves spatial context (no random subsampling).
-    budget None/0/>=box ⇒ the full box is returned unchanged."""
+    `budget` pixels. Preserves spatial context (no random subsampling)."""
     r0, r1, c0, c1 = box
     H, Wd = r1 - r0, c1 - c0
     if not budget or H * Wd <= int(budget):
@@ -153,52 +165,73 @@ def _side_crop_box(box, budget):
     return [r0 + dr, r0 + dr + newH, c0 + dc, c0 + dc + newW]
 
 
-# ---------------------------------------------------------------------------
 def _false_color(data_raw, box, bands=(60, 30, 10)):
     r0, r1, c0, c1 = box
     rgb = data_raw[r0:r1, c0:c1][..., list(bands)].astype(np.float32)
-    lo  = np.percentile(rgb, 2,  axis=(0, 1), keepdims=True)
-    hi  = np.percentile(rgb, 98, axis=(0, 1), keepdims=True)
+    lo = np.percentile(rgb, 2, axis=(0, 1), keepdims=True)
+    hi = np.percentile(rgb, 98, axis=(0, 1), keepdims=True)
     return np.clip((rgb - lo) / (hi - lo + 1e-9), 0, 1)
 
 
 def _gt_colorimage(gt_crop):
     H, W = gt_crop.shape
-    img  = np.zeros((H, W, 3), dtype=np.float32)
+    img = np.zeros((H, W, 3), dtype=np.float32)
     for cid, hex_ in CLS_COLORS_HEX.items():
         img[gt_crop == cid] = to_rgb(hex_)
     return img
+
+
+def _rc(flat_idx, W_b):
+    """Flat box index → (rows, cols) for scatter (x=col, y=row)."""
+    flat_idx = np.asarray(flat_idx, dtype=int)
+    return flat_idx // W_b, flat_idx % W_b
+
+
+def _bg_class_means(te_raw, te_gt):
+    """Mean spectrum for every class present in the patch (incl. class 0)."""
+    out = {}
+    for c in sorted(np.unique(te_gt)):
+        m = (te_gt == c)
+        if m.sum() > 0:
+            out[int(c)] = te_raw[m].mean(axis=0)
+    return out
+
+
+def _pick_foreign_class(gt, present):
+    """A labeled class (1..9) NOT present in the patch, with most global pixels."""
+    present = {int(c) for c in present}
+    cand = [c for c in range(1, 10) if c not in present and int((gt == c).sum()) > 0]
+    if not cand:
+        return None
+    return max(cand, key=lambda c: int((gt == c).sum()))
 
 
 def _savefig(fig, path):
     fig.savefig(path, bbox_inches='tight')
     fig.savefig(path.replace('.pdf', '.png'), dpi=160, bbox_inches='tight')
     plt.close(fig)
-    print(f"  [fig] {os.path.basename(path)}", flush=True)
+    print(f"  [fig] {os.path.relpath(path)}", flush=True)
 
 
 # ---------------------------------------------------------------------------
 def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
     """Score every AVAILABLE detector on (pix, nbr).  Returns {det_name: scores}.
 
-    Deep detectors are skipped gracefully if their model is absent from `models`
-    (e.g. CF-Attn disabled in run_scenario), so the rest of the comparison still
-    runs. Classical detectors are always computed.
+    Deep detectors are skipped gracefully if their model is absent from `models`.
     """
-    pix = pix.astype(np.float32); nbr = nbr.astype(np.float32)
+    pix = pix.astype(np.float32)
+    nbr = nbr.astype(np.float32)
     out = {}
     floor = float(cfg.get('baseline_eig_floor', 1e-12))
-    # --- our deep detectors (only if their model was trained) ---
     if models.get('dsm') is not None:
         out['DSM'] = dsm_additive(pix, tr_raw, models['dsm'], sig)
     if models.get('cfattn') is not None:
-        out['CF-Attn']      = score_cfattn_additive(models['cfattn'], pix, nbr, tr_raw, tr_nbr, sig)
+        out['CF-Attn'] = score_cfattn_additive(models['cfattn'], pix, nbr, tr_raw, tr_nbr, sig)
         out['CF-Attn-CFAR'] = score_cfattn_additive_cfar(models['cfattn'], pix, nbr, sig)
     if models.get('nmlp') is not None:
         out['NeighborMLP'] = score_nmlp_additive(models['nmlp'], pix, nbr, tr_raw, tr_nbr, sig)
-    # --- classical baselines (always) ---
-    out['AMF']       = amf_global(pix, tr_raw, sig, eig_floor=floor)
-    out['CEM']       = cem_global(pix, tr_raw, sig, eig_floor=floor)
+    out['AMF'] = amf_global(pix, tr_raw, sig, eig_floor=floor)
+    out['CEM'] = cem_global(pix, tr_raw, sig, eig_floor=floor)
     out['GMM-Levin'] = gmm_glrt_levin_additive(pix, tr_raw, sig,
                                                p_steps=cfg.get('gmm_steps', 50))
     amf_loc, cem_loc = amf_cem_local_scm(
@@ -207,6 +240,214 @@ def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
     out['AMF-local'] = amf_loc
     out['CEM-local'] = cem_loc
     return out
+
+
+# ---------------------------------------------------------------------------
+def run_detection(sig, sig_label, out_dir, ctx):
+    """Plant targets with `sig`, score all detectors, write the table + figures."""
+    cfg, device, seed = ctx['cfg'], ctx['device'], ctx['seed']
+    models = ctx['models']
+    tr_raw, tr_nbr = ctx['tr_raw'], ctx['tr_nbr']
+    te_raw, te_nbr, te_gt = ctx['te_raw'], ctx['te_nbr'], ctx['te_gt']
+    data_norm, gt = ctx['data_norm'], ctx['gt']
+    test_box, sidx = ctx['test_box'], ctx['sidx']
+
+    os.makedirs(out_dir, exist_ok=True)
+    r0, r1, c0, c1 = test_box
+    H_b, W_b = r1 - r0, c1 - c0
+    te_idx = np.arange(len(te_raw))
+    pfa_t = float(cfg.get('pfa_target', 0.05))
+    all_pfa = sorted(set(PFA_LEVELS) | {pfa_t})
+
+    print(f"\n########## DETECTION RUN: {sig_label} ##########", flush=True)
+    planted, labels, tgt_idx = plant_targets(
+        te_raw, sig, cfg['amplitude'], cfg['target_fraction'],
+        model='additive', seed=seed)
+    planted = planted.astype(np.float32)
+    print(f"[{sig_label}] planted {int(labels.sum())} targets  ||s||={np.linalg.norm(sig):.4g}",
+          flush=True)
+
+    print("Scoring detectors (test) ...", flush=True)
+    test_scores = score_all(planted, te_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
+    print("Scoring detectors (train, for CFAR thresholds) ...", flush=True)
+    train_scores = score_all(tr_raw, tr_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
+
+    DETS = [d for d in DET_ORDER if d in test_scores]
+    print(f"Active detectors: {DETS}", flush=True)
+
+    # CFAR thresholds per detector per Pfa level (from TRAIN scores only).
+    thr = {d: {p: cfar_threshold(np.asarray(train_scores[d], float), target_fpr=p)
+               for p in all_pfa} for d in DETS}
+
+    # ---- Metrics (per-class Pfa includes ALL classes, incl. class 0) ----
+    rows, pfa_per_class, roc_curves = [], {}, {}
+    for det in DETS:
+        sc = np.asarray(test_scores[det], dtype=np.float64)
+        pcf = per_class_fpr(sc, labels, te_gt, thr[det][pfa_t])
+        pfa_per_class[det] = pcf
+        pfa_vals = list(pcf.values()) if pcf else [float('nan')]
+        fpr, tpr, auc_v = roc_safe(labels, sc)
+        roc_curves[det] = (fpr, tpr, auc_v)
+        rows.append({
+            'Detector': det,
+            'pAUC@0.05': partial_auc(labels, sc, fpr_max=0.05),
+            'AUC': auc_v,
+            'Pd@Pfa=0.05': dr_at_fpr(labels, sc, fpr_list=(pfa_t,))[str(pfa_t)],
+            'Pfa_avg': float(np.nanmean(pfa_vals)),
+            'Pfa_max': float(np.nanmax(pfa_vals)),
+        })
+
+    # ---- Summary table ----
+    cols = ['Detector', 'pAUC@0.05', 'AUC', 'Pd@Pfa=0.05', 'Pfa_avg', 'Pfa_max']
+    with open(os.path.join(out_dir, 'summary_table.csv'), 'w') as f:
+        f.write(','.join(cols) + '\n')
+        for r in rows:
+            f.write(','.join(str(r[c]) if c == 'Detector' else f'{r[c]:.4f}'
+                             for c in cols) + '\n')
+    md_path = os.path.join(out_dir, 'summary_table.md')
+    with open(md_path, 'w') as f:
+        f.write('| ' + ' | '.join(cols) + ' |\n')
+        f.write('|' + '|'.join(['---'] * len(cols)) + '|\n')
+        for r in rows:
+            f.write('| ' + ' | '.join(r['Detector'] if c == 'Detector'
+                                      else f'{r[c]:.3f}' for c in cols) + ' |\n')
+    print(f"\n=== Summary [{sig_label}] ===", flush=True)
+    print(open(md_path).read(), flush=True)
+
+    json.dump({'scenario_index': sidx, 'signature': sig_label, 'test_box': test_box,
+               'pfa_target': pfa_t, 'rows': rows, 'pfa_per_class': pfa_per_class},
+              open(os.path.join(out_dir, 'metrics.json'), 'w'), indent=2, default=str)
+    npz = {f'score_{d}': test_scores[d] for d in DETS}
+    npz['labels'] = labels; npz['te_gt'] = te_gt; npz['tgt_idx'] = tgt_idx
+    np.savez(os.path.join(out_dir, 'scores.npz'), **npz)
+
+    # ---- Figures ----
+    print("Saving figures ...", flush=True)
+    fc = _false_color(data_norm, test_box)
+    lm = _gt_colorimage(gt[r0:r1, c0:c1])
+    t_r, t_c = _rc(tgt_idx, W_b)
+    aspect = 5 * H_b / max(W_b, 1)
+
+    # false color (plain)
+    fig, ax = plt.subplots(figsize=(5, aspect))
+    ax.imshow(fc); ax.axis('off')
+    ax.set_title(f'False color — scen {sidx}', fontsize=9)
+    _savefig(fig, os.path.join(out_dir, 'false_color.pdf'))
+
+    # (1) label map + target locations (cyan, not a label color)
+    fig, ax = plt.subplots(figsize=(5, aspect))
+    ax.imshow(lm); ax.axis('off')
+    ax.scatter(t_c, t_r, s=12, facecolors='none', edgecolors=TARGET_MARK, linewidths=0.8)
+    present = sorted(np.unique(te_gt))
+    handles = [mpatches.Patch(color=CLS_COLORS_HEX.get(int(c), '#777'),
+                              label=CLS_NAMES.get(int(c), f'cls{c}')) for c in present]
+    handles.append(Line2D([], [], marker='o', ls='', mfc='none', mec=TARGET_MARK, label='target'))
+    ax.legend(handles=handles, fontsize=6, loc='center left', bbox_to_anchor=(1.0, 0.5))
+    ax.set_title(f'Label map + targets — {sig_label}', fontsize=9)
+    _savefig(fig, os.path.join(out_dir, 'label_map_targets.pdf'))
+
+    # (7) class signatures + target signature
+    means = _bg_class_means(te_raw, te_gt)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    x = np.arange(te_raw.shape[1])
+    for c, mu in means.items():
+        ax.plot(x, mu, color=CLS_COLORS_HEX.get(c, '#777'), lw=1.0,
+                label=CLS_NAMES.get(c, f'cls{c}'))
+    ax.plot(x, sig, color='k', lw=2.4, ls='--', label=f'target [{sig_label}]')
+    ax.set_xlabel('band'); ax.set_ylabel('value')
+    ax.set_title(f'Class signatures + target — {sig_label}', fontsize=9)
+    ax.legend(fontsize=6, ncol=2)
+    _savefig(fig, os.path.join(out_dir, 'signatures.pdf'))
+
+    # (2) detection score maps + target locations (cyan)
+    ncol = 3
+    nrow = int(np.ceil(len(DETS) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3.4 * nrow))
+    axes = np.atleast_1d(axes).ravel()
+    for j, det in enumerate(DETS):
+        smap = scores_to_spatial_map(test_scores[det], te_idx, (H_b, W_b))
+        ax = axes[j]
+        im = ax.imshow(smap, cmap='inferno'); ax.axis('off')
+        ax.scatter(t_c, t_r, s=9, facecolors='none', edgecolors=TARGET_MARK, linewidths=0.6)
+        ax.set_title(f'{det}  (AUC={roc_curves[det][2]:.3f})', fontsize=8)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    for j in range(len(DETS), len(axes)):
+        axes[j].axis('off')
+    fig.suptitle(f'Detection maps + targets — {sig_label}', fontsize=11)
+    fig.tight_layout()
+    _savefig(fig, os.path.join(out_dir, 'detection_maps.pdf'))
+
+    # (5) detected pixels @ Pfa=0.05 — hits (green) vs false alarms (red)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3.2 * nrow))
+    axes = np.atleast_1d(axes).ravel()
+    for j, det in enumerate(DETS):
+        sc = np.asarray(test_scores[det], float)
+        th = thr[det][pfa_t]
+        ax = axes[j]; ax.imshow(fc); ax.axis('off')
+        fa = np.where((sc > th) & (labels == 0))[0]
+        hit = np.where((sc > th) & (labels == 1))[0]
+        fr, fcl = _rc(fa, W_b); ax.scatter(fcl, fr, s=4, c=FA_MARK, marker='s', linewidths=0)
+        hr, hcl = _rc(hit, W_b); ax.scatter(hcl, hr, s=9, c=HIT_MARK, marker='o', linewidths=0)
+        ax.set_title(f'{det}  (#det={int((sc > th).sum())})', fontsize=8)
+    for j in range(len(DETS), len(axes)):
+        axes[j].axis('off')
+    axes[0].legend(handles=[
+        Line2D([], [], marker='o', ls='', mfc=HIT_MARK, mec=HIT_MARK, label='hit'),
+        Line2D([], [], marker='s', ls='', mfc=FA_MARK, mec=FA_MARK, label='false alarm')],
+        fontsize=6, loc='upper right')
+    fig.suptitle(f'Detected pixels @ Pfa={pfa_t} — {sig_label}', fontsize=11)
+    fig.tight_layout()
+    _savefig(fig, os.path.join(out_dir, 'detected_pfa.pdf'))
+
+    # (3,4) false-alarm pixels @ Pfa∈{.01,.05,.1} on false color AND on label map
+    for bg_img, tag in [(fc, 'falsecolor'), (lm, 'labelmap')]:
+        nr, nc = len(DETS), len(PFA_LEVELS)
+        fig, axes = plt.subplots(nr, nc, figsize=(3.0 * nc, 2.7 * nr), squeeze=False)
+        for i, det in enumerate(DETS):
+            sc = np.asarray(test_scores[det], float)
+            for jj, p in enumerate(PFA_LEVELS):
+                ax = axes[i][jj]; ax.imshow(bg_img); ax.axis('off')
+                fa = np.where((labels == 0) & (sc > thr[det][p]))[0]
+                fr, fcl = _rc(fa, W_b)
+                ax.scatter(fcl, fr, s=3, c=FA_MARK, marker='s', linewidths=0)
+                if i == 0:
+                    ax.set_title(f'Pfa={p:g}', fontsize=9)
+                if jj == 0:
+                    ax.text(-0.04, 0.5, det, transform=ax.transAxes, rotation=90,
+                            va='center', ha='right', fontsize=7)
+        fig.suptitle(f'False alarms on {tag} — {sig_label}', fontsize=11)
+        fig.tight_layout()
+        _savefig(fig, os.path.join(out_dir, f'false_alarms_{tag}.pdf'))
+
+    # ROC overlay
+    fig, ax = plt.subplots(figsize=(5.5, 5))
+    ax.plot([0, 1], [0, 1], 'k--', lw=0.7)
+    for det in DETS:
+        fpr, tpr, auc_v = roc_curves[det]
+        ax.plot(fpr, tpr, color=DET_COLORS[det], lw=1.6, label=f'{det} (AUC={auc_v:.3f})')
+    ax.set_xlabel('False Alarm Rate'); ax.set_ylabel('Detection Rate')
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.grid(alpha=0.25)
+    ax.set_title(f'ROC — {sig_label}', fontsize=10)
+    ax.legend(fontsize=7, loc='lower right')
+    _savefig(fig, os.path.join(out_dir, 'roc.pdf'))
+
+    # (6) per-class Pfa grouped bars (ALL classes incl. class 0)
+    classes = sorted({c for d in DETS for c in pfa_per_class[d]})
+    fig, ax = plt.subplots(figsize=(max(7, 1.0 * len(classes)), 4))
+    bw = 0.8 / max(len(DETS), 1)
+    xpos = np.arange(len(classes))
+    for di, det in enumerate(DETS):
+        vals = [pfa_per_class[det].get(c, 0.0) for c in classes]
+        ax.bar(xpos + di * bw, vals, bw, label=det, color=DET_COLORS[det])
+    ax.axhline(pfa_t, color='k', ls=':', lw=1, label=f'target Pfa={pfa_t}')
+    ax.set_xticks(xpos + 0.4 - bw / 2)
+    ax.set_xticklabels(classes, rotation=30, ha='right', fontsize=8)
+    ax.set_ylabel('Per-class Pfa')
+    ax.set_title(f'Per-class Pfa (all classes incl. 0) — {sig_label}', fontsize=9)
+    ax.legend(fontsize=6, ncol=2)
+    _savefig(fig, os.path.join(out_dir, 'pfa_per_class.pdf'))
+
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +475,10 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}", flush=True)
     seed = int(cfg['seed'])
-    torch.manual_seed(seed); np.random.seed(seed)
-    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    ts      = datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = os.path.join(cfg['results_dir'], f'compare_{ts}')
     os.makedirs(run_dir, exist_ok=True)
     yaml.dump(cfg, open(os.path.join(run_dir, 'config.yaml'), 'w'), sort_keys=False)
@@ -261,181 +502,76 @@ def main():
 
     k = int(cfg['k'])
 
-    # ---- Crop train / test (raw bands + k×k neighbors) ----
-    # NO subsampling: use the full train box. If n_budget is set we cut pixels
-    # from the SIDES only (contiguous sub-box) so spatial context is preserved.
+    # ---- Crop train / test (raw bands + k×k neighbors). NO subsampling. ----
     tr_box_eff = _side_crop_box(train_box, cfg.get('n_budget'))
     tr_raw, tr_nbr = _crop_pca_box(data_norm, tr_box_eff, k)
-    tr_raw = tr_raw.astype(np.float32); tr_nbr = tr_nbr.astype(np.float32)
+    tr_raw = tr_raw.astype(np.float32)
+    tr_nbr = tr_nbr.astype(np.float32)
     print(f"train={len(tr_raw)} px  (box {tr_box_eff}, full={cfg.get('n_budget') is None})",
           flush=True)
 
     r0, r1, c0, c1 = test_box
     H_b, W_b = r1 - r0, c1 - c0
     te_raw, te_nbr = _crop_pca_box(data_norm, test_box, k)
-    te_raw = te_raw.astype(np.float32); te_nbr = te_nbr.astype(np.float32)
-    te_gt  = gt[r0:r1, c0:c1].ravel()
-    te_idx = np.arange(len(te_raw))
+    te_raw = te_raw.astype(np.float32)
+    te_nbr = te_nbr.astype(np.float32)
+    te_gt = gt[r0:r1, c0:c1].ravel()
     print(f"test={len(te_raw)} px  ({H_b}×{W_b})", flush=True)
 
-    # ---- Signature ----
-    sig, dom_cls, dom_name = compute_signature(
+    # ---- In-patch signature (dominant class of the test patch) ----
+    sig_in, dom_cls, dom_name = compute_signature(
         gt[r0:r1, c0:c1], data_norm[r0:r1, c0:c1],
         w_dom=float(cfg['sig_dom_weight']), w_mean=float(cfg['sig_mean_weight']))
-    sig = sig.astype(np.float32)
-    print(f"signature: dominant={dom_name}  ||s||={np.linalg.norm(sig):.4f}", flush=True)
+    sig_in = sig_in.astype(np.float32)
+    print(f"in-patch signature: dominant={dom_name}  ||s||={np.linalg.norm(sig_in):.4g}",
+          flush=True)
 
-    # ---- Train deep nets (GPU) ----
+    # ---- Foreign signature: a class NOT in the patch, scaled to mean patch-pixel norm ----
+    fcls = _pick_foreign_class(gt, np.unique(te_gt))
+    sig_for = None
+    if fcls is not None:
+        mu_for = data_norm.reshape(-1, D)[gt.ravel() == fcls].mean(axis=0)
+        scalar = float(np.linalg.norm(te_raw, axis=1).mean())   # mean ||pixel|| over patch
+        sig_for = (mu_for / (np.linalg.norm(mu_for) + 1e-12) * scalar).astype(np.float32)
+        print(f"foreign signature: class={CLS_NAMES[fcls]}  scaled ||s||={scalar:.4g}",
+              flush=True)
+    else:
+        print("No labeled class is absent from the patch — skipping foreign run.", flush=True)
+
+    # ---- Train deep nets ONCE (signature-independent) ----
     print("Training deep nets ...", flush=True)
     t0 = time.time()
-    dsm_net = _train_dsm(tr_raw, cfg, device);                 print(f"  DSM done ({time.time()-t0:.0f}s)", flush=True)
+    dsm_net = _train_dsm(tr_raw, cfg, device)
+    print(f"  DSM done ({time.time() - t0:.0f}s)", flush=True)
     t0 = time.time()
-    cfattn  = _train_cfattn(tr_raw, tr_nbr, cfg, device, seed); print(f"  CF-Attn done ({time.time()-t0:.0f}s)", flush=True)
+    cfattn = _train_cfattn(tr_raw, tr_nbr, cfg, device, seed)
+    print(f"  CF-Attn done ({time.time() - t0:.0f}s)", flush=True)
     t0 = time.time()
-    nmlp    = _train_nmlp(tr_raw, tr_nbr, cfg, device);        print(f"  NeighborMLP done ({time.time()-t0:.0f}s)", flush=True)
-    models = {
-        'dsm': dsm_net,
-        'cfattn': cfattn,
-        'nmlp': nmlp}
+    nmlp = _train_nmlp(tr_raw, tr_nbr, cfg, device)
+    print(f"  NeighborMLP done ({time.time() - t0:.0f}s)", flush=True)
+    models = {'dsm': dsm_net, 'cfattn': cfattn, 'nmlp': nmlp}
 
-    # ---- Plant targets + score ----
-    planted, labels, tgt_idx = plant_targets(
-        te_raw, sig, cfg['amplitude'], cfg['target_fraction'],
-        model='additive', seed=seed)
-    planted = planted.astype(np.float32)
-    print(f"planted {int(labels.sum())} targets", flush=True)
+    ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
+               tr_raw=tr_raw, tr_nbr=tr_nbr, te_raw=te_raw, te_nbr=te_nbr,
+               te_gt=te_gt, data_norm=data_norm, gt=gt, test_box=test_box, sidx=sidx)
 
-    print("Scoring detectors (test) ...", flush=True)
-    test_scores  = score_all(planted, te_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
-    print("Scoring detectors (train, for CFAR threshold) ...", flush=True)
-    train_scores = score_all(tr_raw, tr_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
-
-    # Only the detectors that were actually produced (deep ones may be disabled),
-    # in the canonical display order.
-    DETS = [d for d in DET_ORDER if d in test_scores]
-    print(f"Active detectors: {DETS}", flush=True)
-
-    # ---- Metrics ----
-    pfa_t = float(cfg.get('pfa_target', 0.05))
-    rows = []
-    pfa_per_class = {}
-    roc_curves = {}
-    for det in DETS:
-        sc = np.asarray(test_scores[det], dtype=np.float64)
-        thr = cfar_threshold(np.asarray(train_scores[det], dtype=np.float64),
-                             target_fpr=pfa_t)
-        pcf = per_class_fpr(sc, labels, te_gt, thr)     # {clsname: fpr}
-        pcf = {kk: vv for kk, vv in pcf.items() if kk != 'unlabeled'} or pcf
-        pfa_per_class[det] = pcf
-        pfa_vals = list(pcf.values()) if pcf else [float('nan')]
-        fpr, tpr, auc_v = roc_safe(labels, sc)
-        roc_curves[det] = (fpr, tpr, auc_v)
-        rows.append({
-            'Detector':     det,
-            'pAUC@0.05':    partial_auc(labels, sc, fpr_max=0.05),
-            'AUC':          auc_v,
-            'Pd@Pfa=0.05':  dr_at_fpr(labels, sc, fpr_list=(pfa_t,))[str(pfa_t)],
-            'Pfa_avg':      float(np.nanmean(pfa_vals)),
-            'Pfa_max':      float(np.nanmax(pfa_vals)),
-        })
-
-    # ---- Summary table (CSV + Markdown) ----
-    cols = ['Detector', 'pAUC@0.05', 'AUC', 'Pd@Pfa=0.05', 'Pfa_avg', 'Pfa_max']
-    csv_path = os.path.join(run_dir, 'summary_table.csv')
-    with open(csv_path, 'w') as f:
-        f.write(','.join(cols) + '\n')
-        for r in rows:
-            f.write(','.join(str(r[c]) if c == 'Detector' else f'{r[c]:.4f}'
-                             for c in cols) + '\n')
-    md_path = os.path.join(run_dir, 'summary_table.md')
-    with open(md_path, 'w') as f:
-        f.write('| ' + ' | '.join(cols) + ' |\n')
-        f.write('|' + '|'.join(['---'] * len(cols)) + '|\n')
-        for r in rows:
-            f.write('| ' + ' | '.join(r['Detector'] if c == 'Detector'
-                                      else f'{r[c]:.3f}' for c in cols) + ' |\n')
-    print("\n=== Summary ===", flush=True)
-    print(open(md_path).read(), flush=True)
-
-    # ---- metrics.json + scores.npz ----
-    json.dump({'scenario_index': sidx, 'train_box': train_box, 'test_box': test_box,
-               'dom_cls': dom_cls, 'dom_name': dom_name, 'pfa_target': pfa_t,
-               'rows': rows, 'pfa_per_class': pfa_per_class},
-              open(os.path.join(run_dir, 'metrics.json'), 'w'), indent=2, default=str)
-    npz = {f'score_{d}': test_scores[d] for d in DETS}
-    npz['labels'] = labels; npz['te_gt'] = te_gt; npz['tgt_idx'] = tgt_idx
-    np.savez(os.path.join(run_dir, 'scores.npz'), **npz)
-
-    # ---- Figures ----
-    print("\nSaving figures ...", flush=True)
-    # false color
-    fig, ax = plt.subplots(figsize=(5, 5 * H_b / max(W_b, 1)))
-    ax.imshow(_false_color(data_norm, test_box)); ax.axis('off')
-    ax.set_title(f'False color — test box (scenario {sidx})', fontsize=9)
-    _savefig(fig, os.path.join(run_dir, 'false_color.pdf'))
-
-    # label map
-    fig, ax = plt.subplots(figsize=(5, 5 * H_b / max(W_b, 1)))
-    ax.imshow(_gt_colorimage(gt[r0:r1, c0:c1])); ax.axis('off')
-    ax.set_title(f'Label map — test box (dominant={dom_name})', fontsize=9)
-    present = sorted(np.unique(te_gt))
-    handles = [plt.matplotlib.patches.Patch(color=CLS_COLORS_HEX.get(int(c), '#777'),
-               label=CLS_NAMES.get(int(c), f'cls{c}')) for c in present]
-    ax.legend(handles=handles, fontsize=6, loc='center left',
-              bbox_to_anchor=(1.0, 0.5))
-    _savefig(fig, os.path.join(run_dir, 'label_map.pdf'))
-
-    # detection maps grid
-    ncol = 3
-    nrow = int(np.ceil(len(DETS) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3.4 * nrow))
-    axes = np.atleast_1d(axes).ravel()
-    for j, det in enumerate(DETS):
-        smap = scores_to_spatial_map(test_scores[det], te_idx, (H_b, W_b))
-        ax = axes[j]
-        im = ax.imshow(smap, cmap='inferno')
-        ax.set_title(f'{det}  (AUC={roc_curves[det][2]:.3f})', fontsize=8)
-        ax.axis('off')
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    for j in range(len(DETS), len(axes)):
-        axes[j].axis('off')
-    fig.suptitle(f'Detection score maps — scenario {sidx}', fontsize=11)
-    fig.tight_layout()
-    _savefig(fig, os.path.join(run_dir, 'detection_maps.pdf'))
-
-    # ROC overlay
-    fig, ax = plt.subplots(figsize=(5.5, 5))
-    ax.plot([0, 1], [0, 1], 'k--', lw=0.7)
-    for det in DETS:
-        fpr, tpr, auc_v = roc_curves[det]
-        ax.plot(fpr, tpr, color=DET_COLORS[det], lw=1.6,
-                label=f'{det} (AUC={auc_v:.3f})')
-    ax.set_xlabel('False Alarm Rate'); ax.set_ylabel('Detection Rate')
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.grid(alpha=0.25)
-    ax.set_title(f'ROC — scenario {sidx}', fontsize=10)
-    ax.legend(fontsize=7, loc='lower right')
-    _savefig(fig, os.path.join(run_dir, 'roc.pdf'))
-
-    # per-class Pfa grouped bars
-    classes = sorted({c for d in DETS for c in pfa_per_class[d]})
-    fig, ax = plt.subplots(figsize=(max(7, 1.0 * len(classes)), 4))
-    bw = 0.8 / len(DETS)
-    xpos = np.arange(len(classes))
-    for di, det in enumerate(DETS):
-        vals = [pfa_per_class[det].get(c, 0.0) for c in classes]
-        ax.bar(xpos + di * bw, vals, bw, label=det, color=DET_COLORS[det])
-    ax.axhline(pfa_t, color='k', ls=':', lw=1, label=f'target Pfa={pfa_t}')
-    ax.set_xticks(xpos + 0.4 - bw / 2); ax.set_xticklabels(classes, rotation=30, ha='right', fontsize=8)
-    ax.set_ylabel('Per-class Pfa'); ax.set_title(f'Per-class false-alarm rate (CFAR thr @ {pfa_t})', fontsize=9)
-    ax.legend(fontsize=6, ncol=2)
-    _savefig(fig, os.path.join(run_dir, 'pfa_per_class.pdf'))
+    # ---- Run detection twice ----
+    run_detection(sig_in, f'inpatch-{dom_name}', run_dir, ctx)
+    if sig_for is not None:
+        run_detection(sig_for, f'foreign-{CLS_NAMES[fcls]}',
+                      os.path.join(run_dir, 'foreign'), ctx)
 
     print(f"\nDone.  Results: {run_dir}", flush=True)
+
     if args.dry_run:
-        expect = ['summary_table.csv', 'summary_table.md', 'metrics.json',
-                  'scores.npz', 'false_color.pdf', 'label_map.pdf',
-                  'detection_maps.pdf', 'roc.pdf', 'pfa_per_class.pdf']
+        expect = ['summary_table.csv', 'metrics.json', 'scores.npz',
+                  'false_color.pdf', 'label_map_targets.pdf', 'signatures.pdf',
+                  'detection_maps.pdf', 'detected_pfa.pdf', 'roc.pdf',
+                  'pfa_per_class.pdf', 'false_alarms_falsecolor.pdf',
+                  'false_alarms_labelmap.pdf']
         ok = all(os.path.exists(os.path.join(run_dir, e)) for e in expect)
+        if sig_for is not None:
+            ok = ok and os.path.exists(os.path.join(run_dir, 'foreign', 'summary_table.csv'))
         print("DRY-RUN:", "ALL OUTPUTS PRESENT ✓" if ok else "MISSING OUTPUTS ✗")
         sys.exit(0 if ok else 1)
 
