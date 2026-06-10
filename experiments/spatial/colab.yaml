@@ -71,6 +71,15 @@ dsm_hidden:    [128]
 dsm_epochs:    1000
 dsm_lr:        5.0e-4
 
+# ------- NeighborRidge (neighbor-adapted ridge score head) -------
+ridge_M:        256        # encoder output dim M (head is D×M, ridge is K×K)
+ridge_hidden:   [128, 128] # encoder hidden widths
+ridge_lam_init: 0.1        # ridge lambda init (shrinkage toward global head W0); learned
+ridge_epochs:   1000
+ridge_lr:       3.0e-4
+ridge_batch:    256
+ridge_n_mc:     8          # MC noise draws of the neighbors at scoring time
+
 # ------- Shared -------
 activation:    relu
 dsm_sigma_rho: 0.01
@@ -79,7 +88,7 @@ weight_decay:  1.0e-4
 seed:          42
 
 # ------- GMM baselines -------
-gmm_K:     5     # number of GMM components for GMM-GLRT
+gmm_K:     9     # number of GMM components for GMM-GLRT
 gmm_steps: 50    # grid-search steps for fill factor p
 
 results_dir:   final_paper_experiments/results/spatial

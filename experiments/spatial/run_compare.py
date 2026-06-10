@@ -68,10 +68,15 @@ from final_paper_experiments.evaluation import (
 from cfattn_model import score_cfattn_additive, score_cfattn_additive_cfar
 from neighbor_mlp_model import score_nmlp_additive
 from local_detectors import amf_cem_local_scm, amf_global, cem_global
+from final_paper_experiments.models.neighbor_adapted import (
+    NeighborAdaptedScore, dsm_loss as ridge_dsm_loss, adapted_score_field,
+)
+from tqdm import tqdm
 
 # Reuse the (whitening-aware, GPU) training helpers from the main runner.
 from run_colab import (
     _crop_pca_box, _train_dsm, _train_cfattn, _train_nmlp,
+    _make_whitening, _whiten_np, _whitened_sigma,
 )
 
 CLS_NAMES = {
@@ -92,7 +97,7 @@ HIT_MARK    = '#39ff14'   # lime — true detections
 
 # Fixed display order + colors for the detectors.
 DET_ORDER = [
-    'DSM', 'CF-Attn', 'CF-Attn-CFAR', 'NeighborMLP',
+    'DSM', 'CF-Attn', 'CF-Attn-CFAR', 'NeighborMLP', 'NeighborRidge',
     'AMF', 'AMF-local',
     # 'CEM', 'CEM-local',
     'GMM-Levin'
@@ -102,6 +107,7 @@ DET_COLORS = {
     'CF-Attn': '#aec7e8',
     'CF-Attn-CFAR': '#1f77b4',
     'NeighborMLP': '#2ca02c',
+    'NeighborRidge': '#17becf',
     'AMF': '#9467bd',
     'AMF-local': '#c5b0d5',
     'CEM': '#8c564b',
@@ -134,6 +140,9 @@ DEFAULT_CFG = dict(
     nmlp_epochs=300, nmlp_lr=3e-4, nmlp_batch=256,
     # DSM
     dsm_hidden=[64, 64], dsm_epochs=1000, dsm_lr=5e-4,
+    # NeighborRidge (neighbor-adapted ridge score head)
+    ridge_M=256, ridge_hidden=[128, 128], ridge_lam_init=0.1,
+    ridge_epochs=300, ridge_lr=3e-4, ridge_batch=256, ridge_n_mc=8,
     # shared
     activation='silu', dsm_sigma_rho=0.01,
     whiten_mode='zca', whiten_eig_floor=1e-5,
@@ -145,8 +154,8 @@ DEFAULT_CFG = dict(
 )
 
 DRYRUN_OVERRIDES = dict(
-    cfattn_epochs=8, nmlp_epochs=8, dsm_epochs=20,
-    cfattn_K=4, nmlp_K=4,
+    cfattn_epochs=8, nmlp_epochs=8, dsm_epochs=20, ridge_epochs=8, ridge_n_mc=2,
+    cfattn_K=4, nmlp_K=4, ridge_M=64,
     n_budget=400,   # dry-run only: contiguous side-crop for speed (still spatial)
 )
 
@@ -207,6 +216,69 @@ def _pick_foreign_class(gt, present):
     return max(cand, key=lambda c: int((gt == c).sum()))
 
 
+# ---------------------------------------------------------------------------
+# NeighborRidge — neighbor-adapted ridge score head (paper Section 6.2 / 8.2).
+# Shared encoder + global linear head W0 + per-pixel LOCAL head solved in closed
+# form by ridge regression over the k×k neighbors, shrinking toward W0 when the
+# neighborhood is uninformative (boundaries). Whitening is applied externally
+# (the model has no whitening hook), so it operates in whitened space and the
+# scores are mapped back to data space for detection.
+# ---------------------------------------------------------------------------
+
+def _train_ridge(tr_raw, tr_nbr, cfg, device, seed):
+    torch.manual_seed(seed)
+    D = tr_raw.shape[1]
+    W = _make_whitening(tr_raw, cfg, device)
+    sigma = _whitened_sigma(cfg)
+    Xc = torch.tensor(_whiten_np(W, tr_raw, device), dtype=torch.float32).to(device)   # (N, D)
+    Xn = torch.tensor(_whiten_np(W, tr_nbr, device), dtype=torch.float32).to(device)   # (N, K, D)
+    model = NeighborAdaptedScore(
+        D=D, M=int(cfg.get('ridge_M', 256)),
+        hidden=tuple(cfg.get('ridge_hidden', [128, 128])),
+        k=int(cfg['k']), lam_init=float(cfg.get('ridge_lam_init', 0.1))).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.get('ridge_lr', 3e-4)),
+                            weight_decay=cfg['weight_decay'])
+    P  = len(Xc)
+    bs = int(cfg.get('ridge_batch', 256))
+    pbar = tqdm(range(int(cfg.get('ridge_epochs', 300))), desc='NeighborRidge',
+                dynamic_ncols=True, leave=False)
+    for _ in pbar:
+        perm = torch.randperm(P, device=device)
+        for i in range(0, P, bs):
+            sel = perm[i:i + bs]
+            loss = ridge_dsm_loss(model, Xc[sel], Xn[sel], sigma)
+            opt.zero_grad(); loss.backward(); opt.step()
+    model._whitening = W
+    model.eval()
+    return model
+
+
+def score_ridge_additive(model, test_pix, test_nbr, train_pix, train_nbr, s, cfg):
+    """Additive LMP using the neighbor-adapted ridge score (same convention as
+    score_nmlp_additive). Scores are computed in whitened space, mapped to data
+    space, then normalized by the training-score covariance."""
+    W = model._whitening.cpu()
+    Wn = W.W.detach().cpu().numpy()                      # (D, D)
+    sigma = _whitened_sigma(cfg)
+    n_mc = int(cfg.get('ridge_n_mc', 8))
+    model.cpu().eval()
+
+    def _scores(pix, nbr):
+        cw = torch.tensor(_whiten_np(W, pix, 'cpu'), dtype=torch.float32)   # (B, D)
+        nw = torch.tensor(_whiten_np(W, nbr, 'cpu'), dtype=torch.float32)   # (B, K, D)
+        psi_w = adapted_score_field(model, cw, nw, sigma, n_mc=n_mc).numpy()  # (B, D) whitened
+        return psi_w @ Wn                                                    # data-space score
+
+    z_tr = _scores(train_pix, train_nbr)
+    z_te = _scores(test_pix,  test_nbr)
+    z_bar = z_tr.mean(axis=0)
+    C = np.cov(z_tr, rowvar=False)
+    if C.ndim == 0:
+        C = np.array([[float(C)]])
+    norm = float(np.sqrt(max(float(s @ C @ s), 1e-12)))
+    return -((z_te - z_bar) @ s) / norm
+
+
 def _savefig(fig, path):
     # NO bbox_inches='tight' — that crops each figure to its content and breaks
     # the uniform size. Save the full FIGSIZE canvas at a fixed dpi so every
@@ -235,6 +307,8 @@ def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
         out['CF-Attn-CFAR'] = score_cfattn_additive_cfar(models['cfattn'], pix, nbr, sig)
     if models.get('nmlp') is not None:
         out['NeighborMLP'] = score_nmlp_additive(models['nmlp'], pix, nbr, tr_raw, tr_nbr, sig)
+    if models.get('ridge') is not None:
+        out['NeighborRidge'] = score_ridge_additive(models['ridge'], pix, nbr, tr_raw, tr_nbr, sig, cfg)
     out['AMF'] = amf_global(pix, tr_raw, sig, eig_floor=floor)
     out['CEM'] = cem_global(pix, tr_raw, sig, eig_floor=floor)
     out['GMM-Levin'] = gmm_glrt_levin_additive(pix, tr_raw, sig,
@@ -568,7 +642,10 @@ def main():
     t0 = time.time()
     nmlp = _train_nmlp(tr_raw, tr_nbr, cfg, device)
     print(f"  NeighborMLP done ({time.time() - t0:.0f}s)", flush=True)
-    models = {'dsm': dsm_net, 'cfattn': cfattn, 'nmlp': nmlp}
+    t0 = time.time()
+    ridge = _train_ridge(tr_raw, tr_nbr, cfg, device, seed)
+    print(f"  NeighborRidge done ({time.time() - t0:.0f}s)", flush=True)
+    models = {'dsm': dsm_net, 'cfattn': cfattn, 'nmlp': nmlp, 'ridge': ridge}
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
                tr_raw=tr_raw, tr_nbr=tr_nbr, te_raw=te_raw, te_nbr=te_nbr,
