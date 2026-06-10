@@ -115,6 +115,20 @@ class NeighborMLPDenoiser(nn.Module):
         # --- 5. Tweedie score ---
         return (x_hat - y) / (self.sigma ** 2)
 
+    @torch.no_grad()
+    def topk_indices(self, y: torch.Tensor, neighbors: torch.Tensor) -> torch.Tensor:
+        """Return the indices of the K latent-nearest neighbors the model selects
+        for each pixel — (B, K_eff). Same selection used inside _forward_inner.
+        Inputs are RAW (whitened internally). Used for the kNN local-Fisher CFAR."""
+        y = self.whiten(y)
+        neighbors = self.whiten(neighbors)
+        B, M, D = neighbors.shape
+        z_i = self.phi(y)
+        z_j = self.phi(neighbors.reshape(B * M, D)).reshape(B, M, self.d_lat)
+        dists = ((z_j - z_i.unsqueeze(1)) ** 2).sum(-1)                 # (B, M)
+        K_eff = min(self.K, M)
+        return dists.topk(K_eff, dim=1, largest=False).indices         # (B, K_eff)
+
 
 # ---------------------------------------------------------------------------
 # Training loss

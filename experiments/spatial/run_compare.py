@@ -51,6 +51,7 @@ os.chdir(_ROOT)
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from scipy.ndimage import uniform_filter
 import matplotlib; matplotlib.use('Agg')
@@ -256,6 +257,39 @@ def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6):
     return ((q - mean_a) / std_a).reshape(-1).astype(np.float32)
 
 
+def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6):
+    """Local-Fisher CFAR for NeighborMLP using the model's OWN top-K selected
+    neighbors (not a spatial window). For each pixel, standardize its projected
+    score q_i by the mean/std of q over the K latent-nearest neighbors the model
+    picked — q at the neighbor positions is read straight off the score map
+    (no extra forward passes):
+
+        T_i = (q_i - mean_{kNN}(q)) / (std_{kNN}(q) + eps)
+
+    The k×k window order here matches extract_neighborhoods, so the model's
+    selection indices line up with the unfolded neighbor scores.
+    """
+    H, W = shape
+    dev = next(model.parameters()).device
+    q_i = torch.tensor(np.asarray(score_flat, np.float32), device=dev)        # (HW,)
+    # neighbor q-values via unfold of the score map (reflect-padded k×k window)
+    p = k // 2
+    qmap = q_i.reshape(1, 1, H, W)
+    patches = F.unfold(F.pad(qmap, (p, p, p, p), mode='reflect'), kernel_size=k)  # (1, k*k, HW)
+    patches = patches.reshape(k * k, H * W).t()                               # (HW, k*k)
+    cidx = (k * k) // 2
+    keep = [m for m in range(k * k) if m != cidx]
+    q_neigh = patches[:, keep]                                               # (HW, M)
+    # the model's top-K selected neighbor indices
+    idx = model.topk_indices(
+        torch.tensor(np.asarray(pix, np.float32), device=dev),
+        torch.tensor(np.asarray(nbr, np.float32), device=dev))               # (HW, K)
+    q_topk = torch.gather(q_neigh, 1, idx)                                    # (HW, K)
+    mu = q_topk.mean(dim=1)
+    std = q_topk.var(dim=1, unbiased=False).sqrt() + eps
+    return ((q_i - mu) / std).cpu().numpy().astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # NeighborRidge — neighbor-adapted ridge score head (paper Section 6.2 / 8.2).
 # Shared encoder + global linear head W0 + per-pixel LOCAL head solved in closed
@@ -400,17 +434,24 @@ def run_detection(sig, sig_label, out_dir, ctx):
     print("Scoring detectors (train, for CFAR thresholds) ...", flush=True)
     train_scores = score_all(tr_raw, tr_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
 
-    # ---- Local-CFAR siblings for the score nets (windowed score-map norm) ----
+    # ---- Local-CFAR siblings for the score nets ----
     bg = int(cfg.get('cfar_bg_window', 11))
     guard = int(cfg.get('cfar_guard', 3))
+    k_win = int(cfg['k'])
     tr0, tr1, tc0, tc1 = ctx['train_box']
     tr_shape = (tr1 - tr0, tc1 - tc0)
-    for base in CFAR_BASE:
-        if base in test_scores:
-            test_scores[base + '-CFAR'] = _cfar_normalize_map(
-                test_scores[base], (H_b, W_b), bg, guard)
-            train_scores[base + '-CFAR'] = _cfar_normalize_map(
-                train_scores[base], tr_shape, bg, guard)
+    # NeighborMLP-CFAR: local Fisher from the model's OWN top-K selected neighbors.
+    if 'NeighborMLP' in test_scores and models.get('nmlp') is not None:
+        test_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
+            test_scores['NeighborMLP'], models['nmlp'], planted, te_nbr, (H_b, W_b), k_win)
+        train_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
+            train_scores['NeighborMLP'], models['nmlp'], tr_raw, tr_nbr, tr_shape, k_win)
+    # NeighborRidge-CFAR: windowed score-map normalization (ridge uses all neighbors).
+    if 'NeighborRidge' in test_scores:
+        test_scores['NeighborRidge-CFAR'] = _cfar_normalize_map(
+            test_scores['NeighborRidge'], (H_b, W_b), bg, guard)
+        train_scores['NeighborRidge-CFAR'] = _cfar_normalize_map(
+            train_scores['NeighborRidge'], tr_shape, bg, guard)
 
     DETS = [d for d in DET_ORDER if d in test_scores]
     print(f"Active detectors: {DETS}", flush=True)
