@@ -290,12 +290,12 @@ def main():
     t0 = time.time()
     dsm_net = _train_dsm(tr_raw, cfg, device);                 print(f"  DSM done ({time.time()-t0:.0f}s)", flush=True)
     t0 = time.time()
-    # cfattn  = _train_cfattn(tr_raw, tr_nbr, cfg, device, seed); print(f"  CF-Attn done ({time.time()-t0:.0f}s)", flush=True)
+    cfattn  = _train_cfattn(tr_raw, tr_nbr, cfg, device, seed); print(f"  CF-Attn done ({time.time()-t0:.0f}s)", flush=True)
     t0 = time.time()
     nmlp    = _train_nmlp(tr_raw, tr_nbr, cfg, device);        print(f"  NeighborMLP done ({time.time()-t0:.0f}s)", flush=True)
     models = {
         'dsm': dsm_net,
-        # 'cfattn': cfattn,
+        'cfattn': cfattn,
         'nmlp': nmlp}
 
     # ---- Plant targets + score ----
