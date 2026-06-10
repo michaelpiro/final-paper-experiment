@@ -208,9 +208,10 @@ def _train_cfattn(tr_raw, tr_nbr_raw, cfg, device, seed):
     Ntr = torch.tensor(tr_nbr_raw, dtype=torch.float32).to(device)
     P   = len(Xtr)
     pbar = tqdm(range(cfg['cfattn_epochs']), desc='CF-Attn', dynamic_ncols=True, leave=False)
+    last = float('nan')
     for ep in pbar:
         perm = torch.randperm(P, device=device)
-        ep_loss = 0.0
+        ep_loss = 0.0; nb = 0
         for i in range(0, P, cfg['batch_size']):
             sel = perm[i:i+cfg['batch_size']]
             loss, di = cfattn_dsm_loss(cfattn, Xtr[sel], Ntr[sel],
@@ -218,9 +219,10 @@ def _train_cfattn(tr_raw, tr_nbr_raw, cfg, device, seed):
                                        lam_div=cfg.get('lam_div', 0.05),
                                        lam_cov=cfg.get('lam_cov', 1e-5))
             opt.zero_grad(); loss.backward(); opt.step()
-            ep_loss += float(di)
-        if (ep + 1) % max(cfg['cfattn_epochs'] // 5, 1) == 0:
-            pbar.set_postfix(dsm=f'{ep_loss:.4f}')
+            ep_loss += float(di); nb += 1
+        last = ep_loss / max(nb, 1)
+        pbar.set_postfix(loss=f'{last:.4f}')
+    cfattn._final_loss = last
     cfattn.eval()
     return cfattn
 
@@ -240,12 +242,18 @@ def _train_nmlp(tr_raw, tr_nbr_raw, cfg, device):
     Ntr = torch.tensor(tr_nbr_raw, dtype=torch.float32).to(device)
     P   = len(Xtr)
     pbar = tqdm(range(cfg['nmlp_epochs']), desc='NeighborMLP', dynamic_ncols=True, leave=False)
+    last = float('nan')
     for ep in pbar:
         perm = torch.randperm(P, device=device)
+        ep_loss = 0.0; nb = 0
         for i in range(0, P, cfg['nmlp_batch']):
             sel = perm[i:i+cfg['nmlp_batch']]
             loss = neighbor_mlp_dsm_loss(nmlp, Xtr[sel], Ntr[sel])
             opt.zero_grad(); loss.backward(); opt.step()
+            ep_loss += float(loss.item()); nb += 1
+        last = ep_loss / max(nb, 1)
+        pbar.set_postfix(loss=f'{last:.4f}')
+    nmlp._final_loss = last
     nmlp.eval()
     return nmlp
 
@@ -263,12 +271,18 @@ def _train_dsm(tr_raw, cfg, device):
     Xtr = torch.tensor(tr_raw, dtype=torch.float32).to(device)
     P   = len(Xtr)
     pbar = tqdm(range(cfg['dsm_epochs']), desc='DSM', dynamic_ncols=True, leave=False)
+    last = float('nan')
     for ep in pbar:
         perm = torch.randperm(P, device=device)
+        ep_loss = 0.0; nb = 0
         for i in range(0, P, cfg['batch_size']):
             b = Xtr[perm[i:i+cfg['batch_size']]]
             loss = dsm_loss(dsm_net, b, sigma)
             opt.zero_grad(); loss.backward(); opt.step()
+            ep_loss += float(loss.item()); nb += 1
+        last = ep_loss / max(nb, 1)
+        pbar.set_postfix(loss=f'{last:.4f}')
+    dsm_net._final_loss = last
     dsm_net.eval()
     return dsm_net
 

@@ -242,12 +242,18 @@ def _train_ridge(tr_raw, tr_nbr, cfg, device, seed):
     bs = int(cfg.get('ridge_batch', 256))
     pbar = tqdm(range(int(cfg.get('ridge_epochs', 300))), desc='NeighborRidge',
                 dynamic_ncols=True, leave=False)
+    last = float('nan')
     for _ in pbar:
         perm = torch.randperm(P, device=device)
+        ep_loss = 0.0; nb = 0
         for i in range(0, P, bs):
             sel = perm[i:i + bs]
             loss = ridge_dsm_loss(model, Xc[sel], Xn[sel], sigma)
             opt.zero_grad(); loss.backward(); opt.step()
+            ep_loss += float(loss.item()); nb += 1
+        last = ep_loss / max(nb, 1)
+        pbar.set_postfix(loss=f'{last:.4f}')
+    model._final_loss = last
     model._whitening = W
     model.eval()
     return model
@@ -633,18 +639,20 @@ def main():
 
     # ---- Train deep nets ONCE (signature-independent) ----
     print("Training deep nets ...", flush=True)
+    def _fl(m):
+        return getattr(m, '_final_loss', float('nan'))
     t0 = time.time()
     dsm_net = _train_dsm(tr_raw, cfg, device)
-    print(f"  DSM done ({time.time() - t0:.0f}s)", flush=True)
+    print(f"  DSM done ({time.time() - t0:.0f}s)  final loss={_fl(dsm_net):.4f}", flush=True)
     t0 = time.time()
     cfattn = _train_cfattn(tr_raw, tr_nbr, cfg, device, seed)
-    print(f"  CF-Attn done ({time.time() - t0:.0f}s)", flush=True)
+    print(f"  CF-Attn done ({time.time() - t0:.0f}s)  final loss={_fl(cfattn):.4f}", flush=True)
     t0 = time.time()
     nmlp = _train_nmlp(tr_raw, tr_nbr, cfg, device)
-    print(f"  NeighborMLP done ({time.time() - t0:.0f}s)", flush=True)
+    print(f"  NeighborMLP done ({time.time() - t0:.0f}s)  final loss={_fl(nmlp):.4f}", flush=True)
     t0 = time.time()
     ridge = _train_ridge(tr_raw, tr_nbr, cfg, device, seed)
-    print(f"  NeighborRidge done ({time.time() - t0:.0f}s)", flush=True)
+    print(f"  NeighborRidge done ({time.time() - t0:.0f}s)  final loss={_fl(ridge):.4f}", flush=True)
     models = {'dsm': dsm_net, 'cfattn': cfattn, 'nmlp': nmlp, 'ridge': ridge}
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
