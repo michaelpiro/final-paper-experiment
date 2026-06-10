@@ -323,7 +323,9 @@ DETECTOR_COLORS = {
     'GMM-Levin': '#9467bd',
     'DLTD':      '#e6550d',   # orange
     'SMGLRT':    '#8c564b',   # brown
-    'DSM':       '#d62728',
+    'DSM':       '#d62728',   # red   — primary DSM (architecture set by hidden_dims)
+    'DSM-lin':   '#9b2226',   # dark red  — linear variant
+    'DSM-MLP':   '#e07070',   # light red — MLP variant
     'LRao':      '#2ca02c',
 }
 
@@ -345,7 +347,12 @@ def _apply_log_xticks(ax, x):
     ax.xaxis.set_major_formatter(
         matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:g}'))
     ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-    ax.tick_params(axis='x', labelsize=8, rotation=45)
+    # ha='right' + rotation_mode='anchor' prevents label overlap on dense log grids
+    for lbl in ax.get_xticklabels():
+        lbl.set_rotation(45)
+        lbl.set_ha('right')
+        lbl.set_rotation_mode('anchor')
+        lbl.set_fontsize(8)
 
 
 def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
@@ -361,7 +368,7 @@ def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
         if ys is None or all(v != v for v in ys):     # all-NaN
             continue
         ys = np.asarray(ys, dtype=float)
-        style = dict(marker='D', lw=2.2) if det in ('DSM', 'LRao') \
+        style = dict(marker='D', lw=2.2) if det in ('DSM', 'DSM-lin', 'DSM-MLP', 'LRao') \
             else dict(marker='o', lw=1.4)
         c = _det_color(det)
         ax.plot(x, ys, color=c, label=det, **style)
@@ -387,7 +394,7 @@ def _plot_roc(det_scores: dict, labels: np.ndarray, title: str, out_pdf: str):
     ax.plot([0, 1], [0, 1], 'k--', lw=0.7, label='_no_legend_')
     for det, sc in det_scores.items():
         fpr, tpr, auc_v = _roc(labels, sc)
-        lw  = 2.2 if det in ('DSM', 'LRao') else 1.4
+        lw  = 2.2 if det in ('DSM', 'DSM-lin', 'DSM-MLP', 'LRao') else 1.4
         ax.plot(fpr, tpr, color=_det_color(det), lw=lw,
                 label=f'{det}  (AUC={auc_v:.3f})')
     ax.set_xlabel('False Alarm Rate')
@@ -506,7 +513,16 @@ def run_iid(cfg: dict, mode: str):
           flush=True)
 
     _cls = CLASSICAL_DETS_MULTI if mode == 'multi' else CLASSICAL_DETS_SINGLE
-    DETS = _cls + ['DSM', 'LRao']
+
+    # DSM variant names: always 'DSM' for the primary (hidden_dims/activation).
+    # If hidden_dims_2 is set in config, a second DSM is also run.
+    _dsm_names = ['DSM']
+    if cfg.get('hidden_dims_2') is not None:
+        _h2 = list(cfg['hidden_dims_2'])
+        _dsm2_label = cfg.get('dsm2_label', 'DSM-MLP' if _h2 else 'DSM-lin')
+        _dsm_names.append(_dsm2_label)
+
+    DETS = _cls + _dsm_names + ['LRao']
     loss_curves: Dict[str, list] = {}
     metrics = {
         'n_list': n_list, 'rho_list': rho_list, 'n_fixed': n_fixed,
@@ -520,22 +536,36 @@ def run_iid(cfg: dict, mode: str):
         return (_auc(labels, sc), _pauc(labels, sc, pauc_fpr),
                 _pd_at_fa(labels, sc, pfa))
 
+    def _train_dsm_variant(train_raw_n, cfg_rho, name, tag):
+        """Train one DSM variant and return its additive scores."""
+        net, h = train_dsm_local(train_raw_n, cfg_rho, seed, f'{name}_{tag}')
+        loss_curves[f'{name}_{tag}'] = h
+        torch.save({'state_dict': net.state_dict(), 'tag': tag},
+                   os.path.join(mdl_dir, f'{name}_{tag}.pt'))
+        return score_dsm_add(net, train_raw_n, test_planted, s_raw)
+
     def _train_score_models(train_raw_n, cfg_rho, tag):
-        """Train DSM (at cfg_rho's ρ) + LRao on train_raw_n; return their scores."""
-        dsm_net, h_dsm = train_dsm_local(train_raw_n, cfg_rho, seed, tag)
-        loss_curves[f'DSM_{tag}'] = h_dsm
-        torch.save({'state_dict': dsm_net.state_dict(), 'tag': tag},
-                   os.path.join(mdl_dir, f'dsm_{tag}.pt'))
-        sc_dsm = score_dsm_add(dsm_net, train_raw_n, test_planted, s_raw)
+        """Train all DSM variants + LRao on train_raw_n; return score dict."""
+        scores = {}
+        # --- primary DSM ---
+        scores['DSM'] = _train_dsm_variant(train_raw_n, cfg_rho, 'DSM', tag)
+        # --- secondary DSM (if configured) ---
+        if len(_dsm_names) > 1:
+            label2 = _dsm_names[1]
+            cfg2 = {**cfg_rho,
+                    'hidden_dims': list(cfg['hidden_dims_2']),
+                    'activation':  cfg.get('activation_2', cfg_rho['activation'])}
+            scores[label2] = _train_dsm_variant(train_raw_n, cfg2, label2, tag)
+        # --- LRao ---
         lrao_net, h_lrao = train_lrao_local(train_raw_n, cfg, seed, tag)
         loss_curves[f'LRao_{tag}'] = h_lrao
         torch.save({'state_dict': lrao_net.state_dict(), 'tag': tag},
                    os.path.join(mdl_dir, f'lrao_{tag}.pt'))
-        sc_lrao = _safe(f'LRao {tag}',
-                        lambda: score_lrao(lrao_net, train_raw_n, test_planted,
-                                           s_raw, cfg),
-                        len(labels))
-        return sc_dsm, sc_lrao
+        scores['LRao'] = _safe(f'LRao {tag}',
+                               lambda: score_lrao(lrao_net, train_raw_n, test_planted,
+                                                  s_raw, cfg),
+                               len(labels))
+        return scores
 
     # ------------------------------------------------------------------ vs n
     print(f"\n=== SWEEP vs n  (ρ={rho_fixed}) ===", flush=True)
@@ -544,8 +574,8 @@ def run_iid(cfg: dict, mode: str):
         tr = train_pool_raw[:n]
         reg_sigma = compute_sigma_from_data(tr, rho_fixed)
         cl = run_classical_additive(tr, test_planted, s_raw, reg_sigma, cfg, mode)
-        sc_dsm, sc_lrao = _train_score_models(tr, cfg, f'n{n}')
-        det_scores = {**cl, 'DSM': sc_dsm, 'LRao': sc_lrao}
+        sc_dict = _train_score_models(tr, cfg, f'n{n}')
+        det_scores = {**cl, **sc_dict}
         for det, sc in det_scores.items():
             au, pa, pd = _mtr(sc)
             metrics['vs_n'][det]['auc'].append(au)
@@ -585,20 +615,23 @@ def run_iid(cfg: dict, mode: str):
     for rho in rho_list:
         t0 = time.time()
         cfg_rho = {**cfg, 'dsm_sigma_rho': float(rho)}
-        dsm_net, h = train_dsm_local(tr_f, cfg_rho, seed, f'rho{rho}_n{n_fixed}')
-        loss_curves[f'DSM_rho{rho}_n{n_fixed}'] = h
-        torch.save({'state_dict': dsm_net.state_dict(), 'rho': rho, 'n': n_fixed},
-                   os.path.join(mdl_dir, f'dsm_rho{rho}_n{n_fixed}.pt'))
-        sc_dsm = score_dsm_add(dsm_net, tr_f, test_planted, s_raw)
-        det_scores = {**flat, 'DSM': sc_dsm}
+        tag_rho = f'rho{rho}_n{n_fixed}'
+        dsm_scores_rho = {'DSM': _train_dsm_variant(tr_f, cfg_rho, 'DSM', tag_rho)}
+        if len(_dsm_names) > 1:
+            label2 = _dsm_names[1]
+            cfg2 = {**cfg_rho,
+                    'hidden_dims': list(cfg['hidden_dims_2']),
+                    'activation':  cfg.get('activation_2', cfg['activation'])}
+            dsm_scores_rho[label2] = _train_dsm_variant(tr_f, cfg2, label2, tag_rho)
+        det_scores = {**flat, **dsm_scores_rho}
         for det, sc in det_scores.items():
             au, _, pd = _mtr(sc)
             metrics['vs_rho'][det]['auc'].append(au)
             metrics['vs_rho'][det]['pd'].append(pd)
             store[f'vsRho/{det}_rho{rho}'] = np.asarray(sc, np.float32)
-        print(f"  ρ={rho:<6}  ({time.time()-t0:.0f}s)  "
-              f"DSM auc={metrics['vs_rho']['DSM']['auc'][-1]:.3f} "
-              f"pd@{pfa}={metrics['vs_rho']['DSM']['pd'][-1]:.3f}", flush=True)
+        dsm_aucs = "  ".join(f"{n}={metrics['vs_rho'][n]['auc'][-1]:.3f}"
+                             for n in _dsm_names)
+        print(f"  ρ={rho:<6}  ({time.time()-t0:.0f}s)  {dsm_aucs}", flush=True)
         json.dump(metrics, open(os.path.join(run_dir, 'metrics.json'), 'w'),
                   indent=2, default=str)
 

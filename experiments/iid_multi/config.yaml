@@ -44,8 +44,11 @@ pfa: 0.1                       # Pd @ this Pfa
 pauc_fpr: 0.1                  # partial AUC over Pfa < this
 
 # ----- score network architecture (DSM + LRao share this) -----
-hidden_dims: [128, 128]
+hidden_dims: [128, 128]   # primary DSM → MLP score function  (label: "DSM")
 activation: relu
+hidden_dims_2: []          # secondary DSM → linear score function
+activation_2: silu
+dsm2_label: "DSM-lin"
 
 # ----- training budgets -----
 dsm_epochs: 2000
