@@ -138,7 +138,7 @@ class Whitening(nn.Module):
 
     @classmethod
     def from_data(cls, X: np.ndarray, mode: str = "zca",
-                  eig_floor: float = 1e-3, eps: float = 1e-8):
+                  eig_floor: float = 1e-12, eps: float = 1e-3):
         """Fit a frozen whitener from background pixels X.
 
         eig_floor : RELATIVE eigenvalue floor (× λ_max). CRITICAL for raw
@@ -154,14 +154,20 @@ class Whitening(nn.Module):
         Xc = X - mu
         Sigma = (Xc.T @ Xc) / max(len(X) - 1, 1)
         Sigma = (Sigma + Sigma.T) / 2
+        # print(f"Whitening: mode={mode}, eig_floor={eig_floor}, eps={eps}, ")
         if mode == "cholesky":
             W = np.linalg.inv(np.linalg.cholesky(
                 Sigma + eps * np.eye(Sigma.shape[0])))
         else:
             evals, evecs = np.linalg.eigh(Sigma)
+            # print(f"  evals: min={evals.min():.3e}, max={evals.max():.3e}, mean={evals.mean():.3e}")
             floor = max(float(evals.max()) * eig_floor, eps)
             evals = np.clip(evals, floor, None)
             inv_sqrt = np.diag(1.0 / np.sqrt(evals))
+            # make W diagonal matrix:
+            I = np.eye(len(evals))
+            # W = (I @ inv_sqrt @ I) if mode == "zca" else (inv_sqrt @ I)
+            # print(W)
             W = (inv_sqrt @ evecs.T) if mode == "pca" else (evecs @ inv_sqrt @ evecs.T)
         return cls(mu.astype(np.float32), W.astype(np.float32))
 

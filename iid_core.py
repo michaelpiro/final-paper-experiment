@@ -81,7 +81,7 @@ def _make_whitening(train_raw, cfg):
     """Frozen ZCA whitener fit on the RAW training pool (relative eigen-floor)."""
     return Whitening.from_data(np.asarray(train_raw, dtype=np.float32),
                                mode=cfg.get('whiten_mode', 'zca'),
-                               eig_floor=float(cfg.get('whiten_eig_floor', 1e-3)))
+                               eig_floor=float(cfg.get('whiten_eig_floor', 1e-12)))
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +474,8 @@ def run_iid(cfg: dict, mode: str):
     H, W, D_RAW = data.shape
     gt_flat = gt.flatten()
     print(f"Image {H}x{W}x{D_RAW}  (RAW band space, no PCA)", flush=True)
+    for cls_id in sorted(np.unique(gt_flat).tolist()):
+        print(f"  class {int(cls_id):>2}: {int((gt_flat == cls_id).sum()):>6} px", flush=True)
 
     bkg_raw, tgt_raw = build_pools(data, gt_flat, cfg, mode)
     s_raw = tgt_raw.mean(axis=0).astype(np.float32)

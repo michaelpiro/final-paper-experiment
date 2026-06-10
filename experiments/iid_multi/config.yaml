@@ -8,13 +8,13 @@
 dataset: data/pavia-u.mat
 norm_mode: none                # RAW sensor values — no scaling (no PCA anywhere)
 whiten_mode: zca               # frozen whitening first layer: zca | pca | cholesky
-whiten_eig_floor:      0.0000000000000001  # DSM floor  (× λ_max) — keep nearly all directions
+whiten_eig_floor:      0.01  # DSM floor  (× λ_max) — keep nearly all directions
 lrao_whiten_eig_floor: 0.01               # LRao floor (× λ_max) — cut near-zero dirs to keep C_Ψ invertible
 
 # ----- target + background -----
-target_cls: 1                  # detect this class (trees)
+target_cls: 6                  # detect this class (trees)
 bkg_cls: null                  # ignored in multi — all other classes form background
-exclude_classes: [0]           # leave [] to include class 0 (unlabeled) in background
+exclude_classes: [2,0,9]           # leave [] to include class 0 (unlabeled) in background
 
 # ----- planted target (additive) -----
 amplitude: 0.15
@@ -28,8 +28,10 @@ n_train_list: [
   200,
   500,
   1000,
-
-  2000
+  2000,
+  4000,
+  6000,
+  8000,
 ]   # vs-n  (at rho = dsm_sigma_rho)
 rho_list: [
   0.00001, 0.001, 0.007,0.01,0.07, 0.1,0.5, 1.0,3.0,10.0
@@ -41,20 +43,20 @@ pfa: 0.1                       # Pd @ this Pfa
 pauc_fpr: 0.1                  # partial AUC over Pfa < this
 
 # ----- score network architecture (DSM + LRao share this) -----
-hidden_dims: [256]
-activation: silu
+hidden_dims: [128, 128]
+activation: relu
 
 # ----- training budgets -----
 dsm_epochs: 2000
-lrao_epochs: 10
+lrao_epochs: 0
 
 # ----- optimizer (DSM, LRao) -----
 lr: 0.0005
-weight_decay: 0.00005
-batch_size: 256
+weight_decay: 0.0000005
+batch_size: 512
 
 # ----- DSM specifics -----
-dsm_sigma_rho: 0.5            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
+dsm_sigma_rho: 0.1            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
 
 # ----- LRao Mode-2 specifics -----
 lfi_delta_theta: 0.01
@@ -66,8 +68,9 @@ gmm_K: 9
 
 # ----- reproducibility -----
 seed: [
-  42,
-  43, 44, 45, 46
+#  42,
+  43,
+  44, 45, 46
 ]   # list of seeds for multiple runs (with different train/test splits)
 
 # ----- output -----

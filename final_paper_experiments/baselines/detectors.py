@@ -42,10 +42,11 @@ def amf(test_data: np.ndarray, train_data: np.ndarray,
     Sigma = np.cov(train_data, rowvar=False)
     Sigma = (Sigma + Sigma.T) / 2
     eigv, eigvec = np.linalg.eigh(Sigma)
-    eigv = np.clip(eigv, eigv.max() * 1e-12, None)
+    # print("AMF: min eigv = %.2e, max eigv = %.2e" % (eigv.min(), eigv.max()))
+    eigv = np.clip(eigv, eigv.max() * 1e-18, None)
     Si   = eigvec @ np.diag(1.0 / eigv) @ eigvec.T
     Si_s = Si @ s
-    norm = np.sqrt(float(s @ Si_s) + 1e-12)
+    norm = np.sqrt(float(s @ Si_s) + 1e-18)
     return (test_data - mu) @ Si_s / norm
 
 

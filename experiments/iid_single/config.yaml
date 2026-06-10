@@ -15,7 +15,7 @@ lrao_whiten_eig_floor: 0.01               # LRao floor (× λ_max) — cut near-
 
 # ----- classes (single-class: ONE background class vs ONE target class) -----
 bkg_cls: 2                     # asphalt
-target_cls: 1                  # trees
+target_cls: 4                  # trees
 exclude_classes: []
 
 # ----- planted target (additive) -----
@@ -33,7 +33,7 @@ n_train_list: [
 rho_list: [
   0.00001, 0.001, 0.007,0.01,0.07, 0.1,0.5, 1.0,3.0,10.0
 ]
-n_fixed_for_rho: 1000           # n used for the vs-rho sweep
+n_fixed_for_rho: 400           # n used for the vs-rho sweep
 
 # ----- metric operating points -----
 pfa: 0.1                       # Pd @ this Pfa
@@ -45,12 +45,12 @@ activation: silu
 
 # ----- training budgets -----
 dsm_epochs: 2000
-lrao_epochs: 10
+lrao_epochs: 50
 
 # ----- optimizer (DSM, LRao) -----
 lr: 0.0005
 weight_decay: 0.00005
-batch_size: 256
+batch_size: 512
 
 # ----- DSM specifics -----
 dsm_sigma_rho: 0.5            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
