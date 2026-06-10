@@ -78,10 +78,14 @@ from dsm_model import (
 
 
 def _make_whitening(train_raw, cfg):
-    """Frozen ZCA whitener fit on the RAW training pool (relative eigen-floor)."""
+    """Frozen ZCA whitener fit on the RAW training pool.
+
+    Default eig_floor=0 → Marchenko–Pastur adaptive floor (recommended).
+    Set whiten_eig_floor > 0 in config to override with a fixed relative floor.
+    """
     return Whitening.from_data(np.asarray(train_raw, dtype=np.float32),
                                mode=cfg.get('whiten_mode', 'zca'),
-                               eig_floor=float(cfg.get('whiten_eig_floor', 1e-12)))
+                               eig_floor=float(cfg.get('whiten_eig_floor', 0.0)))
 
 
 # ---------------------------------------------------------------------------

@@ -138,36 +138,60 @@ class Whitening(nn.Module):
 
     @classmethod
     def from_data(cls, X: np.ndarray, mode: str = "zca",
-                  eig_floor: float = 1e-12, eps: float = 1e-3):
+                  eig_floor: float = 0.0, eps: float = 1e-6):
         """Fit a frozen whitener from background pixels X.
 
-        eig_floor : RELATIVE eigenvalue floor (× λ_max). CRITICAL for raw
-            hyperspectral data whose covariance spans many orders of magnitude:
-            tiny-variance band directions would otherwise be amplified by
-            1/√(λ→0) and blow up the whitened representation. Flooring at
-            λ_max·eig_floor caps the whitening gain (this is "the whitening
-            problem" — an absolute floor is wrong on raw 103-band data).
-        eps : tiny absolute jitter for PSD safety (cholesky path).
+        eig_floor : Eigenvalue floor mode.
+            0.0  (default) — Marchenko–Pastur adaptive floor.
+                 Clips eigenvalues that are statistically indistinguishable
+                 from pure sampling noise given the n/D aspect ratio:
+                     floor = median(λ) · (1 + √(D/n))²
+                 Automatically near-zero at large n, more aggressive at
+                 small n, handles the null-space (n < D) correctly.
+            > 0  — Fixed relative override: floor = eig_floor × λ_max.
+                 Useful when you want a predictable manual floor (e.g.
+                 lrao_whiten_eig_floor = 0.01 to keep C_Ψ invertible).
+        eps : absolute minimum floor — safety guard against 1/0.
         """
         X = np.asarray(X, dtype=np.float64)
+        n, D = X.shape
         mu = X.mean(0)
         Xc = X - mu
-        Sigma = (Xc.T @ Xc) / max(len(X) - 1, 1)
+        Sigma = (Xc.T @ Xc) / max(n - 1, 1)
         Sigma = (Sigma + Sigma.T) / 2
-        # print(f"Whitening: mode={mode}, eig_floor={eig_floor}, eps={eps}, ")
         if mode == "cholesky":
             W = np.linalg.inv(np.linalg.cholesky(
-                Sigma + eps * np.eye(Sigma.shape[0])))
+                Sigma + eps * np.eye(D)))
         else:
-            evals, evecs = np.linalg.eigh(Sigma)
-            # print(f"  evals: min={evals.min():.3e}, max={evals.max():.3e}, mean={evals.mean():.3e}")
-            floor = max(float(evals.max()) * eig_floor, eps)
+            evals, evecs = np.linalg.eigh(Sigma)   # ascending order
+            if eig_floor > 0:
+                # Manual: fixed relative floor × λ_max
+                floor = max(float(evals.max()) * eig_floor, eps)
+            else:
+                # Marchenko–Pastur adaptive floor — two regimes:
+                #
+                # n ≥ D  (full-rank covariance):  all D directions are
+                #   data-supported and well-estimated.  Use only a tiny
+                #   absolute floor (eps) so no information is discarded.
+                #
+                # n < D  (rank-deficient):  D−(n−1) directions are pure
+                #   null-space.  Apply the MP upper edge
+                #       λ₊ = σ² (1 + √(D/n))²
+                #   to suppress both the null-space (λ≈0) and the poorly-
+                #   estimated low-variance directions.  σ² is estimated as
+                #   the MEDIAN of the non-trivial eigenvalues (robust to the
+                #   few large signal eigenvalues that would inflate the mean).
+                n_eff = max(n - 1, 1)
+                if n_eff >= D:
+                    # Full-rank: keep everything; tiny floor for 1/0 safety.
+                    floor = eps
+                else:
+                    gamma  = float(D) / n_eff       # aspect ratio D/n > 1
+                    pos    = evals[evals > eps]      # non-trivial eigenvalues
+                    sigma2 = float(np.median(pos)) if len(pos) > 0 else eps
+                    floor  = max(sigma2 * (1.0 + np.sqrt(gamma)) ** 2, eps)
             evals = np.clip(evals, floor, None)
             inv_sqrt = np.diag(1.0 / np.sqrt(evals))
-            # make W diagonal matrix:
-            I = np.eye(len(evals))
-            # W = (I @ inv_sqrt @ I) if mode == "zca" else (inv_sqrt @ I)
-            # print(W)
             W = (inv_sqrt @ evecs.T) if mode == "pca" else (evecs @ inv_sqrt @ evecs.T)
         return cls(mu.astype(np.float32), W.astype(np.float32))
 

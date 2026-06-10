@@ -10,7 +10,7 @@
 dataset: data/pavia-u.mat
 norm_mode: none                # RAW sensor values — no scaling (no PCA anywhere)
 whiten_mode: zca               # frozen whitening first layer: zca | pca | cholesky
-whiten_eig_floor:      0.0000000000000001  # DSM floor  (× λ_max) — keep nearly all directions
+whiten_eig_floor:      0      # DSM: 0 = Marchenko-Pastur adaptive floor (clips noise eigs only)
 lrao_whiten_eig_floor: 0.01               # LRao floor (× λ_max) — cut near-zero dirs to keep C_Ψ invertible
 
 # ----- classes (single-class: ONE background class vs ONE target class) -----

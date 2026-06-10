@@ -8,11 +8,11 @@
 dataset: data/pavia-u.mat
 norm_mode: none                # RAW sensor values — no scaling (no PCA anywhere)
 whiten_mode: zca               # frozen whitening first layer: zca | pca | cholesky
-whiten_eig_floor:      0.0001  # DSM floor  (× λ_max) — keep nearly all directions
-lrao_whiten_eig_floor: 0.01               # LRao floor (× λ_max) — cut near-zero dirs to keep C_Ψ invertible
+whiten_eig_floor:      0      # DSM: 0 = Marchenko-Pastur adaptive floor (clips noise eigs only)
+lrao_whiten_eig_floor: 0.00001               # LRao floor (× λ_max) — cut near-zero dirs to keep C_Ψ invertible
 
 # ----- target + background -----
-target_cls: 6                  # detect this class (trees)
+target_cls: 1                  # detect this class (trees)
 bkg_cls: null                  # ignored in multi — all other classes form background
 exclude_classes: [2,0,9]           # leave [] to include class 0 (unlabeled) in background
 
@@ -27,11 +27,11 @@ n_train_list: [
   40, 60, 100,
   200,
   500,
-  1000,
-  2000,
-  4000,
-  6000,
-  8000,
+#  1000,
+#  2000,
+#  4000,
+#  6000,
+#  8000,
 ]   # vs-n  (at rho = dsm_sigma_rho)
 rho_list: [
   0.00001, 0.001, 0.007,0.01,0.07, 0.1,0.5, 1.0,3.0,10.0
