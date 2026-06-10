@@ -52,6 +52,7 @@ os.chdir(_ROOT)
 import numpy as np
 import torch
 import yaml
+from scipy.ndimage import uniform_filter
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgb
@@ -97,7 +98,8 @@ HIT_MARK    = '#39ff14'   # lime — true detections
 
 # Fixed display order + colors for the detectors.
 DET_ORDER = [
-    'DSM', 'CF-Attn', 'CF-Attn-CFAR', 'NeighborMLP', 'NeighborRidge',
+    'DSM', 'CF-Attn', 'CF-Attn-CFAR',
+    'NeighborMLP', 'NeighborMLP-CFAR', 'NeighborRidge', 'NeighborRidge-CFAR',
     'AMF', 'AMF-local',
     # 'CEM', 'CEM-local',
     'GMM-Levin'
@@ -107,13 +109,18 @@ DET_COLORS = {
     'CF-Attn': '#aec7e8',
     'CF-Attn-CFAR': '#1f77b4',
     'NeighborMLP': '#2ca02c',
+    'NeighborMLP-CFAR': '#006d2c',
     'NeighborRidge': '#17becf',
+    'NeighborRidge-CFAR': '#0e6b78',
     'AMF': '#9467bd',
     'AMF-local': '#c5b0d5',
     'CEM': '#8c564b',
     'CEM-local': '#e7969c',
     'GMM-Levin': '#e377c2',
 }
+
+# Detectors that get a local-CFAR (windowed score-map normalization) sibling.
+CFAR_BASE = ['NeighborMLP', 'NeighborRidge']
 
 # Pfa levels for the false-alarm overlays.
 PFA_LEVELS = [0.01, 0.05, 0.10]
@@ -132,6 +139,9 @@ DEFAULT_CFG = dict(
     k=5,
     local_scm_loading=1e-8,
     baseline_eig_floor=1e-12,
+    # local-CFAR (windowed score-map normalization) for NeighborMLP/Ridge
+    cfar_bg_window=11,   # background window side (odd)
+    cfar_guard=3,        # guard window side (odd, excluded from the bg stats)
     # CF-Attn
     cfattn_h=64, cfattn_K=9, cfattn_epochs=300, cfattn_lr=3e-4, cfattn_eps=1e-4,
     lam_ent=0.05, lam_div=0.05, lam_cov=1e-5,
@@ -214,6 +224,36 @@ def _pick_foreign_class(gt, present):
     if not cand:
         return None
     return max(cand, key=lambda c: int((gt == c).sum()))
+
+
+def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6):
+    """Local-CFAR normalization of a projected-score MAP (paper Eq 70/80).
+
+    Standardize each pixel by the LOCAL mean/std of the score over a bg×bg
+    window EXCLUDING a guard×guard center (so the cell / a target can't inflate
+    its own background estimate):
+
+        T_i = (q_i - mean_annulus(q)) / (std_annulus(q) + eps)
+
+    This is the 1-D ("along s") empirical local Fisher: a scalar variance of the
+    already-projected score, so there is NO matrix inverse and NO rank/loading
+    issue (unlike the SCM detectors). Cheap windowed stats via uniform_filter.
+    """
+    H, W = shape
+    q = np.asarray(flat_scores, dtype=np.float64).reshape(H, W)
+    nb, ng = bg * bg, (guard * guard if guard and guard > 0 else 0)
+    m_bg  = uniform_filter(q,     size=bg, mode='reflect')
+    s2_bg = uniform_filter(q * q, size=bg, mode='reflect')
+    if ng > 0:
+        m_g  = uniform_filter(q,     size=guard, mode='reflect')
+        s2_g = uniform_filter(q * q, size=guard, mode='reflect')
+    else:
+        m_g = s2_g = 0.0
+    denom = max(nb - ng, 1)
+    mean_a = (nb * m_bg - ng * m_g) / denom          # annulus mean
+    e2_a   = (nb * s2_bg - ng * s2_g) / denom         # annulus E[q^2]
+    std_a  = np.sqrt(np.maximum(e2_a - mean_a ** 2, 0.0)) + eps
+    return ((q - mean_a) / std_a).reshape(-1).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +399,18 @@ def run_detection(sig, sig_label, out_dir, ctx):
     test_scores = score_all(planted, te_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
     print("Scoring detectors (train, for CFAR thresholds) ...", flush=True)
     train_scores = score_all(tr_raw, tr_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
+
+    # ---- Local-CFAR siblings for the score nets (windowed score-map norm) ----
+    bg = int(cfg.get('cfar_bg_window', 11))
+    guard = int(cfg.get('cfar_guard', 3))
+    tr0, tr1, tc0, tc1 = ctx['train_box']
+    tr_shape = (tr1 - tr0, tc1 - tc0)
+    for base in CFAR_BASE:
+        if base in test_scores:
+            test_scores[base + '-CFAR'] = _cfar_normalize_map(
+                test_scores[base], (H_b, W_b), bg, guard)
+            train_scores[base + '-CFAR'] = _cfar_normalize_map(
+                train_scores[base], tr_shape, bg, guard)
 
     DETS = [d for d in DET_ORDER if d in test_scores]
     print(f"Active detectors: {DETS}", flush=True)

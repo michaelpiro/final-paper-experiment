@@ -33,6 +33,8 @@ n_budget:            null      # null = FULL train box (no subsampling);
 local_scm_loading:   1.0e-8    # AMF-local / CEM-local diagonal loading (≈ no loading)
 whiten_eig_floor:    1.0e-5    # OUR score nets' ZCA whitening floor (× λ_max)
 baseline_eig_floor:  1.0e-12   # AMF / CEM (baselines) covariance eigenvalue floor (× λ_max)
+cfar_bg_window:      11        # NeighborMLP/Ridge local-CFAR background window (odd)
+cfar_guard:          3         # local-CFAR guard window (odd; excluded from bg stats)
 
 # ------- CF-Attn -------
 cfattn_h:      128
