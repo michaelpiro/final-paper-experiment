@@ -138,18 +138,29 @@ class Whitening(nn.Module):
 
     @classmethod
     def from_data(cls, X: np.ndarray, mode: str = "zca",
-                  eig_floor: float = 0.0, eps: float = 1e-6):
+                  eig_floor: float = 0.0, eps: float = 1e2):
         """Fit a frozen whitener from background pixels X.
 
         eig_floor : Eigenvalue floor mode.
-            0.0  (default) — Marchenko–Pastur adaptive floor.
-                 Clips eigenvalues that are statistically indistinguishable
-                 from pure sampling noise given the n/D aspect ratio:
-                     floor = median(λ) · (1 + √(D/n))²
-                 Automatically near-zero at large n, more aggressive at
-                 small n, handles the null-space (n < D) correctly.
+            0.0  (default) — Spectral-gap adaptive floor.
+                 Scans the BOTTOM HALF of the positive eigenvalue spectrum
+                 for the first large multiplicative jump (≥ 100×).  If one
+                 is found, the floor is set at the top of the bottom cluster
+                 (i.e. the eigenvalue just below the gap).  If no large gap
+                 exists the floor is ``eps`` — smooth spectra keep all
+                 directions.
+
+                 Examples:
+                   [1e7,…,1e0, 1e-3, 1e-6,1e-6,1e-6]
+                       → gap 1e-6→1e-3 is 1000×  → floor = 1e-6
+                   null-space (n < D):
+                       near-zero eigenvalues excluded from scan,
+                       automatically clipped to eps = 1e-6
+                   smooth spectrum (n >> D):
+                       no gap ≥ 100× in the bottom half → floor = eps
+
             > 0  — Fixed relative override: floor = eig_floor × λ_max.
-                 Useful when you want a predictable manual floor (e.g.
+                 Useful for a predictable manual floor (e.g.
                  lrao_whiten_eig_floor = 0.01 to keep C_Ψ invertible).
         eps : absolute minimum floor — safety guard against 1/0.
         """
@@ -168,28 +179,32 @@ class Whitening(nn.Module):
                 # Manual: fixed relative floor × λ_max
                 floor = max(float(evals.max()) * eig_floor, eps)
             else:
-                # Marchenko–Pastur adaptive floor — two regimes:
+
+                # # Spectral-gap adaptive floor.
+                # #
+                # # Look for a large multiplicative jump in the BOTTOM HALF of
+                # # the positive eigenvalue sequence (ascending).  A gap ≥ 100×
+                # # indicates a natural noise floor (null-space boundary or a
+                # # genuine low-eigenvalue cluster).  Searching only the bottom
+                # # half avoids being misled by large gaps in the signal part of
+                # # the spectrum.  The floor is set to the eigenvalue just below
+                # # the gap (top of the bottom cluster).
+                # #
+                # # Null-space directions (eigenvalue ≤ 0) are excluded from the
+                # # scan; np.clip raises them to eps automatically.
+                # _GAP = 100.0                          # 2 log10 decades
+                # pos  = evals[evals > 0]               # ascending positive evals
+                # floor = eps
+                floor = max(float(evals[-1]*1e-5),eps)
+                # if len(pos) >= 2:
+                #     # third   = max(len(pos) // 8, 1)
+                #     bottom = pos[2:]            # bottom-half + 1 element
+                #     if len(bottom) >= 2:
+                #         ratios = bottom[1:] / bottom[:-1]
+                #         i_gap  = int(np.argmax(ratios))
+                #         if ratios[i_gap] >= _GAP:
                 #
-                # n ≥ D  (full-rank covariance):  all D directions are
-                #   data-supported and well-estimated.  Use only a tiny
-                #   absolute floor (eps) so no information is discarded.
-                #
-                # n < D  (rank-deficient):  D−(n−1) directions are pure
-                #   null-space.  Apply the MP upper edge
-                #       λ₊ = σ² (1 + √(D/n))²
-                #   to suppress both the null-space (λ≈0) and the poorly-
-                #   estimated low-variance directions.  σ² is estimated as
-                #   the MEDIAN of the non-trivial eigenvalues (robust to the
-                #   few large signal eigenvalues that would inflate the mean).
-                n_eff = max(n - 1, 1)
-                if n_eff >= D:
-                    # Full-rank: keep everything; tiny floor for 1/0 safety.
-                    floor = eps
-                else:
-                    gamma  = float(D) / n_eff       # aspect ratio D/n > 1
-                    pos    = evals[evals > eps]      # non-trivial eigenvalues
-                    sigma2 = float(np.median(pos)) if len(pos) > 0 else eps
-                    floor  = max(sigma2 * (1.0 + np.sqrt(gamma)) ** 2, eps)
+                #             floor = max(float(bottom[i_gap]), eps)
             evals = np.clip(evals, floor, None)
             inv_sqrt = np.diag(1.0 / np.sqrt(evals))
             W = (inv_sqrt @ evecs.T) if mode == "pca" else (evecs @ inv_sqrt @ evecs.T)

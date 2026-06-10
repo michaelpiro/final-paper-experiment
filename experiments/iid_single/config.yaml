@@ -10,7 +10,7 @@
 dataset: data/pavia-u.mat
 norm_mode: none                # RAW sensor values — no scaling (no PCA anywhere)
 whiten_mode: zca               # frozen whitening first layer: zca | pca | cholesky
-whiten_eig_floor:      0      # DSM: 0 = Marchenko-Pastur adaptive floor (clips noise eigs only)
+whiten_eig_floor:      0      # DSM: 0 = spectral-gap adaptive floor (detects natural noise floor)
 lrao_whiten_eig_floor: 0.01               # LRao floor (× λ_max) — cut near-zero dirs to keep C_Ψ invertible
 
 # ----- classes (single-class: ONE background class vs ONE target class) -----
@@ -25,13 +25,10 @@ test_size: 2000
 
 # ----- sweep axes -----
 # Full paper sweep — trim for quick tests by editing the lists below
-n_train_list: [
-    20,
-    40, 60, 100, 200, 500, 1000, 2000
-]
+n_train_list: [20,40, 60, 100, 200, 500, 1000, 2000,4000]
 
 rho_list: [
-  0.00001, 0.001, 0.007,0.01,0.07, 0.1,0.5, 1.0,3.0,10.0
+  0.00001, 0.001, 0.005,0.01,0.3,0.5,0.07, 0.1,0.5, 1.0,3.0,10.0
 ]
 n_fixed_for_rho: 400           # n used for the vs-rho sweep
 
@@ -53,7 +50,7 @@ weight_decay: 0.00005
 batch_size: 512
 
 # ----- DSM specifics -----
-dsm_sigma_rho: 0.5            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
+dsm_sigma_rho: 0.1            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
 
 # ----- LRao Mode-2 specifics -----
 lfi_delta_theta: 0.01

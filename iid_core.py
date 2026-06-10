@@ -80,7 +80,7 @@ from dsm_model import (
 def _make_whitening(train_raw, cfg):
     """Frozen ZCA whitener fit on the RAW training pool.
 
-    Default eig_floor=0 → Marchenko–Pastur adaptive floor (recommended).
+    Default eig_floor=0 → spectral-gap adaptive floor (recommended).
     Set whiten_eig_floor > 0 in config to override with a fixed relative floor.
     """
     return Whitening.from_data(np.asarray(train_raw, dtype=np.float32),
@@ -288,7 +288,7 @@ def score_lrao(model, train_lat, test_lat, s_lat, cfg):
 #   DLTD/SMGLRT: shared-cov K-component GMM GLRT variants (Ma 2025/2026)
 #                K clamped to ≥ 3 (K=1 is degenerate constant score)
 CLASSICAL_DETS_SINGLE = ['AMF']
-CLASSICAL_DETS_MULTI  = ['AMF', 'GMM-Levin', 'DLTD', 'SMGLRT']
+CLASSICAL_DETS_MULTI  = ['AMF', 'GMM-Levin']
 
 
 def run_classical_additive(train_raw, test_planted, s_raw, reg_sigma, cfg, mode):
