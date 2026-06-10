@@ -328,26 +328,32 @@ def run_detection(sig, sig_label, out_dir, ctx):
 
     # ---- Figures ----
     print("Saving figures ...", flush=True)
+    train_box = ctx['train_box']
+    r0t, r1t, c0t, c1t = train_box
     fc = _false_color(data_norm, test_box)
+    fc_tr = _false_color(data_norm, train_box)
     lm = _gt_colorimage(gt[r0:r1, c0:c1])
+    lm_tr = _gt_colorimage(gt[r0t:r1t, c0t:c1t])
     t_r, t_c = _rc(tgt_idx, W_b)
 
-    # false color (plain)
-    fig, ax = plt.subplots(figsize=FIGSIZE)
-    ax.imshow(fc); ax.axis('off')
-    ax.set_title(f'False color — scen {sidx}', fontsize=9)
+    # false color — TRAIN + TEST boxes
+    fig, axes = plt.subplots(1, 2, figsize=FIGSIZE)
+    axes[0].imshow(fc_tr); axes[0].axis('off'); axes[0].set_title('TRAIN box', fontsize=9)
+    axes[1].imshow(fc);    axes[1].axis('off'); axes[1].set_title('TEST box', fontsize=9)
+    fig.suptitle(f'False color — scen {sidx}', fontsize=11)
     _savefig(fig, os.path.join(out_dir, 'false_color.pdf'))
 
-    # (1) label map + target locations (cyan, not a label color)
-    fig, ax = plt.subplots(figsize=FIGSIZE)
-    ax.imshow(lm); ax.axis('off')
-    ax.scatter(t_c, t_r, s=12, facecolors='none', edgecolors=TARGET_MARK, linewidths=0.8)
-    present = sorted(np.unique(te_gt))
+    # (1) label maps — TRAIN + TEST (targets overlaid on TEST only)
+    fig, axes = plt.subplots(1, 2, figsize=FIGSIZE)
+    axes[0].imshow(lm_tr); axes[0].axis('off'); axes[0].set_title('TRAIN box', fontsize=9)
+    axes[1].imshow(lm);    axes[1].axis('off'); axes[1].set_title('TEST box + targets', fontsize=9)
+    axes[1].scatter(t_c, t_r, s=12, facecolors='none', edgecolors=TARGET_MARK, linewidths=0.8)
+    present = sorted(set(np.unique(te_gt)) | set(np.unique(gt[r0t:r1t, c0t:c1t])))
     handles = [mpatches.Patch(color=CLS_COLORS_HEX.get(int(c), '#777'),
                               label=CLS_NAMES.get(int(c), f'cls{c}')) for c in present]
     handles.append(Line2D([], [], marker='o', ls='', mfc='none', mec=TARGET_MARK, label='target'))
-    ax.legend(handles=handles, fontsize=6, loc='upper right', framealpha=0.75, ncol=2)
-    ax.set_title(f'Label map + targets — {sig_label}', fontsize=9)
+    axes[1].legend(handles=handles, fontsize=6, loc='upper right', framealpha=0.75, ncol=2)
+    fig.suptitle(f'Label map — {sig_label}', fontsize=11)
     _savefig(fig, os.path.join(out_dir, 'label_map_targets.pdf'))
 
     # (7) class signatures + target signature
@@ -363,7 +369,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
     ax.legend(fontsize=6, ncol=2)
     _savefig(fig, os.path.join(out_dir, 'signatures.pdf'))
 
-    # (2) detection score maps + target locations (cyan)
+    # (2) detection score maps (no target overlay)
     ncol = 3
     nrow = int(np.ceil(len(DETS) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=FIGSIZE)
@@ -372,12 +378,11 @@ def run_detection(sig, sig_label, out_dir, ctx):
         smap = scores_to_spatial_map(test_scores[det], te_idx, (H_b, W_b))
         ax = axes[j]
         im = ax.imshow(smap, cmap='inferno'); ax.axis('off')
-        ax.scatter(t_c, t_r, s=9, facecolors='none', edgecolors=TARGET_MARK, linewidths=0.6)
         ax.set_title(f'{det}  (AUC={roc_curves[det][2]:.3f})', fontsize=8)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     for j in range(len(DETS), len(axes)):
         axes[j].axis('off')
-    fig.suptitle(f'Detection maps + targets — {sig_label}', fontsize=11)
+    fig.suptitle(f'Detection maps — {sig_label}', fontsize=11)
     fig.tight_layout()
     _savefig(fig, os.path.join(out_dir, 'detection_maps.pdf'))
 
@@ -557,7 +562,8 @@ def main():
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
                tr_raw=tr_raw, tr_nbr=tr_nbr, te_raw=te_raw, te_nbr=te_nbr,
-               te_gt=te_gt, data_norm=data_norm, gt=gt, test_box=test_box, sidx=sidx)
+               te_gt=te_gt, data_norm=data_norm, gt=gt,
+               test_box=test_box, train_box=tr_box_eff, sidx=sidx)
 
     # ---- Run detection twice ----
     run_detection(sig_in, f'inpatch-{dom_name}', run_dir, ctx)
