@@ -32,12 +32,14 @@ n_train_list: [
   1000,
   2000,
   4000,
-#  8000,
+  8000,
+  16000,
+  24000
 ]   # vs-n  (at rho = dsm_sigma_rho)
 rho_list: [
   0.00001, 0.001, 0.005,0.01,0.3,0.5,0.07, 0.1,0.5, 1.0,3.0,10.0
 ]
-n_fixed_for_rho: 1000                                      # n used for the vs-rho sweep
+n_fixed_for_rho: 4000                                      # n used for the vs-rho sweep
 
 # ----- metric operating points -----
 pfa: 0.1                       # Pd @ this Pfa
