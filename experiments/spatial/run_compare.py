@@ -302,8 +302,18 @@ def run_detection(sig, sig_label, out_dir, ctx):
             'Pfa_max': float(np.nanmax(pfa_vals)),
         })
 
+    # ---- Per-class Pfa columns (ALL classes incl. 0, ordered by class id) ----
+    name_to_id = {v: k for k, v in CLS_NAMES.items()}
+    all_cls = sorted({c for d in DETS for c in pfa_per_class[d]},
+                     key=lambda nm: name_to_id.get(nm, 999))
+    for r in rows:
+        pcf = pfa_per_class[r['Detector']]
+        for nm in all_cls:
+            r[f'Pfa[{nm}]'] = float(pcf.get(nm, 0.0))
+
     # ---- Summary table ----
-    cols = ['Detector', 'pAUC@0.05', 'AUC', 'Pd@Pfa=0.05', 'Pfa_avg', 'Pfa_max']
+    cols = (['Detector', 'pAUC@0.05', 'AUC', 'Pd@Pfa=0.05', 'Pfa_avg', 'Pfa_max']
+            + [f'Pfa[{nm}]' for nm in all_cls])
     with open(os.path.join(out_dir, 'summary_table.csv'), 'w') as f:
         f.write(','.join(cols) + '\n')
         for r in rows:
