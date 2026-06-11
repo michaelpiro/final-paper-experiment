@@ -549,8 +549,9 @@ def run_iid(cfg: dict, mode: str):
     def _train_score_models(train_raw_n, cfg_rho, tag):
         """Train all DSM variants + LRao on train_raw_n; return score dict."""
         scores = {}
-        # --- primary DSM ---
-        scores['DSM'] = _train_dsm_variant(train_raw_n, cfg_rho, 'DSM', tag)
+        # --- primary DSM (label from cfg['dsm_label'], NOT hardcoded 'DSM') ---
+        scores[_dsm_names[0]] = _train_dsm_variant(
+            train_raw_n, cfg_rho, _dsm_names[0], tag)
         # --- secondary DSM (if configured) ---
         if len(_dsm_names) > 1:
             label2 = _dsm_names[1]
@@ -618,7 +619,8 @@ def run_iid(cfg: dict, mode: str):
         t0 = time.time()
         cfg_rho = {**cfg, 'dsm_sigma_rho': float(rho)}
         tag_rho = f'rho{rho}_n{n_fixed}'
-        dsm_scores_rho = {'DSM': _train_dsm_variant(tr_f, cfg_rho, 'DSM', tag_rho)}
+        dsm_scores_rho = {_dsm_names[0]: _train_dsm_variant(
+            tr_f, cfg_rho, _dsm_names[0], tag_rho)}
         if len(_dsm_names) > 1:
             label2 = _dsm_names[1]
             cfg2 = {**cfg_rho,
