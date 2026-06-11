@@ -3,12 +3,12 @@ run_compare.py — Focused spatial detector comparison (single scenario).
 
 Detectors
 ---------
-  DSM            — our global per-pixel score (ScoreNet, no spatial context)
-  LinearDSM      — neighbor-adapted LINEAR score (ridge regression head, paper §6.1)
-  NeighborMLP    — spatial denoiser score net                    (Ours, spatial)
-  AMF            — Adaptive Matched Filter (global SCM)
-  AMF-local      — AMF on the per-pixel k×k window SCM (same window as spatial nets)
-  GMM-Levin      — Levin product-GMM GLRT
+  DSM               — global per-pixel score (ScoreNet, no spatial context)
+  NeighborMLP       — spatial denoiser score net                 (Ours, spatial)
+  NeighborMLP-CFAR  — NeighborMLP with local kNN-Fisher normalization
+  AMF               — Adaptive Matched Filter (global SCM)
+  AMF-local         — AMF on the per-pixel k×k window SCM
+  GMM-Levin         — Levin product-GMM GLRT
 
 Deep nets train on GPU (cuda) when available.
 
@@ -67,15 +67,12 @@ from final_paper_experiments.evaluation import (
 from dsm_model import ScoreNet, dsm_loss
 from neighbor_mlp_model import NeighborMLPDenoiser, score_nmlp_additive, neighbor_mlp_dsm_loss
 from local_detectors import amf_cem_local_scm, amf_global
-from final_paper_experiments.models.neighbor_adapted import (
-    NeighborAdaptedScore, dsm_loss as ridge_dsm_loss, adapted_score_field,
-)
 from tqdm import tqdm
 
 # Shared helpers from the main runner.
 from run_colab import (
     _crop_pca_box,
-    _make_whitening, _whiten_np, _whitened_sigma, _placeholder_whitening,
+    _make_whitening, _whitened_sigma, _placeholder_whitening,
 )
 
 CLS_NAMES = {
@@ -97,19 +94,19 @@ HIT_MARK    = '#39ff14'   # lime — true detections
 # Fixed display order + colors for the detectors.
 DET_ORDER = [
     'DSM',
-    'LinearDSM',
     'NeighborMLP',
+    'NeighborMLP-CFAR',
     'AMF',
     'AMF-local',
     'GMM-Levin',
 ]
 DET_COLORS = {
-    'DSM':        '#ff7f0e',   # orange
-    'LinearDSM':  '#17becf',   # teal
-    'NeighborMLP':'#2ca02c',   # green
-    'AMF':        '#9467bd',   # purple
-    'AMF-local':  '#c5b0d5',   # light purple
-    'GMM-Levin':  '#e377c2',   # pink
+    'DSM':              '#ff7f0e',   # orange
+    'NeighborMLP':      '#2ca02c',   # green
+    'NeighborMLP-CFAR': '#006d2c',   # dark green
+    'AMF':              '#9467bd',   # purple
+    'AMF-local':        '#c5b0d5',   # light purple
+    'GMM-Levin':        '#e377c2',   # pink
 }
 
 # Pfa levels for the false-alarm overlays.
@@ -132,11 +129,10 @@ DEFAULT_CFG = dict(
     # NeighborMLP — encoder: D→enc_hidden→d_lat ; denoiser: (D+(K+1)*d_lat)→score_hidden→D
     nmlp_d_lat=16, nmlp_K=8, nmlp_enc_hidden=[128, 64], nmlp_score_hidden=[128],
     nmlp_epochs=1000, nmlp_lr=3e-4, nmlp_batch=256,
+    # NeighborMLP-CFAR local normalization
+    cfar_bg_window=11, cfar_guard=3, cfar_lam=0.0,
     # DSM
     dsm_hidden=[64, 64], dsm_epochs=1000, dsm_lr=5e-4,
-    # LinearDSM (neighbor-adapted ridge score head, paper §6.1)
-    ridge_M=256, ridge_hidden=[128, 128], ridge_lam_init=0.1,
-    ridge_epochs=1000, ridge_lr=3e-4, ridge_batch=256, ridge_n_mc=8,
     # shared
     activation='silu', dsm_sigma_rho=0.01,
     whiten_mode='zca', whiten_eig_floor=1e-5,
@@ -148,8 +144,8 @@ DEFAULT_CFG = dict(
 )
 
 DRYRUN_OVERRIDES = dict(
-    nmlp_epochs=8, dsm_epochs=20, ridge_epochs=8, ridge_n_mc=2,
-    nmlp_K=4, ridge_M=64,
+    nmlp_epochs=8, dsm_epochs=20,
+    nmlp_K=4,
     n_budget=400,   # dry-run only: contiguous side-crop for speed (still spatial)
 )
 
@@ -329,7 +325,8 @@ def _train_dsm_best(tr_raw, cfg, device):
             best_state = copy.deepcopy(net.state_dict())
         if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
             print(f"    [DSM] epoch {ep+1}/{E}  loss={last:.4f}  best={best_loss:.4f}", flush=True)
-    net.load_state_dict(best_state)
+    if best_state is not None:
+        net.load_state_dict(best_state)
     net._final_loss = best_loss
     net.eval()
     return net
@@ -371,88 +368,11 @@ def _train_nmlp_best(tr_raw, tr_nbr, cfg, device):
         if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
             print(f"    [NeighborMLP] epoch {ep+1}/{E}  loss={last:.4f}  best={best_loss:.4f}",
                   flush=True)
-    nmlp.load_state_dict(best_state)
+    if best_state is not None:
+        nmlp.load_state_dict(best_state)
     nmlp._final_loss = best_loss
     nmlp.eval()
     return nmlp
-
-
-# ---------------------------------------------------------------------------
-# LinearDSM (NeighborRidge) — neighbor-adapted ridge score head (paper §6.1).
-# Shared encoder + global linear head W0 + per-pixel LOCAL head solved in closed
-# form by ridge regression over the k×k neighbors, shrinking toward W0 when the
-# neighborhood is uninformative (boundaries). Whitening is applied externally
-# (the model has no whitening hook), so it operates in whitened space and the
-# scores are mapped back to data space for detection.
-# ---------------------------------------------------------------------------
-
-def _train_ridge(tr_raw, tr_nbr, cfg, device, seed):
-    """Train LinearDSM (NeighborAdaptedScore) with best-epoch tracking."""
-    torch.manual_seed(seed)
-    D = tr_raw.shape[1]
-    W = _make_whitening(tr_raw, cfg, device)
-    sigma = _whitened_sigma(cfg)
-    Xc = torch.tensor(_whiten_np(W, tr_raw, device), dtype=torch.float32).to(device)
-    Xn = torch.tensor(_whiten_np(W, tr_nbr, device), dtype=torch.float32).to(device)
-    model = NeighborAdaptedScore(
-        D=D, M=int(cfg.get('ridge_M', 256)),
-        hidden=tuple(cfg.get('ridge_hidden', [128, 128])),
-        k=int(cfg['k']), lam_init=float(cfg.get('ridge_lam_init', 0.1))).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.get('ridge_lr', 3e-4)),
-                            weight_decay=cfg['weight_decay'])
-    P  = len(Xc)
-    bs = int(cfg.get('ridge_batch', 256))
-    E  = int(cfg.get('ridge_epochs', 1000))
-    best_loss, best_state = float('inf'), None
-    pbar = tqdm(range(E), desc='LinearDSM', dynamic_ncols=True, leave=False)
-    last = float('nan')
-    for ep in pbar:
-        perm = torch.randperm(P, device=device)
-        ep_loss = 0.0; nb = 0
-        for i in range(0, P, bs):
-            sel = perm[i:i + bs]
-            loss = ridge_dsm_loss(model, Xc[sel], Xn[sel], sigma)
-            opt.zero_grad(); loss.backward(); opt.step()
-            ep_loss += float(loss.item()); nb += 1
-        last = ep_loss / max(nb, 1)
-        pbar.set_postfix(loss=f'{last:.4f}')
-        if last < best_loss:
-            best_loss = last
-            best_state = copy.deepcopy(model.state_dict())
-        if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
-            print(f"    [LinearDSM] epoch {ep+1}/{E}  loss={last:.4f}  best={best_loss:.4f}",
-                  flush=True)
-    model.load_state_dict(best_state)
-    model._final_loss = best_loss
-    model._whitening = W
-    model.eval()
-    return model
-
-
-def score_ridge_additive(model, test_pix, test_nbr, train_pix, train_nbr, s, cfg):
-    """Additive LMP using the neighbor-adapted ridge score (same convention as
-    score_nmlp_additive). Scores are computed in whitened space, mapped to data
-    space, then normalized by the training-score covariance."""
-    W = model._whitening.cpu()
-    Wn = W.W.detach().cpu().numpy()                      # (D, D)
-    sigma = _whitened_sigma(cfg)
-    n_mc = int(cfg.get('ridge_n_mc', 8))
-    model.cpu().eval()
-
-    def _scores(pix, nbr):
-        cw = torch.tensor(_whiten_np(W, pix, 'cpu'), dtype=torch.float32)   # (B, D)
-        nw = torch.tensor(_whiten_np(W, nbr, 'cpu'), dtype=torch.float32)   # (B, K, D)
-        psi_w = adapted_score_field(model, cw, nw, sigma, n_mc=n_mc).numpy()  # (B, D) whitened
-        return psi_w @ Wn                                                    # data-space score
-
-    z_tr = _scores(train_pix, train_nbr)
-    z_te = _scores(test_pix,  test_nbr)
-    z_bar = z_tr.mean(axis=0)
-    C = np.cov(z_tr, rowvar=False)
-    if C.ndim == 0:
-        C = np.array([[float(C)]])
-    norm = float(np.sqrt(max(float(s @ C @ s), 1e-12)))
-    return -((z_te - z_bar) @ s) / norm
 
 
 def _savefig(fig, path):
@@ -480,8 +400,6 @@ def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
         out['DSM'] = dsm_additive(pix, tr_raw, models['dsm'], sig)
     if models.get('nmlp') is not None:
         out['NeighborMLP'] = score_nmlp_additive(models['nmlp'], pix, nbr, tr_raw, tr_nbr, sig)
-    if models.get('ridge') is not None:
-        out['LinearDSM'] = score_ridge_additive(models['ridge'], pix, nbr, tr_raw, tr_nbr, sig, cfg)
     out['AMF'] = amf_global(pix, tr_raw, sig, eig_floor=floor)
     amf_loc, _ = amf_cem_local_scm(
         pix, nbr, sig, device=device,
@@ -523,6 +441,19 @@ def run_detection(sig, sig_label, out_dir, ctx):
     test_scores = score_all(planted, te_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
     print("Scoring detectors (train, for CFAR thresholds) ...", flush=True)
     train_scores = score_all(tr_raw, tr_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
+
+    # ---- NeighborMLP-CFAR: local kNN-Fisher normalization ----
+    k_win = int(cfg['k'])
+    lam   = float(cfg.get('cfar_lam', 0.0))
+    tr0, tr1, tc0, tc1 = ctx['train_box']
+    tr_shape = (tr1 - tr0, tc1 - tc0)
+    if 'NeighborMLP' in test_scores and models.get('nmlp') is not None:
+        test_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
+            test_scores['NeighborMLP'], models['nmlp'], planted, te_nbr,
+            (H_b, W_b), k_win, cfar_lam=lam)
+        train_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
+            train_scores['NeighborMLP'], models['nmlp'], tr_raw, tr_nbr,
+            tr_shape, k_win, cfar_lam=lam)
 
     DETS = [d for d in DET_ORDER if d in test_scores]
     print(f"Active detectors: {DETS}", flush=True)
@@ -725,23 +656,23 @@ def run_detection(sig, sig_label, out_dir, ctx):
 # Keys safe to override when re-extracting from saved models (they don't change
 # the trained nets or the train/test boxes — only scoring / planting / plots).
 RELOAD_OVERRIDE_KEYS = [
-    'cfar_bg_window', 'cfar_guard', 'cfar_lam', 'pfa_target', 'amplitude', 'target_fraction',
-    'edge_guard', 'ridge_n_mc', 'gmm_steps', 'gmm_K', 'local_scm_loading', 'baseline_eig_floor',
+    'cfar_bg_window', 'cfar_guard', 'cfar_lam',
+    'pfa_target', 'amplitude', 'target_fraction', 'edge_guard',
+    'gmm_steps', 'gmm_K', 'local_scm_loading', 'baseline_eig_floor',
 ]
 
 
 def _save_models(run_dir, models, cfg, sidx, train_box, test_box):
     torch.save({
         'cfg': cfg, 'sidx': sidx, 'train_box': train_box, 'test_box': test_box,
-        'dsm':   models['dsm'].state_dict(),
-        'nmlp':  models['nmlp'].state_dict(),
-        'ridge': models['ridge'].state_dict(),
+        'dsm':  models['dsm'].state_dict(),
+        'nmlp': models['nmlp'].state_dict(),
     }, os.path.join(run_dir, 'models.pt'))
     print(f"  saved models -> {os.path.join(run_dir, 'models.pt')}", flush=True)
 
 
 def _build_models_from_ckpt(ckpt, D, cfg, device):
-    """Reconstruct the 3 nets and load their weights (incl. frozen whitening)."""
+    """Reconstruct DSM + NeighborMLP and load their weights (incl. frozen whitening)."""
     dsm = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'],
                    whitening=_placeholder_whitening(D))
     dsm.load_state_dict(ckpt['dsm']); dsm.to(device).eval()
@@ -756,14 +687,7 @@ def _build_models_from_ckpt(ckpt, D, cfg, device):
         whitening=_placeholder_whitening(D))
     nm.load_state_dict(ckpt['nmlp']); nm.to(device).eval()
 
-    rg = NeighborAdaptedScore(
-        D=D, M=int(cfg.get('ridge_M', 256)),
-        hidden=tuple(cfg.get('ridge_hidden', [128, 128])),
-        k=int(cfg['k']), lam_init=float(cfg.get('ridge_lam_init', 0.1)))
-    rg._whitening = _placeholder_whitening(D)
-    rg.load_state_dict(ckpt['ridge']); rg.to(device).eval()
-
-    return {'dsm': dsm, 'nmlp': nm, 'ridge': rg}
+    return {'dsm': dsm, 'nmlp': nm}
 
 
 # ---------------------------------------------------------------------------
@@ -884,10 +808,7 @@ def main():
         t0 = time.time()
         nmlp = _train_nmlp_best(tr_raw, tr_nbr, cfg, device)
         print(f"  NeighborMLP done ({time.time()-t0:.0f}s)  best loss={_fl(nmlp):.4f}", flush=True)
-        t0 = time.time()
-        ridge = _train_ridge(tr_raw, tr_nbr, cfg, device, seed)
-        print(f"  LinearDSM done ({time.time()-t0:.0f}s)  best loss={_fl(ridge):.4f}", flush=True)
-        models = {'dsm': dsm_net, 'nmlp': nmlp, 'ridge': ridge}
+        models = {'dsm': dsm_net, 'nmlp': nmlp}
         _save_models(run_dir, models, cfg, sidx, tr_box_eff, test_box)
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
@@ -996,10 +917,7 @@ def run_from_cfg(overrides: dict, dry_run: bool = False):
     t0 = time.time()
     nmlp = _train_nmlp_best(tr_raw, tr_nbr, cfg, device)
     print(f"  NeighborMLP done ({time.time()-t0:.0f}s)  best loss={_fl(nmlp):.4f}", flush=True)
-    t0 = time.time()
-    ridge = _train_ridge(tr_raw, tr_nbr, cfg, device, seed)
-    print(f"  LinearDSM done ({time.time()-t0:.0f}s)  best loss={_fl(ridge):.4f}", flush=True)
-    models = {'dsm': dsm_net, 'nmlp': nmlp, 'ridge': ridge}
+    models = {'dsm': dsm_net, 'nmlp': nmlp}
     _save_models(run_dir, models, cfg, sidx, tr_box_eff, test_box)
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
