@@ -471,11 +471,18 @@ def run_detection(sig, sig_label, out_dir, ctx):
         pfa_vals = list(pcf.values()) if pcf else [float('nan')]
         fpr, tpr, auc_v = roc_safe(labels, sc)
         roc_curves[det] = (fpr, tpr, auc_v)
+        # Pd at the *train* CFAR threshold (honest, deployable operating point):
+        # apply the threshold set on TRAIN scores to the test targets directly,
+        # unlike 'Pd@Pfa=0.05' which re-fits the operating point on the test ROC.
+        tgt_mask = (labels == 1)
+        pd_cfar = (float(np.mean(sc[tgt_mask] > thr[det][pfa_t]))
+                   if tgt_mask.any() else float('nan'))
         rows.append({
             'Detector': det,
             'pAUC@0.05': partial_auc(labels, sc, fpr_max=0.05),
             'AUC': auc_v,
             'Pd@Pfa=0.05': dr_at_fpr(labels, sc, fpr_list=(pfa_t,))[str(pfa_t)],
+            'Pd_cfar': pd_cfar,
             'Pfa_avg': float(np.nanmean(pfa_vals)),
             'Pfa_max': float(np.nanmax(pfa_vals)),
         })
@@ -490,7 +497,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
             r[f'Pfa[{nm}]'] = float(pcf.get(nm, 0.0))
 
     # ---- Summary table ----
-    cols = (['Detector', 'pAUC@0.05', 'AUC', 'Pd@Pfa=0.05', 'Pfa_avg', 'Pfa_max']
+    cols = (['Detector', 'pAUC@0.05', 'AUC', 'Pd@Pfa=0.05', 'Pd_cfar', 'Pfa_avg', 'Pfa_max']
             + [f'Pfa[{nm}]' for nm in all_cls])
     with open(os.path.join(out_dir, 'summary_table.csv'), 'w') as f:
         f.write(','.join(cols) + '\n')
