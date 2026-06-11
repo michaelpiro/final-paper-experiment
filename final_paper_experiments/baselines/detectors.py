@@ -106,8 +106,12 @@ def gmm_glrt(test_data: np.ndarray, train_data: np.ndarray,
     Fits a K-component GMM on train_data, then:
         T(y) = max_θ [log p(y − θs)] − log p(y)   (θ over [theta_min, theta_max])
     """
+    # scale-relative reg_covar: sklearn's absolute 1e-6 vanishes on raw HSI
+    # bands (variance ~1e4-1e6) -> singular component cov -> Cholesky SEGFAULT
+    # on macOS. Floor it to the data scale (cf. _fit_gmm_shared_cov).
+    rc = max(1e-3 * float(np.mean(np.var(train_data, axis=0))), 1e-6)
     gm = GaussianMixture(n_components=K, covariance_type='full',
-                         n_init=5, random_state=0)
+                         reg_covar=rc, n_init=5, random_state=0)
     gm.fit(train_data)
     log_p0   = gm.score_samples(test_data)            # (n_test,)
     thetas   = np.linspace(theta_min, theta_max, theta_steps)
@@ -133,8 +137,9 @@ def gmm_glrt_oracle(test_data: np.ndarray, train_data: np.ndarray,
         is therefore a valid upper bound. Do not use this function as the paper
         oracle — it can score BELOW the honest Levin curve.
     """
+    rc = max(1e-3 * float(np.mean(np.var(train_data, axis=0))), 1e-6)
     gm = GaussianMixture(n_components=K, covariance_type='full',
-                         n_init=5, random_state=0)
+                         reg_covar=rc, n_init=5, random_state=0)
     gm.fit(train_data)
     log_p0 = gm.score_samples(test_data)
     log_p1 = gm.score_samples(test_data - theta * s)

@@ -4,10 +4,17 @@
 # Like iid_single.yaml but: ONE target class, background = union of all
 # OTHER labeled classes (incl. class 0 / unlabeled unless excluded).
 # Same pipeline + sweeps; only the data/GMM hyperparams differ.
-
+device: cpu
+dsm_arch: mlp                # DSM score net. After VICReg the latent is a generic
+                             # learned representation, and a plain MLP fits the
+                             # score best (A/B at n=1000: mlp 0.891 > mixture 0.744
+                             # > resmlp 0.525 — resmlp's LayerNorm kills score
+                             # magnitude). Alternatives: 'mixture', 'resmlp'.
+dsm_n_experts: 16            # only used by arch='mixture' (affine experts; >= gmm_K)
 dataset: data/pavia-u.mat
 norm_mode: none                # RAW sensor values — no scaling (no PCA anywhere)
-whiten_mode: zca               # frozen whitening first layer: zca | pca | cholesky
+whiten_mode: vicreg               # frozen whitening first layer: zca | pca | cholesky
+vicreg_epochs: 400
 whiten_eig_floor:      0      # DSM: 0 = spectral-gap adaptive floor (detects natural noise floor)
 lrao_whiten_eig_floor: 0.00001               # LRao floor (× λ_max) — cut near-zero dirs to keep C_Ψ invertible
 
@@ -34,9 +41,10 @@ n_train_list: [
   4000,
 #  8000,
 ]   # vs-n  (at rho = dsm_sigma_rho)
-rho_list: [
-  0.00001, 0.001, 0.005,0.01,0.3,0.5,0.07, 0.1,0.5, 1.0,3.0,10.0
-]
+rho_list: [0.1]
+#rho_list: [
+#  0.00001, 0.001, 0.005,0.01,0.3,0.5,0.07, 0.1,0.5, 1.0,3.0,10.0
+#]
 n_fixed_for_rho: 1000                                      # n used for the vs-rho sweep
 
 # ----- metric operating points -----
@@ -44,20 +52,60 @@ pfa: 0.1                       # Pd @ this Pfa
 pauc_fpr: 0.1                  # partial AUC over Pfa < this
 
 # ----- score network architecture (DSM + LRao share this) -----
-hidden_dims: [128, 128]
-activation: relu
+hidden_dims: [512]
+activation: silu
 
 # ----- training budgets -----
-dsm_epochs: 2000
+dsm_epochs: 10000              # DSM: only a FALLBACK / max-epoch cap when
+                             # dsm_auto_budget is on (see below); LRao still uses it
 lrao_epochs: 50
 
+# ----- SSM comparison (sliced score matching; sigma-free counterpart of DSM) -----
+# NOTE: the SSM loss is EXPECTED to be NEGATIVE. It equals the Fisher
+# divergence minus a dropped constant, so only its trend matters; for
+# unit-variance (whitened) data the optimum is ≈ -d/2 (e.g. ~ -51 for d=103).
+train_ssm: false              # add an SSM detector next to DSM (same arch/budget)
+ssm_n_projections: 4         # random projections per SSM training step (more = lower variance, slower)
+ssm_val_projections: 16      # projections for the best-epoch monitor only (stabilizes selection)
+ssm_variance_reduction: true # SSM-VR (use 1/2||psi||^2 instead of 1/2(v^T psi)^2)
+# Pure SSM (noise 0) is unbounded below at finite n: the train loss runs off
+# to -inf as the net overfits, while the held-out loss diverges. We guard it
+# with gradient clipping + early stopping on the val objective; the SELECTED
+# (best-val) checkpoint is the sane pre-overfit model. ssm_noise > 0 evaluates
+# SSM at slightly perturbed inputs (the standard cure) so it can train longer.
+ssm_noise: 0.0               # input-noise regularization for SSM (0 = pure SSM)
+ssm_patience: 5             # stop SSM after this many val evals without improvement
+
 # ----- optimizer (DSM, LRao) -----
-lr: 0.0005
-weight_decay: 0.0000005
-batch_size: 512
+lr: 0.001                     # DSM: REFERENCE lr at dsm_ref_bs (auto-budget scales
+                             # it to the chosen batch). LRao uses it directly.
+weight_decay: 0.005
+batch_size: 256              # DSM: fallback when auto-budget is off; LRao uses it
+
+# ----- DSM sample-size-adaptive training budget -----
+# With dsm_auto_budget on, the DSM (epochs, batch, lr) are derived from the
+# number of training samples n (so the same config works for n=20..thousands):
+#   batch  = clip(n_train, dsm_min_bs, dsm_max_bs)   (full-batch for small n)
+#   epochs = clip(dsm_target_steps / steps_per_epoch, dsm_min_epochs, dsm_max_epochs)
+#            -> roughly constant TOTAL optimizer steps regardless of n
+#   lr     = lr * sqrt(batch / dsm_ref_bs)           (batch-scaled)
+dsm_auto_budget: false
+dsm_target_steps: 20000      # target total optimizer steps (the real budget)
+dsm_min_bs: 16
+dsm_max_bs: 256
+dsm_min_epochs: 100
+dsm_max_epochs: 3000         # epoch cap (bounds runtime; lets small n reach steps)
+dsm_ref_bs: 64               # batch at which 'lr' above is the reference value
 
 # ----- DSM specifics -----
-dsm_sigma_rho: 0.1            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
+dsm_sigma_rho: auto-sm           # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
+                              # OR a data-driven sigma chosen before training,
+                              # in the whitened space, from the training data:
+                              #   'auto'      Parzen-bandwidth LOO (log-likelihood)
+                              #   'auto-sm'   Parzen-bandwidth LOO (score-matching)
+                              #   'lw'        Ledoit-Wolf shrinkage loading
+                              #              (sigma^2 = rho*mu/(1-rho); Gaussian,
+                              #               second-order only, cheap & stable)
 
 # ----- LRao Mode-2 specifics -----
 lfi_delta_theta: 0.01
@@ -68,7 +116,7 @@ lfi_detach_sigma: false        # Sigma in graph (matches original LRao code)
 gmm_K: 9
 
 # ----- reproducibility -----
-seed: [42,43,44, 45, 46]   # list of seeds for multiple runs (with different train/test splits)
+seed: [42, 43, 44, 45]   # list of seeds for multiple runs (with different train/test splits)
 
 # ----- output -----
 results_dir: experiments/iid_multi/results

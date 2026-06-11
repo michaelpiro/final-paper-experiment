@@ -73,18 +73,31 @@ from final_paper_experiments.baselines.detectors import (
 )
 from final_paper_experiments.baselines.gmm_glrt_levin import gmm_glrt_levin_additive
 from dsm_model import (
-    ScoreNet, Whitening, dsm_loss, lfi_loss_mode2, compute_lfi_detector_scores_mode2,
+    ScoreNet, Whitening, dsm_loss, ssm_loss, lfi_loss_mode2,
+    compute_lfi_detector_scores_mode2, select_sigma_parzen,
+    select_sigma_ledoitwolf,
 )
 
 
-def _make_whitening(train_raw, cfg):
-    """Frozen ZCA whitener fit on the RAW training pool.
+def _make_whitening(train_raw, cfg, seed: int = 0):
+    """Frozen linear front-end for the score nets, fit on the RAW training pool.
+
+    whiten_mode (cfg):
+      'zca'|'pca'|'cholesky'  — closed-form whiteners (Whitening.from_data).
+      'normalize'             — per-channel standardization (diagonal).
+      'vicreg'                — LEARNED linear front-end via VICReg self-
+                                supervised preprocessing (noise-robust
+                                whitening; see vicreg_features). Square D->D,
+                                so it is a drop-in for the other modes.
 
     Default eig_floor=0 → spectral-gap adaptive floor (recommended).
     Set whiten_eig_floor > 0 in config to override with a fixed relative floor.
     """
-    return Whitening.from_data(np.asarray(train_raw, dtype=np.float32),
-                               mode=cfg.get('whiten_mode', 'zca'),
+    Xr = np.asarray(train_raw, dtype=np.float32)
+    if cfg.get('whiten_mode', 'zca') == 'vicreg':
+        from vicreg_features import fit_vicreg_whitening   # lazy: torch
+        return fit_vicreg_whitening(Xr, cfg, seed=seed)
+    return Whitening.from_data(Xr, mode=cfg.get('whiten_mode', 'zca'),
                                eig_floor=float(cfg.get('whiten_eig_floor', 0.0)))
 
 
@@ -164,32 +177,151 @@ def train_dsm_local(train_raw: np.ndarray, cfg: dict,
     torch.manual_seed(seed)
     device = torch.device(cfg.get('device', 'cpu'))
     D = train_raw.shape[1]
-    W = _make_whitening(train_raw, cfg)
-    sigma = float(np.sqrt(cfg['dsm_sigma_rho']))     # whitened cov≈I ⇒ σ²=ρ·1
-    model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
-                           weight_decay=cfg['weight_decay'])
+    W = _make_whitening(train_raw, cfg, seed=seed)
+    rho_cfg = cfg['dsm_sigma_rho']
+    if isinstance(rho_cfg, str):
+        # Data-driven sigma, chosen BEFORE training in the whitened space the
+        # DSM noise lives in:
+        #   'auto' / 'auto-sm' -> Parzen-bandwidth LOO (loglik / score-matching)
+        #   'lw' / 'ledoitwolf' -> Ledoit-Wolf shrinkage loading (Gaussian, eq. Prop 1)
+        Zw = W(torch.tensor(np.asarray(train_raw, dtype=np.float32))
+               ).detach().cpu().numpy()
+        mode = rho_cfg.lower()
+        if mode in ('lw', 'ledoit', 'ledoitwolf'):
+            sigma = select_sigma_ledoitwolf(Zw, seed=seed)
+            how = 'ledoit-wolf'
+        else:
+            crit = 'scorematch' if mode.endswith('sm') else 'loglik'
+            sigma = select_sigma_parzen(Zw, seed=seed, criterion=crit)
+            how = f'parzen-{crit}'
+        print(f"    [auto-sigma] DSM {label}: sigma={sigma:.4f} "
+              f"(rho={sigma ** 2:.4g}) [whitened space, {how}]", flush=True)
+    else:
+        sigma = float(np.sqrt(rho_cfg))              # whitened cov≈I ⇒ σ²=ρ·1
     X = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
-    N, bs = len(X), min(cfg['batch_size'], len(X))
+    N = len(X)
+
+    # Held-out split for best-epoch selection: monitor a DSM validation loss
+    # (deterministic noise, so it is comparable across epochs). Fall back to
+    # the epoch training loss when n is too small to spare a validation set.
+    val_frac = float(cfg.get('dsm_val_frac', 0.1))
+    n_val = int(round(val_frac * N))
+    use_val = n_val >= 8 and (N - n_val) >= 2
+    if use_val:
+        vperm = torch.randperm(N, generator=torch.Generator().manual_seed(1)).to(device)
+        Xtr, Xval = X[vperm[n_val:]], X[vperm[:n_val]]
+    else:
+        Xtr, Xval = X, None
+    Ntr = len(Xtr)
+    val_seed = seed + 777
+
+    # ---- sample-size-adaptive training budget -------------------------------
+    # Fixed (epochs, bs, lr) cannot fit n that spans 20..thousands. Budget by
+    # total optimizer STEPS (~constant across n), set the batch relative to n
+    # (full-batch when small, capped when large), and scale the LR to the batch
+    # (sqrt rule). Set dsm_auto_budget: false to use the fixed cfg values.
+    if bool(cfg.get('dsm_auto_budget', True)):
+        min_bs = int(cfg.get('dsm_min_bs', 16))
+        max_bs = int(cfg.get('dsm_max_bs', 256))
+        bs = int(min(np.clip(Ntr, min_bs, max_bs), Ntr))
+        steps_per_epoch = max(1, int(np.ceil(Ntr / bs)))
+        target_steps = int(cfg.get('dsm_target_steps', 20000))
+        min_ep = int(cfg.get('dsm_min_epochs', 100))
+        # cap epochs (bounds runtime); kept independent of dsm_epochs so that
+        # small n (1 step/epoch) can still accumulate enough optimizer steps.
+        max_ep = int(cfg.get('dsm_max_epochs', 3000))
+        epochs = int(np.clip(round(target_steps / steps_per_epoch),
+                             min_ep, max_ep))
+        ref_bs = int(cfg.get('dsm_ref_bs', 64))
+        lr = float(cfg['lr']) * float(np.sqrt(bs / max(ref_bs, 1)))
+        print(f"    [auto-budget] DSM {label}: n_tr={Ntr} bs={bs} "
+              f"epochs={epochs} (~{epochs * steps_per_epoch} steps) "
+              f"lr={lr:.2e}", flush=True)
+    else:
+        bs = min(int(cfg['batch_size']), Ntr)
+        epochs = int(cfg['dsm_epochs'])
+        lr = float(cfg['lr'])
+
+    model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'],
+                     whitening=W, arch=cfg.get('dsm_arch', 'mlp'),
+                     n_experts=int(cfg.get('dsm_n_experts', cfg.get('gmm_K', 16)))
+                     ).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, amsgrad=True, betas=(0.95, 0.999),
+                           weight_decay=cfg['weight_decay'])
+
+    # LR scheduler (cosine by default; 'none' disables)
+    sched_name = str(cfg.get('dsm_scheduler', 'cosine')).lower()
+    if sched_name == 'cosine':
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-12)
+    elif sched_name in ('plateau', 'reduce'):
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, factor=0.5, patience=10)
+    else:
+        sched = None
     baseline = D / (sigma ** 2)
+
+    # Pre-sample the validation noise ONCE with a local generator: the held-out
+    # loss is then deterministic across epochs AND never draws from the global
+    # RNG, so it cannot perturb the training noise stream. (The previous
+    # reseed-and-restore was silently wrong on MPS, whose RNG is not covered by
+    # get/set_rng_state -> validation was leaking into the optimization.)
+    _val_noise = None
+    if Xval is not None:
+        Dw = int(W.W.shape[0]) if W is not None else D   # whitened-space dim
+        g_val = torch.Generator().manual_seed(val_seed)
+        _val_noise = torch.randn(len(Xval), Dw, generator=g_val).to(device)
+
+    def _val_loss():
+        """DSM loss on the held-out split with FIXED, pre-sampled noise."""
+        model.eval()
+        with torch.no_grad():
+            v = float(dsm_loss(model, Xval, sigma, noise=_val_noise))
+        model.train()
+        return v
+
+    best_loss, best_state, best_epoch = float('inf'), None, -1
     hist = []
-    pbar = tqdm(range(1, cfg['dsm_epochs'] + 1), desc=f'DSM {label}',
+    pbar = tqdm(range(1, epochs + 1), desc=f'DSM {label}',
                 dynamic_ncols=True, leave=False)
-    for _ in pbar:
-        perm = torch.randperm(N)
+    for ep in pbar:
+        model.train()
+        perm = torch.randperm(Ntr, device=device)
         tot = 0.0
         nb = 0
-        for i in range(0, N, bs):
-            b = X[perm[i:i + bs]]
-            loss = dsm_loss(model, b, sigma)
+        for i in range(0, Ntr, bs):
             opt.zero_grad()
+            b = Xtr[perm[i:i + bs]]
+            loss = dsm_loss(model, b, sigma)
             loss.backward()
             opt.step()
             tot += loss.item()
             nb += 1
-        hist.append(tot / max(nb, 1))
-        pbar.set_postfix(loss=f"{hist[-1]:.2f}",
-                         ratio=f"{hist[-1] / baseline:.3f}")
+        train_loss = tot / max(nb, 1)
+
+        hist.append(train_loss)
+        ep+=1
+        monitor = _val_loss() if Xval is not None else train_loss
+        if sched is not None:
+            sched.step(monitor) if sched_name in ('plateau', 'reduce') \
+                else sched.step()
+
+        # save the best epoch (lowest monitored loss)
+        if monitor < best_loss:
+            best_loss, best_epoch = monitor, ep
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+
+        pbar.set_postfix(loss=f"{train_loss:.2f}",
+                         val=f"{monitor:.2f}",
+                         best=f"{best_epoch}",
+                         ratio=f"{train_loss / baseline:.3f}")
+
+    # restore the best epoch's weights
+    # if best_state is not None:
+    #     model.load_state_dict(best_state)
+    print(f"    DSM {label}: best epoch {best_epoch}/{epochs} "
+          f"(monitor loss {best_loss:.4f}, "
+          f"{'val' if Xval is not None else 'train'})", flush=True)
     model.cpu().eval()   # move back to CPU so scoring helpers get numpy-compatible model
     return model, hist
 
@@ -210,8 +342,9 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     # Falls back to the shared whiten_eig_floor if not set.
     lrao_cfg = cfg if 'lrao_whiten_eig_floor' not in cfg else {
         **cfg, 'whiten_eig_floor': cfg['lrao_whiten_eig_floor']}
-    W = _make_whitening(train_raw, lrao_cfg)
-    model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
+    W = _make_whitening(train_raw, lrao_cfg, seed=seed)
+    model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'],
+                     whitening=W, arch=cfg.get('lrao_arch', 'mlp')).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                               weight_decay=cfg['weight_decay'])
     X     = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
@@ -231,7 +364,12 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
                                       detach_sigma=cfg['lfi_detach_sigma'])
                 if not torch.isfinite(loss):
                     raise FloatingPointError("non-finite LRao loss")
-                opt.zero_grad(); loss.backward(); opt.step()
+                opt.zero_grad(); loss.backward()
+                # clip grads: the LFI objective is unbounded, so without this
+                # the score net can blow up to Inf/NaN in a single step (the
+                # divergence that then crashes the covariance SVD).
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                opt.step()
                 tot += loss.item(); nb += 1
         except Exception as exc:
             print(f"      [warn] LRao {label} aborted at epoch {ep}: {exc}",
@@ -241,6 +379,152 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
         pbar.set_postfix(trJ=f"{hist[-1]:.2f}")
 
     model.cpu().eval()   # back to CPU so scoring helpers receive numpy-compatible model
+    return model, hist
+
+
+def train_ssm_local(train_raw: np.ndarray, cfg: dict,
+                    seed: int, label: str) -> Tuple[ScoreNet, List[float]]:
+    """Sliced Score Matching (SSM) counterpart of train_dsm_local.
+
+    Same frozen whitening front-end, same residual architecture, the same
+    sample-size-adaptive budget (batch/epochs/lr), cosine scheduler and
+    best-epoch selection — but the network is trained with the SSM objective
+    (estimating the score of p_w directly, sigma -> 0) instead of DSM. This
+    is the natural head-to-head comparison for DSM. Detection uses the same
+    Rao statistic (score_dsm_add), since SSM yields a score net just like DSM.
+    """
+    torch.manual_seed(seed)
+    device = torch.device(cfg.get('device', 'cpu'))
+    D = train_raw.shape[1]
+    W = _make_whitening(train_raw, cfg, seed=seed)
+    n_proj = int(cfg.get('ssm_n_projections', 1))
+    ssm_vr = bool(cfg.get('ssm_variance_reduction', True))
+    ssm_noise = float(cfg.get('ssm_noise', 0.0))     # >0 regularizes pure SSM
+    grad_clip = float(cfg.get('grad_clip', 5.0))
+    patience = int(cfg.get('ssm_patience', 15))      # val-eval early stopping
+
+    X = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
+    N = len(X)
+
+    # held-out split for best-epoch selection (fixed-noise SSM val loss)
+    val_frac = float(cfg.get('dsm_val_frac', 0.1))
+    n_val = int(round(val_frac * N))
+    use_val = n_val >= 8 and (N - n_val) >= 2
+    if use_val:
+        vperm = torch.randperm(N, generator=torch.Generator().manual_seed(
+            seed + 3)).to(device)
+        Xtr, Xval = X[vperm[n_val:]], X[vperm[:n_val]]
+    else:
+        Xtr, Xval = X, None
+    Ntr = len(Xtr)
+    val_seed = seed + 777
+
+    # sample-size-adaptive budget (identical policy to DSM)
+    if bool(cfg.get('dsm_auto_budget', True)):
+        min_bs = int(cfg.get('dsm_min_bs', 16))
+        max_bs = int(cfg.get('dsm_max_bs', 256))
+        bs = int(min(np.clip(Ntr, min_bs, max_bs), Ntr))
+        steps_per_epoch = max(1, int(np.ceil(Ntr / bs)))
+        target_steps = int(cfg.get('dsm_target_steps', 20000))
+        min_ep = int(cfg.get('dsm_min_epochs', 100))
+        max_ep = int(cfg.get('dsm_max_epochs', 3000))
+        epochs = int(np.clip(round(target_steps / steps_per_epoch),
+                             min_ep, max_ep))
+        ref_bs = int(cfg.get('dsm_ref_bs', 64))
+        lr = float(cfg['lr']) * float(np.sqrt(bs / max(ref_bs, 1)))
+        print(f"    [auto-budget] SSM {label}: n_tr={Ntr} bs={bs} "
+              f"epochs={epochs} (~{epochs * steps_per_epoch} steps) "
+              f"lr={lr:.2e}", flush=True)
+    else:
+        bs = min(int(cfg['batch_size']), Ntr)
+        epochs = int(cfg['dsm_epochs'])
+        lr = float(cfg['lr'])
+
+    model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'],
+                     whitening=W, arch=cfg.get('dsm_arch', 'mlp'),
+                     n_experts=int(cfg.get('dsm_n_experts', cfg.get('gmm_K', 16)))
+                     ).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr,
+                           weight_decay=cfg['weight_decay'])
+    sched_name = str(cfg.get('dsm_scheduler', 'cosine')).lower()
+    if sched_name == 'cosine':
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    elif sched_name in ('plateau', 'reduce'):
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, factor=0.5, patience=max(epochs // 20, 5))
+    else:
+        sched = None
+
+    # Use many projections for the MONITOR only: the SSM trace term is a
+    # Hutchinson estimate, and 1 projection is too noisy for reliable
+    # best-epoch selection (the training objective still uses n_proj).
+    val_proj = max(n_proj, int(cfg.get('ssm_val_projections', 16)))
+
+    # Pre-sample FIXED projection vectors (and input noise) once, so the
+    # held-out SSM loss is deterministic AND never touches the global RNG
+    # (no leakage into training; correct on MPS too).
+    _val_fixed = None
+    if Xval is not None:
+        Dw = int(W.W.shape[0]) if W is not None else D
+        g_val = torch.Generator().manual_seed(val_seed)
+        _val_fixed = {
+            'proj': torch.randn(val_proj, len(Xval), Dw, generator=g_val).to(device),
+            'innoise': torch.randn(len(Xval), Dw, generator=g_val).to(device),
+        }
+
+    def _val_loss():
+        model.eval()
+        v = float(ssm_loss(model, Xval, val_proj, ssm_vr, ssm_noise,
+                           fixed=_val_fixed))
+        model.train()
+        return v
+
+    best_loss, best_state, best_epoch, since = float('inf'), None, -1, 0
+    hist = []
+    pbar = tqdm(range(1, epochs + 1), desc=f'SSM {label}',
+                dynamic_ncols=True, leave=False)
+    for ep in pbar:
+        model.train()
+        perm = torch.randperm(Ntr, device=device)
+        tot, nb = 0.0, 0
+        for i in range(0, Ntr, bs):
+            opt.zero_grad()
+            b = Xtr[perm[i:i + bs]]
+            loss = ssm_loss(model, b, n_proj, ssm_vr, ssm_noise)
+            loss.backward()
+            # clip grads: pure SSM is unbounded below at finite n, so the
+            # trace term can drive gradients (and the loss) to blow up.
+            if grad_clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+            tot += loss.item()
+            nb += 1
+        train_loss = tot / max(nb, 1)
+        hist.append(train_loss)
+
+        monitor = _val_loss() if Xval is not None else train_loss
+        if sched is not None:
+            sched.step(monitor) if sched_name in ('plateau', 'reduce') \
+                else sched.step()
+        if monitor < best_loss - 1e-9:
+            best_loss, best_epoch, since = monitor, ep, 0
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+        else:
+            since += 1
+        pbar.set_postfix(loss=f"{train_loss:.3f}", val=f"{monitor:.3f}",
+                         best=f"{best_epoch}")
+        # early stop once the held-out objective stops improving (pure SSM
+        # then only overfits -> the train loss runs off to -inf).
+        if Xval is not None and since >= patience:
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    print(f"    SSM {label}: best epoch {best_epoch}/{epochs} "
+          f"(monitor loss {best_loss:.4f}, "
+          f"{'val' if Xval is not None else 'train'})", flush=True)
+    model.cpu().eval()
     return model, hist
 
 
@@ -324,6 +608,7 @@ DETECTOR_COLORS = {
     'DLTD':      '#e6550d',   # orange
     'SMGLRT':    '#8c564b',   # brown
     'DSM':       '#d62728',
+    'SSM':       '#e377c2',   # pink — sliced score matching
     'LRao':      '#2ca02c',
 }
 
@@ -453,7 +738,12 @@ def run_iid(cfg: dict, mode: str):
     n_list   = sorted(set(_ensure_list(cfg['n_train_list'])))
     rho_list = sorted(set(_ensure_list(cfg.get(
         'rho_list', [0.001, 0.003, 0.01, 0.03, 0.1, 0.3]))))
-    rho_fixed = float(cfg['dsm_sigma_rho'])          # ρ used for the vs-n sweep
+    # dsm_sigma_rho may be a number, or 'auto'/'auto-sm' (data-driven per-n
+    # sigma via Parzen-bandwidth LOO; see train_dsm_local). rho_fixed is the
+    # numeric reference still needed for the Reg-AMF loading and ROC pick.
+    _rho_raw  = cfg['dsm_sigma_rho']
+    auto_sigma = isinstance(_rho_raw, str)
+    rho_fixed = float(np.median(rho_list)) if auto_sigma else float(_rho_raw)
     n_fixed   = int(cfg.get('n_fixed_for_rho', max(n_list)))   # n for the vs-ρ sweep
     pfa       = float(cfg.get('pfa', 0.1))           # operating Pfa for Pd@Pfa
     pauc_fpr  = float(cfg.get('pauc_fpr', 0.1))      # partial-AUC upper FPR
@@ -506,7 +796,8 @@ def run_iid(cfg: dict, mode: str):
           flush=True)
 
     _cls = CLASSICAL_DETS_MULTI if mode == 'multi' else CLASSICAL_DETS_SINGLE
-    DETS = _cls + ['DSM', 'LRao']
+    train_ssm = bool(cfg.get('train_ssm', True))
+    DETS = _cls + ['DSM'] + (['SSM'] if train_ssm else []) + ['LRao']
     loss_curves: Dict[str, list] = {}
     metrics = {
         'n_list': n_list, 'rho_list': rho_list, 'n_fixed': n_fixed,
@@ -521,21 +812,29 @@ def run_iid(cfg: dict, mode: str):
                 _pd_at_fa(labels, sc, pfa))
 
     def _train_score_models(train_raw_n, cfg_rho, tag):
-        """Train DSM (at cfg_rho's ρ) + LRao on train_raw_n; return their scores."""
+        """Train DSM (at cfg_rho's ρ), optional SSM, and LRao on train_raw_n;
+        return {detector_name: scores}."""
+        out = {}
         dsm_net, h_dsm = train_dsm_local(train_raw_n, cfg_rho, seed, tag)
         loss_curves[f'DSM_{tag}'] = h_dsm
         torch.save({'state_dict': dsm_net.state_dict(), 'tag': tag},
                    os.path.join(mdl_dir, f'dsm_{tag}.pt'))
-        sc_dsm = score_dsm_add(dsm_net, train_raw_n, test_planted, s_raw)
+        out['DSM'] = score_dsm_add(dsm_net, train_raw_n, test_planted, s_raw)
+        if train_ssm:
+            ssm_net, h_ssm = train_ssm_local(train_raw_n, cfg_rho, seed, tag)
+            loss_curves[f'SSM_{tag}'] = h_ssm
+            torch.save({'state_dict': ssm_net.state_dict(), 'tag': tag},
+                       os.path.join(mdl_dir, f'ssm_{tag}.pt'))
+            out['SSM'] = score_dsm_add(ssm_net, train_raw_n, test_planted, s_raw)
         lrao_net, h_lrao = train_lrao_local(train_raw_n, cfg, seed, tag)
         loss_curves[f'LRao_{tag}'] = h_lrao
         torch.save({'state_dict': lrao_net.state_dict(), 'tag': tag},
                    os.path.join(mdl_dir, f'lrao_{tag}.pt'))
-        sc_lrao = _safe(f'LRao {tag}',
-                        lambda: score_lrao(lrao_net, train_raw_n, test_planted,
-                                           s_raw, cfg),
-                        len(labels))
-        return sc_dsm, sc_lrao
+        out['LRao'] = _safe(f'LRao {tag}',
+                            lambda: score_lrao(lrao_net, train_raw_n,
+                                               test_planted, s_raw, cfg),
+                            len(labels))
+        return out
 
     # ------------------------------------------------------------------ vs n
     print(f"\n=== SWEEP vs n  (ρ={rho_fixed}) ===", flush=True)
@@ -544,8 +843,8 @@ def run_iid(cfg: dict, mode: str):
         tr = train_pool_raw[:n]
         reg_sigma = compute_sigma_from_data(tr, rho_fixed)
         cl = run_classical_additive(tr, test_planted, s_raw, reg_sigma, cfg, mode)
-        sc_dsm, sc_lrao = _train_score_models(tr, cfg, f'n{n}')
-        det_scores = {**cl, 'DSM': sc_dsm, 'LRao': sc_lrao}
+        sc_models = _train_score_models(tr, cfg, f'n{n}')
+        det_scores = {**cl, **sc_models}
         for det, sc in det_scores.items():
             au, pa, pd = _mtr(sc)
             metrics['vs_n'][det]['auc'].append(au)
@@ -581,6 +880,10 @@ def run_iid(cfg: dict, mode: str):
                       lambda: score_lrao(lrao_f, tr_f, test_planted, s_raw, cfg),
                       len(labels))
     flat = {**cl_f, 'LRao': sc_lrao_f}            # ρ-independent reference scores
+    if train_ssm:                                 # SSM is ρ-independent (no sigma)
+        ssm_f, h_ssm_f = train_ssm_local(tr_f, cfg, seed, f'rhofix_n{n_fixed}')
+        loss_curves[f'SSM_rhofix_n{n_fixed}'] = h_ssm_f
+        flat['SSM'] = score_dsm_add(ssm_f, tr_f, test_planted, s_raw)
 
     for rho in rho_list:
         t0 = time.time()

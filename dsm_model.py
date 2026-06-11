@@ -4,6 +4,112 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+def select_sigma_parzen(W: np.ndarray, sigma_lo: float = 0.02,
+                        sigma_hi: float = 5.0, seed: int = 0,
+                        criterion: str = "loglik") -> float:
+    """Choose the DSM noise level sigma from the samples, before training.
+
+    DSM at noise sigma estimates the score of q_sigma = p_w * N(0, sigma^2 I)
+    -- exactly the Gaussian-kernel Parzen (KDE) density with bandwidth sigma.
+    So picking sigma is a KDE-bandwidth problem, solved from the samples alone
+    by leave-one-out cross-validation (no network training):
+
+      criterion="loglik"     : maximize the LOO Parzen log-likelihood.
+      criterion="scorematch" : minimize the LOO implicit-score-matching loss
+                               (the objective DSM itself optimizes).
+
+    NOTE: pass the data in the SAME space the DSM noise is added in. Here the
+    score net whitens internally and DSM noise is isotropic in whitened space,
+    so this must be called on the WHITENED training data; the returned sigma is
+    then the whitened-space sigma used by dsm_loss.
+
+    n is small in this problem, so we just build the full (n, n) pairwise
+    squared-distance matrix once and reuse it across the 1-D golden-section
+    search over log-sigma.
+    """
+    from scipy.special import logsumexp
+    mu, std = W.mean(0), W.std(0) + 1e-8
+    U = ((W - mu) / std).astype(np.float64)
+    n, d = U.shape
+    if n < 3:
+        return 1.0
+
+    # full pairwise squared distances (n, n); self-distance excluded (LOO)
+    sqn = np.einsum("ij,ij->i", U, U)
+    D = np.maximum(sqn[:, None] + sqn[None, :] - 2.0 * (U @ U.T), 0.0)
+    diag = np.arange(n)
+    Dself0 = D.copy()                       # self-distance 0 for weighted sums
+    D[diag, diag] = np.inf                  # exclude self in the LOO kernel
+
+    def negobj(log_sigma):
+        s2 = np.exp(2.0 * log_sigma)
+        logk = -D / (2.0 * s2)              # (n, n), -inf on the diagonal
+        lse = logsumexp(logk, axis=1)       # sum over j != i
+        if criterion == "loglik":
+            ll = lse - np.log(n - 1) - 0.5 * d * np.log(2 * np.pi * s2)
+            return -ll.mean()
+        # score-matching: LOO implicit-score-matching loss of the KDE score
+        r = np.exp(logk - lse[:, None])     # responsibilities (self = 0)
+        m = r @ U - U                       # (n, d) = E_r[u_j] - u_i  = s2 * psi
+        m2 = np.einsum("ij,ij->i", m, m)
+        rD = np.einsum("ij,ij->i", r, Dself0)
+        psi2 = m2 / s2 ** 2
+        div = (-d + (rD - m2) / s2) / s2
+        return (0.5 * psi2 + div).mean()
+
+    gr = (np.sqrt(5) - 1) / 2
+    a, b = np.log(sigma_lo), np.log(sigma_hi)
+    c, dd = b - gr * (b - a), a + gr * (b - a)
+    fc, fd = negobj(c), negobj(dd)
+    for _ in range(40):
+        if fc < fd:
+            b, dd, fd = dd, c, fc
+            c = b - gr * (b - a)
+            fc = negobj(c)
+        else:
+            a, c, fc = c, dd, fd
+            dd = a + gr * (b - a)
+            fd = negobj(dd)
+        if (b - a) < 1e-24:
+            break
+    return float(np.exp((a + b) / 2))
+
+
+def select_sigma_ledoitwolf(W: np.ndarray, seed: int = 0) -> float:
+    """Pick the DSM noise level sigma from a Ledoit-Wolf shrinkage covariance.
+
+    By Proposition 1, Gaussian DSM at noise sigma is the diagonally-loaded
+    covariance (Sigma_hat + sigma^2 I). Ledoit-Wolf gives the optimal linear
+    shrinkage toward a scaled identity:
+
+        Sigma_LW = (1 - rho) Sigma_hat + rho * mu * I,   mu = tr(Sigma_hat)/d.
+
+    The isotropic ("diagonal-loading") variance that the shrinkage injects is
+
+        sigma^2 = rho * mu,
+
+    which we use as the DSM noise level. (We deliberately do NOT use the
+    scale-invariant ratio rho*mu/(1-rho): on whitened data Sigma_hat is already
+    ~= mu*I = the shrinkage target, so Ledoit-Wolf drives rho -> 1 and the ratio
+    diverges; rho*mu stays bounded by mu.) rho is chosen analytically by
+    Ledoit-Wolf -- no search, no training. Pass WHITENED data so sigma is in
+    the space the DSM noise lives in. Unlike the Parzen-LOO selector this is a
+    purely second-order (Gaussian) criterion: cheap and stable, but blind to
+    non-Gaussian structure.
+    """
+    from sklearn.covariance import LedoitWolf
+    X = np.asarray(W, dtype=np.float64)
+    n, d = X.shape
+    if n < 3:
+        return 1.0
+    lw = LedoitWolf().fit(X)
+    rho = float(np.clip(lw.shrinkage_, 0.0, 1.0))
+    Xc = X - X.mean(0)
+    mu_scale = float(np.trace(Xc.T @ Xc) / max(n - 1, 1) / d)   # tr(Sigma)/d
+    sigma2 = rho * mu_scale
+    return float(np.sqrt(max(sigma2, 1e-12)))
+
+
 def _robust_svd_np(A: np.ndarray):
     """
     SVD with fallback chain for ill-conditioned matrices.
@@ -115,9 +221,13 @@ class Whitening(nn.Module):
     a background covariance so cov(output) = I (full-dimensional; replaces PCA).
 
     mode (configurable — keep it a one-line swap):
-      'zca'      W = V Λ^{-1/2} Vᵀ   (symmetric; stays closest to original axes)
-      'pca'      W = Λ^{-1/2} Vᵀ     (rotate to eigenbasis)
-      'cholesky' W = L^{-1}, Σ = L Lᵀ
+      'zca'       W = V Λ^{-1/2} Vᵀ   (symmetric; stays closest to original axes)
+      'pca'       W = Λ^{-1/2} Vᵀ     (rotate to eigenbasis)
+      'cholesky'  W = L^{-1}, Σ = L Lᵀ
+      'normalize' W = diag(1/σ_b)     (per-channel standardization only — NO
+                  decorrelation: each band is centered and scaled to unit
+                  variance but cross-band correlations are kept. Diagonal W,
+                  so no eigendecomposition/LAPACK is used.)
 
     The module is FROZEN (buffers, no grad). It also whitens the (B, M, D)
     neighbor tensor (broadcast over the last axis).
@@ -170,6 +280,14 @@ class Whitening(nn.Module):
         Xc = X - mu
         Sigma = (Xc.T @ Xc) / max(n - 1, 1)
         Sigma = (Sigma + Sigma.T) / 2
+        if mode in ("normalize", "standardize", "channel"):
+            # Per-channel standardization: diagonal W = diag(1/sigma_b).
+            # No decorrelation, no eigendecomposition. Floor the variance so
+            # a (near-)constant band does not produce a non-finite scale.
+            var   = np.diag(Sigma).copy()
+            var   = np.maximum(var, max(float(var.max()), 1.0) * 1e-12)
+            W     = np.diag(1.0 / np.sqrt(var))
+            return cls(mu.astype(np.float32), W.astype(np.float32))
         if mode == "cholesky":
             W = np.linalg.inv(np.linalg.cholesky(
                 Sigma + eps * np.eye(D)))
@@ -211,31 +329,126 @@ class Whitening(nn.Module):
         return cls(mu.astype(np.float32), W.astype(np.float32))
 
 
+class _ResidualScoreNet(nn.Module):
+    """Pre-norm residual MLP score net with a learnable affine skip.
+
+    Runs in WHITENED space (d -> d). Two design choices make it train far
+    better than a plain MLP at high d / low n:
+
+      * Pre-norm residual blocks (LayerNorm -> Linear -> act -> Linear, added
+        to the input) give stable gradients and let depth help instead of hurt.
+      * A learnable global affine skip  a ⊙ w + b  with the residual branch
+        zero-initialized and a init = -1, b = 0. In whitened space the
+        population score is ≈ -w (the score of N(0, I)), so the net STARTS at
+        the exact Gaussian/AMF score and only has to learn the non-Gaussian
+        correction — a strong, well-motivated inductive prior.
+    """
+
+    def __init__(self, d: int, width: int, n_blocks: int, act_cls):
+        super().__init__()
+        self.inp = nn.Linear(d, width)
+        self.blocks = nn.ModuleList(
+            nn.Sequential(nn.LayerNorm(width),
+                          nn.Linear(width, width), act_cls(),
+                          nn.Linear(width, width))
+            for _ in range(n_blocks)
+        )
+        self.out = nn.Linear(width, d)
+        self.a = nn.Parameter(-torch.ones(d))      # affine skip: start at -w
+        self.b = nn.Parameter(torch.zeros(d))
+        nn.init.zeros_(self.out.weight)             # residual branch starts at 0
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        h = self.inp(w)
+        for blk in self.blocks:
+            h = h + blk(h)
+        return self.out(h) + (self.a * w + self.b)
+
+
+class _MixtureScoreNet(nn.Module):
+    """Mixture-of-affine-experts score net (the natural GMM-score model).
+
+    Operates in WHITENED space (d -> d). The score of a Gaussian mixture is a
+    responsibility-weighted sum of affine (per-component Gaussian) scores:
+
+        psi(w) = sum_k g_k(w) * (a_k ⊙ w + b_k),   g(w) = softmax(gate(w)),
+
+    which is exactly this network: K diagonal-affine experts and a small MLP
+    gate. This matches the multimodal structure of HSI clutter (the reason
+    GMM-GLRT is the baseline) and is far better suited than a generic MLP:
+
+      * It is lightweight (K*(2d) + a tiny gate), so it works with FEW samples.
+      * No feature normalization (LayerNorm/BatchNorm) — a score must carry
+        magnitude, which normalization destroys (the resmlp's weakness here).
+      * After VICReg the latent is ~white, so initializing every expert slope
+        a_k = -1 (and b_k = 0) starts the net at the white Gaussian score -w;
+        the gate then learns the soft cluster assignment and b_k the per-mode
+        offsets — a strong, problem-matched prior.
+    """
+
+    def __init__(self, d: int, n_experts: int, gate_hidden: int, act_cls):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(d, gate_hidden), act_cls(),
+            nn.Linear(gate_hidden, n_experts),
+        )
+        # diagonal-affine experts; slope starts at -1 (whitened Gaussian score)
+        self.a = nn.Parameter(-torch.ones(n_experts, d)
+                              + 0.01 * torch.randn(n_experts, d))
+        self.b = nn.Parameter(torch.zeros(n_experts, d))
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        g = torch.softmax(self.gate(w), dim=-1)            # (B, K)
+        experts = w.unsqueeze(1) * self.a + self.b         # (B, K, d)
+        return (g.unsqueeze(-1) * experts).sum(1)          # (B, d)
+
+
 class ScoreNet(nn.Module):
     """Score network ψ_η: R^d → R^d trained via denoising score matching.
 
     Optional frozen `whitening` front-end (the first layer). When present the net
     operates in WHITENED space: forward(x) = net(whiten(x)); the DSM loss whitens
     first then adds noise in whitened space; detection uses the whitened signature.
+
+    arch :
+      'mlp' (default)     — plain feed-forward MLP. Best empirically after the
+                            VICReg front-end (the latent is a generic learned
+                            representation; A/B: mlp > mixture > resmlp).
+      'mixture'           — mixture of affine experts (GMM-score model; see
+                            _MixtureScoreNet). n_experts from `dsm_n_experts`,
+                            gate width from max(hidden_dims).
+      'resmlp'            — pre-norm residual MLP + affine skip (LayerNorm can
+                            hurt: it strips the score magnitude).
     """
 
     def __init__(self, input_dim: int, hidden_dims: list = None,
-                 activation: str = "silu", whitening: "Whitening" = None):
+                 activation: str = "silu", whitening: "Whitening" = None,
+                 arch: str = "mlp", n_experts: int = 16):
         super().__init__()
         if hidden_dims is None:
             hidden_dims = []
 
-        act_map = {"silu": nn.SiLU, "relu": nn.ReLU, "tanh": nn.Tanh}
+        act_map = {"silu": nn.SiLU, "relu": nn.ReLU, "tanh": nn.Tanh, "gelu": nn.GELU}
         act_cls = act_map[activation]
+        self.arch = arch
+        gate_hidden = int(max(hidden_dims)) if len(hidden_dims) else 64
 
-        dims = [input_dim] + list(hidden_dims) + [input_dim]
-        layers = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(act_cls())
-
-        self.net = nn.Sequential(*layers)
+        if arch in ("mixture", "moe"):
+            self.net = _MixtureScoreNet(input_dim, n_experts, gate_hidden,
+                                        act_cls)
+        elif arch in ("resmlp", "residual") and len(hidden_dims) > 0:
+            width = int(max(hidden_dims))
+            n_blocks = len(hidden_dims)
+            self.net = _ResidualScoreNet(input_dim, width, n_blocks, act_cls)
+        else:                                       # plain MLP (back-compat)
+            dims = [input_dim] + list(hidden_dims) + [input_dim]
+            layers = []
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1]))
+                if i < len(dims) - 2:
+                    layers.append(act_cls())
+            self.net = nn.Sequential(*layers)
         self.whitening = whitening
 
     def whiten(self, x: torch.Tensor) -> torch.Tensor:
@@ -263,7 +476,7 @@ class ScoreNet(nn.Module):
 
 
 def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma,
-             weighted: bool = False) -> torch.Tensor:
+             weighted: bool = False, noise=None) -> torch.Tensor:
     """DSM objective: E[||ψ_η(w̃) - (w - w̃)/Σ_n||²] where w̃ = w + ε, ε ~ N(0,Σ_n).
 
     Parameters
@@ -278,6 +491,11 @@ def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma,
         tiny-σ band does not numerically dominate the loss.  For SCALAR σ it
         is just a global constant (does not change the learned score); for a
         DIAGONAL σ it is the principled, well-conditioned form.
+    noise : optional FIXED unit-N(0,1) tensor (same shape as the whitened
+        batch). If given it is used instead of drawing fresh noise -- this lets
+        a caller (e.g. validation) compute a deterministic loss WITHOUT touching
+        the global RNG, so it cannot perturb the training noise stream (this
+        matters on MPS, whose RNG is not covered by get/set_rng_state).
     """
     if not torch.is_tensor(sigma):
         sigma = torch.as_tensor(sigma, dtype=batch.dtype, device=batch.device)
@@ -285,13 +503,67 @@ def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma,
     # whiten first, then add the DSM noise, and score the inner net directly.
     w = model.whiten(batch) if hasattr(model, "whiten") else batch
     inner = model.net if hasattr(model, "net") else model
-    eps = torch.randn_like(w) * sigma              # (B,d), per-band std
+    z = torch.randn_like(w) if noise is None else noise.to(w.dtype)
+    eps = z * sigma                                 # (B,d), per-band std
     w_tilde = w + eps
     target = -eps / (sigma ** 2)                    # (w - w̃)/Σ_n = -ε/σ_b²
     se = (inner(w_tilde) - target) ** 2             # (B,d)
     if weighted:
         se = se * (sigma ** 2)                      # precondition per band
     return se.sum(dim=-1).mean()
+
+
+def ssm_loss(model: ScoreNet, batch: torch.Tensor, n_projections: int = 1,
+             variance_reduction: bool = True, noise: float = 0.0,
+             fixed=None) -> torch.Tensor:
+    """Sliced Score Matching objective (Song et al., UAI 2019).
+
+    Estimates the score of p_w DIRECTLY (no noise level sigma), via random
+    projections of the score Jacobian:
+
+        J = E_x E_v [ v^T (d psi/dx) v + 1/2 (v^T psi(x))^2 ]      (plain)
+        J = E_x E_v [ v^T (d psi/dx) v ] + 1/2 ||psi(x)||^2        (SSM-VR)
+
+    Like dsm_loss, it operates in the WHITENED space (the net's internal
+    space): the frozen whitening is applied, then the inner net's score and
+    its Jacobian-vector products are taken w.r.t. the whitened input. This
+    is the sigma -> 0 counterpart of DSM and is the natural comparison.
+
+    ``noise`` > 0 evaluates the objective at slightly perturbed points
+    w + noise * N(0, I). Pure SSM (noise = 0) is ill-posed for a flexible
+    network at finite n -- the empirical trace term is unbounded below (the
+    net can make ||psi|| ~ 0 at each training point with a very steep
+    negative slope), so the loss runs off to -inf. A small noise (or the
+    val-based early stopping in the trainer) regularizes it.
+
+    ``fixed`` : optional dict {'innoise': (B,d) or None, 'proj': (P,B,d)} of
+        FIXED unit-N(0,1) tensors, so a caller (validation) can compute a
+        deterministic loss WITHOUT touching the global RNG (avoids leaking into
+        the training noise stream; matters on MPS).
+    """
+    w0 = model.whiten(batch) if hasattr(model, "whiten") else batch
+    inner = model.net if hasattr(model, "net") else model
+    w = w0.detach()
+    if noise and noise > 0:
+        innoise = None if fixed is None else fixed.get('innoise')
+        z = torch.randn_like(w) if innoise is None else innoise.to(w.dtype)
+        w = w + noise * z
+    w = w.requires_grad_(True)
+    s = inner(w)                                        # (B, d) whitened score
+    proj_fixed = None if fixed is None else fixed.get('proj')
+    jac = 0.0
+    proj = 0.0
+    for j in range(n_projections):
+        v = (torch.randn_like(w) if proj_fixed is None
+             else proj_fixed[j].to(w.dtype))
+        gv = torch.autograd.grad((s * v).sum(), w, create_graph=True)[0]
+        jac = jac + (gv * v).sum(-1)                    # v^T (ds/dw) v
+        if not variance_reduction:
+            proj = proj + 0.5 * ((s * v).sum(-1)) ** 2
+    jac = jac / n_projections
+    norm = (0.5 * (s ** 2).sum(-1) if variance_reduction
+            else proj / n_projections)
+    return (jac + norm).mean()
 
 
 def train_dsm(model: ScoreNet, data: np.ndarray, sigma: float,
@@ -361,6 +633,11 @@ def lfi_loss(model: ScoreNet, batch: torch.Tensor, s: torch.Tensor,
     Sigma    = (centered.T @ centered) / max(n - 1, 1)   # (d, d)
     Sigma    = Sigma + 1e-4 * torch.eye(Sigma.shape[0], device=batch.device)
 
+    # Guard the LAPACK call: non-finite input makes torch.linalg.inv raise on
+    # Linux but SEGFAULT on macOS (Accelerate). Raise a catchable error so the
+    # training loop aborts gracefully on every platform.
+    if not torch.isfinite(Sigma).all():
+        raise RuntimeError("non-finite Sigma in LFI loss (LRao training diverged)")
     Sigma_inv = torch.linalg.inv(Sigma)
     J         = g @ Sigma_inv @ g                         # scalar LFI
     return -J
@@ -476,6 +753,10 @@ def compute_lfi_detector_scores(model: ScoreNet, train_data: np.ndarray,
     centered  = psi_tr - mu_psi
     Sigma     = centered.T @ centered / max(len(train_data) - 1, 1)
     Sigma    += 1e-4 * np.eye(Sigma.shape[0])
+    # Guard the LAPACK call: a diverged model gives non-finite Sigma, and
+    # np.linalg.inv raises on Linux but SEGFAULTS on macOS (Accelerate).
+    if not np.all(np.isfinite(Sigma)):
+        return np.zeros(len(test_data), dtype=np.float32)    # scores ~ 0
     Sigma_inv = np.linalg.inv(Sigma)
 
     # Central-difference Jacobian direction from train data
@@ -526,6 +807,11 @@ def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
         mu_psi   = psi_0.mean(dim=0)
         centered = psi_0 - mu_psi
         Sigma    = (centered.T @ centered) / max(n - 1, 1)
+        # Guard the LAPACK call: non-finite input makes torch.linalg.svd raise
+        # on Linux but SEGFAULT on macOS (Accelerate). Raise a catchable error
+        # so the training loop aborts gracefully on every platform.
+        if not torch.isfinite(Sigma).all():
+            raise RuntimeError("non-finite Sigma in LFI (LRao training diverged)")
         # Truncated pseudo-inverse (Zschetzsche et al. lfi_diag_autocorr).
         # torch.linalg.svd is robust; no ridge added so training is unaffected.
         U, S, Vh  = torch.linalg.svd(Sigma)
@@ -668,6 +954,11 @@ def _model_lfi_stats(model: ScoreNet, train_data: np.ndarray, s: np.ndarray,
 
     mu    = psi.mean(axis=0)
     C     = np.cov(psi, rowvar=False) + 1e-4 * np.eye(psi.shape[1])
+    # Guard the LAPACK call: a diverged model gives non-finite Psi -> non-finite
+    # C, and np.linalg.inv raises on Linux but SEGFAULTS on macOS (Accelerate).
+    if not np.all(np.isfinite(C)):
+        d = C.shape[0]
+        return mu, np.zeros((d, d)), np.zeros(d), 0.0, 1.0   # -> scores ~ 0
     C_inv = np.linalg.inv(C)
     g     = ((psi_plus - psi_minus) / (2.0 * delta_theta)).mean(axis=0)
     J     = float(g @ C_inv @ g)

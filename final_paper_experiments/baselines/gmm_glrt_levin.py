@@ -100,13 +100,27 @@ def fit_product_gmm(Z, cond_tol=1e3, max_dim=5, k_max=5,
     gmms    = []
     for sub in subsets:
         Zs = Z[:, sub]
+        # Drop non-finite rows: sklearn's EM drops into a LAPACK Cholesky that
+        # SEGFAULTS on non-finite input on macOS (Accelerate) instead of raising.
+        Zs = Zs[np.all(np.isfinite(Zs), axis=1)]
+        if len(Zs) < 2:
+            gmms.append(None)
+            continue
+        # reg_covar is an ABSOLUTE diagonal floor in sklearn; its 1e-6 default
+        # assumes ~unit-scale data. These are raw PCA scores with variance up
+        # to ~1e6, so 1e-6 fails to keep component covariances positive-
+        # definite and a collapsed EM component -> singular covariance ->
+        # Cholesky crash. Floor it relative to the subset's data scale (the
+        # scale-correct analogue of the sklearn default).
+        scale = float(np.mean(np.var(Zs, axis=0))) + 1e-12
+        rc    = max(reg_covar, 1e-6 * scale)
         best_gmm, best_aic = None, np.inf
         for k in range(1, k_max + 1):
             if len(Zs) < 2 * k:           # not enough data for k comps
                 break
             try:
                 gm = GaussianMixture(n_components=k, covariance_type='full',
-                                     reg_covar=reg_covar, random_state=seed,
+                                     reg_covar=rc, random_state=seed,
                                      max_iter=200, n_init=1)
                 gm.fit(Zs)
                 aic = gm.aic(Zs)
