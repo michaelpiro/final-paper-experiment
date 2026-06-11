@@ -123,6 +123,9 @@ DEFAULT_CFG = dict(
     sig_dom_weight=0.8, sig_mean_weight=0.2,
     target_class=None,    # None = auto dominant labeled class; 1..9 = manual
     foreign_class=None,   # None = auto class absent from patch; 1..9 = manual
+    active_detectors=None,  # None = all of DET_ORDER; else a subset to run/show
+    run_inpatch=True,       # run the in-patch (dominant/target_class) signature
+    run_foreign=True,       # run the foreign (absent/foreign_class) signature
     amplitude=0.15, target_fraction=0.10, edge_guard=5,
     n_budget=None,               # None = full train box (no subsampling); int = side-crop
     k=5,
@@ -425,27 +428,45 @@ def _savefig(fig, path):
     print(f"  [fig] {os.path.relpath(path)}", flush=True)
 
 
+def _active_set(cfg):
+    """The detectors to compute/show. cfg['active_detectors']=None → all of
+    DET_ORDER; otherwise the given subset. 'NeighborMLP-CFAR' implies its base
+    'NeighborMLP' is scored too (the CFAR variant is derived from it)."""
+    act = cfg.get('active_detectors')
+    if act is None:
+        return set(DET_ORDER)
+    s = set(act)
+    if 'NeighborMLP-CFAR' in s:
+        s.add('NeighborMLP')
+    return s
+
+
 # ---------------------------------------------------------------------------
 def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
-    """Score every AVAILABLE detector on (pix, nbr).  Returns {det_name: scores}.
+    """Score the REQUESTED detectors on (pix, nbr).  Returns {det_name: scores}.
 
-    Deep detectors are skipped gracefully if their model is absent from `models`.
+    A detector is skipped if it is not in cfg['active_detectors'] (None = all),
+    or if its deep model is absent from `models`.
     """
     pix = pix.astype(np.float32)
     nbr = nbr.astype(np.float32)
+    act = _active_set(cfg)
     out = {}
     floor = float(cfg.get('baseline_eig_floor', 1e-12))
-    if models.get('dsm') is not None:
+    if 'DSM' in act and models.get('dsm') is not None:
         out['DSM'] = dsm_additive(pix, tr_raw, models['dsm'], sig)
-    if models.get('nmlp') is not None:
+    if 'NeighborMLP' in act and models.get('nmlp') is not None:
         out['NeighborMLP'] = score_nmlp_additive(models['nmlp'], pix, nbr, tr_raw, tr_nbr, sig)
-    out['AMF'] = amf_global(pix, tr_raw, sig, eig_floor=floor)
-    amf_loc, _ = amf_cem_local_scm(
-        pix, nbr, sig, device=device,
-        loading=float(cfg.get('local_scm_loading', 1e-8)))
-    out['AMF-local'] = amf_loc
-    out['GMM-Levin'] = gmm_glrt_levin_additive(pix, tr_raw, sig,
-                                               p_steps=cfg.get('gmm_steps', 50))
+    if 'AMF' in act:
+        out['AMF'] = amf_global(pix, tr_raw, sig, eig_floor=floor)
+    if 'AMF-local' in act:
+        amf_loc, _ = amf_cem_local_scm(
+            pix, nbr, sig, device=device,
+            loading=float(cfg.get('local_scm_loading', 1e-8)))
+        out['AMF-local'] = amf_loc
+    if 'GMM-Levin' in act:
+        out['GMM-Levin'] = gmm_glrt_levin_additive(pix, tr_raw, sig,
+                                                   p_steps=cfg.get('gmm_steps', 50))
     return out
 
 
@@ -486,7 +507,8 @@ def run_detection(sig, sig_label, out_dir, ctx):
     lam   = float(cfg.get('cfar_lam', 0.0))
     tr0, tr1, tc0, tc1 = ctx['train_box']
     tr_shape = (tr1 - tr0, tc1 - tc0)
-    if 'NeighborMLP' in test_scores and models.get('nmlp') is not None:
+    if ('NeighborMLP-CFAR' in _active_set(cfg)
+            and 'NeighborMLP' in test_scores and models.get('nmlp') is not None):
         test_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
             test_scores['NeighborMLP'], models['nmlp'], planted, te_nbr,
             (H_b, W_b), k_win, cfar_lam=lam)
@@ -704,37 +726,41 @@ def run_detection(sig, sig_label, out_dir, ctx):
 RELOAD_OVERRIDE_KEYS = [
     'cfar_bg_window', 'cfar_guard', 'cfar_lam',
     'pfa_target', 'amplitude', 'target_fraction', 'edge_guard',
-    'target_class', 'foreign_class',
+    'target_class', 'foreign_class', 'active_detectors', 'run_inpatch', 'run_foreign',
     'gmm_steps', 'gmm_K', 'local_scm_loading', 'baseline_eig_floor',
 ]
 
 
 def _save_models(run_dir, models, cfg, sidx, train_box, test_box):
-    torch.save({
-        'cfg': cfg, 'sidx': sidx, 'train_box': train_box, 'test_box': test_box,
-        'dsm':  models['dsm'].state_dict(),
-        'nmlp': models['nmlp'].state_dict(),
-    }, os.path.join(run_dir, 'models.pt'))
+    blob = {'cfg': cfg, 'sidx': sidx, 'train_box': train_box, 'test_box': test_box}
+    if models.get('dsm') is not None:
+        blob['dsm'] = models['dsm'].state_dict()
+    if models.get('nmlp') is not None:
+        blob['nmlp'] = models['nmlp'].state_dict()
+    torch.save(blob, os.path.join(run_dir, 'models.pt'))
     print(f"  saved models -> {os.path.join(run_dir, 'models.pt')}", flush=True)
 
 
 def _build_models_from_ckpt(ckpt, D, cfg, device):
-    """Reconstruct DSM + NeighborMLP and load their weights (incl. frozen whitening)."""
-    dsm = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'],
-                   whitening=_placeholder_whitening(D))
-    dsm.load_state_dict(ckpt['dsm']); dsm.to(device).eval()
-
-    nm = NeighborMLPDenoiser(
-        D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
-        enc_hidden=cfg.get('nmlp_enc_hidden'),
-        score_hidden=cfg.get('nmlp_score_hidden'),
-        hidden=cfg.get('nmlp_hidden', 128),
-        n_layers=cfg.get('nmlp_n_layers', 3),
-        sigma=_whitened_sigma(cfg), activation=cfg['activation'],
-        whitening=_placeholder_whitening(D))
-    nm.load_state_dict(ckpt['nmlp']); nm.to(device).eval()
-
-    return {'dsm': dsm, 'nmlp': nm}
+    """Reconstruct whichever of DSM / NeighborMLP are present in the checkpoint."""
+    models = {}
+    if 'dsm' in ckpt:
+        dsm = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'],
+                       whitening=_placeholder_whitening(D))
+        dsm.load_state_dict(ckpt['dsm']); dsm.to(device).eval()
+        models['dsm'] = dsm
+    if 'nmlp' in ckpt:
+        nm = NeighborMLPDenoiser(
+            D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
+            enc_hidden=cfg.get('nmlp_enc_hidden'),
+            score_hidden=cfg.get('nmlp_score_hidden'),
+            hidden=cfg.get('nmlp_hidden', 128),
+            n_layers=cfg.get('nmlp_n_layers', 3),
+            sigma=_whitened_sigma(cfg), activation=cfg['activation'],
+            whitening=_placeholder_whitening(D))
+        nm.load_state_dict(ckpt['nmlp']); nm.to(device).eval()
+        models['nmlp'] = nm
+    return models
 
 
 # ---------------------------------------------------------------------------
@@ -841,21 +867,23 @@ def main():
     else:
         print("No labeled class is absent from the patch — skipping foreign run.", flush=True)
 
-    # ---- Models: LOAD (reload mode) or TRAIN once (signature-independent) ----
+    # ---- Models: LOAD (reload mode) or TRAIN only what's requested ----
+    act = _active_set(cfg)
     if ckpt is not None:
         print("Loading trained nets (no training) ...", flush=True)
         models = _build_models_from_ckpt(ckpt, D, cfg, device)
     else:
-        print("Training deep nets (best-epoch checkpointing) ...", flush=True)
         def _fl(m):
             return getattr(m, '_final_loss', float('nan'))
-        t0 = time.time()
-        dsm_net = _train_dsm_best(tr_raw, cfg, device)
-        print(f"  DSM done ({time.time()-t0:.0f}s)  best loss={_fl(dsm_net):.4f}", flush=True)
-        t0 = time.time()
-        nmlp = _train_nmlp_best(tr_raw, tr_nbr, cfg, device)
-        print(f"  NeighborMLP done ({time.time()-t0:.0f}s)  best loss={_fl(nmlp):.4f}", flush=True)
-        models = {'dsm': dsm_net, 'nmlp': nmlp}
+        models = {}
+        if 'DSM' in act:
+            print("Training DSM ...", flush=True)
+            t0 = time.time(); models['dsm'] = _train_dsm_best(tr_raw, cfg, device)
+            print(f"  DSM done ({time.time()-t0:.0f}s)  best loss={_fl(models['dsm']):.4f}", flush=True)
+        if {'NeighborMLP', 'NeighborMLP-CFAR'} & act:
+            print("Training NeighborMLP ...", flush=True)
+            t0 = time.time(); models['nmlp'] = _train_nmlp_best(tr_raw, tr_nbr, cfg, device)
+            print(f"  NeighborMLP done ({time.time()-t0:.0f}s)  best loss={_fl(models['nmlp']):.4f}", flush=True)
         _save_models(run_dir, models, cfg, sidx, tr_box_eff, test_box)
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
@@ -863,9 +891,10 @@ def main():
                te_gt=te_gt, data_norm=data_norm, gt=gt,
                test_box=test_box, train_box=tr_box_eff, sidx=sidx)
 
-    # ---- Run detection twice ----
-    run_detection(sig_in, f'inpatch-{dom_name}', run_dir, ctx)
-    if sig_for is not None:
+    # ---- Run detection (in-patch and/or foreign) ----
+    if cfg.get('run_inpatch', True):
+        run_detection(sig_in, f'inpatch-{dom_name}', run_dir, ctx)
+    if cfg.get('run_foreign', True) and sig_for is not None:
         run_detection(sig_for, f'foreign-{CLS_NAMES[fcls]}',
                       os.path.join(run_dir, 'foreign'), ctx)
 
@@ -956,15 +985,18 @@ def run_from_cfg(overrides: dict, dry_run: bool = False):
         sig_for = (mu_for / (np.linalg.norm(mu_for) + 1e-12) * scalar).astype(np.float32)
         print(f"foreign signature: class={CLS_NAMES[fcls]}  scaled ||s||={scalar:.4g}", flush=True)
 
-    print("Training deep nets (best-epoch checkpointing) ...", flush=True)
+    # Only train the deep nets that the requested detector set actually needs.
+    act = _active_set(cfg)
     def _fl(m): return getattr(m, '_final_loss', float('nan'))
-    t0 = time.time()
-    dsm_net = _train_dsm_best(tr_raw, cfg, device)
-    print(f"  DSM done ({time.time()-t0:.0f}s)  best loss={_fl(dsm_net):.4f}", flush=True)
-    t0 = time.time()
-    nmlp = _train_nmlp_best(tr_raw, tr_nbr, cfg, device)
-    print(f"  NeighborMLP done ({time.time()-t0:.0f}s)  best loss={_fl(nmlp):.4f}", flush=True)
-    models = {'dsm': dsm_net, 'nmlp': nmlp}
+    models = {}
+    if 'DSM' in act:
+        print("Training DSM ...", flush=True)
+        t0 = time.time(); models['dsm'] = _train_dsm_best(tr_raw, cfg, device)
+        print(f"  DSM done ({time.time()-t0:.0f}s)  best loss={_fl(models['dsm']):.4f}", flush=True)
+    if {'NeighborMLP', 'NeighborMLP-CFAR'} & act:
+        print("Training NeighborMLP ...", flush=True)
+        t0 = time.time(); models['nmlp'] = _train_nmlp_best(tr_raw, tr_nbr, cfg, device)
+        print(f"  NeighborMLP done ({time.time()-t0:.0f}s)  best loss={_fl(models['nmlp']):.4f}", flush=True)
     _save_models(run_dir, models, cfg, sidx, tr_box_eff, test_box)
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
@@ -972,8 +1004,9 @@ def run_from_cfg(overrides: dict, dry_run: bool = False):
                te_gt=te_gt, data_norm=data_norm, gt=gt,
                test_box=test_box, train_box=tr_box_eff, sidx=sidx)
 
-    run_detection(sig_in, f'inpatch-{dom_name}', run_dir, ctx)
-    if sig_for is not None:
+    if cfg.get('run_inpatch', True):
+        run_detection(sig_in, f'inpatch-{dom_name}', run_dir, ctx)
+    if cfg.get('run_foreign', True) and sig_for is not None:
         run_detection(sig_for, f'foreign-{CLS_NAMES[fcls]}',
                       os.path.join(run_dir, 'foreign'), ctx)
 
