@@ -103,8 +103,8 @@ HIT_MARK    = '#39ff14'   # lime — true detections
 # Fixed display order + colors for the detectors.
 DET_ORDER = [
     'DSM',
-    # 'CF-Attn',
-    # 'CF-Attn-CFAR',
+    'CF-Attn',
+    'CF-Attn-CFAR',
     'NeighborMLP',
     'NeighborMLP-CFAR',
     # 'NeighborRidge',
