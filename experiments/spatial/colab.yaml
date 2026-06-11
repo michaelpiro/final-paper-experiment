@@ -48,13 +48,15 @@ lam_div:       0.05
 lam_cov:       1.0e-5
 
 # ------- NeighborMLP -------
-nmlp_d_lat:    32
-nmlp_K:        8
-nmlp_hidden:   128
-nmlp_n_layers: 2
-nmlp_epochs:   1000
-nmlp_lr:       3.0e-4
-nmlp_batch:    256
+# encoder:  D → enc_hidden → d_lat              (e.g. D→128→64→16)
+# denoiser: (D + (K+1)*d_lat) → score_hidden → D  (e.g. (D+9*16)→128→D)
+nmlp_d_lat:       16
+nmlp_K:           8
+nmlp_enc_hidden:  [128, 64]
+nmlp_score_hidden: [128]
+nmlp_epochs:      1000
+nmlp_lr:          3.0e-4
+nmlp_batch:       256
 
 # ------- THANTD -------
 thantd_m:               7

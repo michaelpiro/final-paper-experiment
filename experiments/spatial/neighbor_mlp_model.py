@@ -25,20 +25,28 @@ import torch.nn as nn
 class NeighborMLPDenoiser(nn.Module):
     """Spatially-aware denoising score estimator via top-K neighbor selection."""
 
-    def __init__(self, D: int, d_lat: int = 32, K: int = 8,
+    def __init__(self, D: int, d_lat: int = 16, K: int = 8,
+                 enc_hidden=None, score_hidden=None,
                  hidden: int = 128, n_layers: int = 3,
                  sigma: float = 0.1, activation: str = 'silu',
                  whitening=None):
         """
         Parameters
         ----------
-        D         : spectral / latent dimension
-        d_lat     : shared encoder output dimension
-        K         : number of latent-nearest neighbors to use (K <= M)
-        hidden    : width of both phi and f MLPs
-        n_layers  : total layers in each MLP (including input/output)
-        sigma     : DSM noise level (also used in the Tweedie score formula)
-        activation: 'silu' or 'relu'
+        D            : spectral / latent dimension (d_input)
+        d_lat        : shared encoder OUTPUT dimension (d_embed)
+        K            : number of latent-nearest neighbors to use (K <= M)
+        enc_hidden   : encoder HIDDEN widths (list). The encoder is
+                       D -> enc_hidden[0] -> ... -> enc_hidden[-1] -> d_lat.
+                       e.g. enc_hidden=(128, 64), d_lat=16  →  D→128→64→16.
+        score_hidden : denoiser HIDDEN widths (list). The denoiser is
+                       (D + (K+1)*d_lat) -> score_hidden[0] -> ... -> D.
+                       e.g. score_hidden=(128,)  →  (D+(K+1)*16)→128→D.
+        hidden,      : LEGACY uniform spec — used only when enc_hidden /
+        n_layers       score_hidden are None (builds [hidden]*(n_layers-1) for
+                       both MLPs, reproducing the old fixed-width architecture).
+        sigma        : DSM noise level (also used in the Tweedie score formula)
+        activation   : 'silu' or 'relu'
         """
         super().__init__()
         self.D     = D
@@ -47,20 +55,29 @@ class NeighborMLPDenoiser(nn.Module):
         self.sigma = sigma
         self.whitening = whitening
 
+        # Legacy fallback: derive uniform hidden lists from (hidden, n_layers).
+        if enc_hidden is None:
+            enc_hidden = [hidden] * max(n_layers - 1, 1)
+        if score_hidden is None:
+            score_hidden = [hidden] * max(n_layers - 1, 1)
+
         act_cls = {'silu': nn.SiLU, 'relu': nn.ReLU}[activation]
 
-        def _mlp(in_dim, out_dim, hidden, n_layers):
-            layers = [nn.Linear(in_dim, hidden), act_cls()]
-            for _ in range(max(n_layers - 2, 0)):
-                layers += [nn.Linear(hidden, hidden), act_cls()]
-            layers.append(nn.Linear(hidden, out_dim))
+        def _mlp(in_dim, hidden_list, out_dim):
+            """Build an MLP  in_dim -> hidden_list[0] -> ... -> out_dim."""
+            dims = [in_dim] + list(hidden_list)
+            layers = []
+            for a, b in zip(dims[:-1], dims[1:]):
+                layers += [nn.Linear(a, b), act_cls()]
+            layers.append(nn.Linear(dims[-1], out_dim))
             return nn.Sequential(*layers)
 
-        # Shared encoder: D -> d_lat
-        self.phi = _mlp(D, d_lat, hidden, n_layers)
+        # Shared encoder: D -> enc_hidden -> d_lat   (e.g. D→128→64→16)
+        self.phi = _mlp(D, enc_hidden, d_lat)
 
-        # Denoiser: [y_i | z_i | z_j1...z_jK] -> D
-        self.f = _mlp(D + d_lat * (1 + K), D, hidden, n_layers)
+        # Denoiser: [y_i | z_i | z_j1...z_jK] -> score_hidden -> D
+        # input dim = D + (K+1)*d_lat   (the +1 is the query's own embedding z_i)
+        self.f = _mlp(D + d_lat * (1 + K), score_hidden, D)
 
     def whiten(self, x: torch.Tensor) -> torch.Tensor:
         return self.whitening(x) if self.whitening is not None else x

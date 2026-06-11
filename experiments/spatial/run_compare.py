@@ -156,8 +156,8 @@ DEFAULT_CFG = dict(
     # CF-Attn
     cfattn_h=64, cfattn_K=9, cfattn_epochs=300, cfattn_lr=3e-4, cfattn_eps=1e-4,
     lam_ent=0.05, lam_div=0.05, lam_cov=1e-5,
-    # NeighborMLP
-    nmlp_d_lat=32, nmlp_K=8, nmlp_hidden=128, nmlp_n_layers=3,
+    # NeighborMLP — encoder: D→enc_hidden→d_lat ; denoiser: (D+(K+1)*d_lat)→score_hidden→D
+    nmlp_d_lat=16, nmlp_K=8, nmlp_enc_hidden=[128, 64], nmlp_score_hidden=[128],
     nmlp_epochs=300, nmlp_lr=3e-4, nmlp_batch=256,
     # DSM
     dsm_hidden=[64, 64], dsm_epochs=1000, dsm_lr=5e-4,
@@ -720,7 +720,7 @@ def _build_models_from_ckpt(ckpt, D, cfg, device):
 
     nm = NeighborMLPDenoiser(
         D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
-        hidden=cfg['nmlp_hidden'], n_layers=cfg['nmlp_n_layers'],
+        enc_hidden=cfg['nmlp_enc_hidden'], score_hidden=cfg['nmlp_score_hidden'],
         sigma=_whitened_sigma(cfg), activation=cfg['activation'],
         whitening=_placeholder_whitening(D))
     nm.load_state_dict(ckpt['nmlp']); nm.to(device).eval()

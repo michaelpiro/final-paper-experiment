@@ -110,8 +110,8 @@ DEFAULT_CFG = dict(
     cfattn_h=64, cfattn_K=9, cfattn_epochs=300,
     cfattn_lr=3e-4, cfattn_eps=1e-4,
     lam_ent=0.05, lam_div=0.05, lam_cov=1e-5,
-    # NeighborMLP
-    nmlp_d_lat=32, nmlp_K=8, nmlp_hidden=128, nmlp_n_layers=3,
+    # NeighborMLP — encoder: D→enc_hidden→d_lat ; denoiser: (D+(K+1)*d_lat)→score_hidden→D
+    nmlp_d_lat=16, nmlp_K=8, nmlp_enc_hidden=[128, 64], nmlp_score_hidden=[128],
     nmlp_epochs=300, nmlp_lr=3e-4, nmlp_batch=256,
     # THANTD
     thantd_m=7, thantd_d=64, thantd_heads=4,
@@ -237,7 +237,7 @@ def _train_nmlp(tr_raw, tr_nbr_raw, cfg, device):
     sigma = _whitened_sigma(cfg)
     nmlp = NeighborMLPDenoiser(
         D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
-        hidden=cfg['nmlp_hidden'], n_layers=cfg['nmlp_n_layers'],
+        enc_hidden=cfg['nmlp_enc_hidden'], score_hidden=cfg['nmlp_score_hidden'],
         sigma=sigma, activation=cfg['activation'], whitening=W).to(device)
     opt  = torch.optim.AdamW(nmlp.parameters(), lr=cfg['nmlp_lr'],
                               weight_decay=cfg['weight_decay'])
@@ -407,7 +407,7 @@ def run_scenario(sid, scenario, n_budget, cfg,
         print("  [NeighborMLP] loading checkpoint", flush=True)
         nmlp = NeighborMLPDenoiser(
             D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
-            hidden=cfg['nmlp_hidden'], n_layers=cfg['nmlp_n_layers'],
+            enc_hidden=cfg['nmlp_enc_hidden'], score_hidden=cfg['nmlp_score_hidden'],
             sigma=_whitened_sigma(cfg), activation=cfg['activation'],
             whitening=_placeholder_whitening(D))
         nmlp.load_state_dict(torch.load(nmlp_ckpt, map_location='cpu')['state_dict'])
