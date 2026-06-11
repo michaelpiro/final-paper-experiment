@@ -121,6 +121,8 @@ DEFAULT_CFG = dict(
     min_pixels=2000,
     random_scenario_seeds=[42, 123, 456, 789],
     sig_dom_weight=0.8, sig_mean_weight=0.2,
+    target_class=None,    # None = auto dominant labeled class; 1..9 = manual
+    foreign_class=None,   # None = auto class absent from patch; 1..9 = manual
     amplitude=0.15, target_fraction=0.10, edge_guard=5,
     n_budget=None,               # None = full train box (no subsampling); int = side-crop
     k=5,
@@ -204,6 +206,43 @@ def _pick_foreign_class(gt, present):
     if not cand:
         return None
     return max(cand, key=lambda c: int((gt == c).sum()))
+
+
+def _class_signature(cls_id, data_norm, gt, te_raw, w_dom, w_mean):
+    """In-patch-style signature for an EXPLICIT class id.
+
+    Mean spectrum of `cls_id` over the WHOLE image (cleaner than box-only),
+    blended with the test-patch mean exactly as compute_signature does:
+        s = w_dom * mu_class + w_mean * mu_patch
+    """
+    D = data_norm.shape[-1]
+    mu_cls = data_norm.reshape(-1, D)[gt.ravel() == int(cls_id)].mean(axis=0)
+    mu_patch = te_raw.reshape(-1, D).mean(axis=0)
+    return (w_dom * mu_cls + w_mean * mu_patch).astype(np.float32)
+
+
+def _resolve_inpatch_signature(cfg, gt, data_norm, te_raw, box):
+    """Return (sig_in, dom_cls, dom_name). Honors cfg['target_class'] (1..9) if
+    set, otherwise auto-picks the dominant labeled class of the box."""
+    r0, r1, c0, c1 = box
+    tcls = cfg.get('target_class')
+    w_dom, w_mean = float(cfg['sig_dom_weight']), float(cfg['sig_mean_weight'])
+    if tcls is not None:
+        tcls = int(tcls)
+        sig = _class_signature(tcls, data_norm, gt, te_raw, w_dom, w_mean)
+        return sig, tcls, CLS_NAMES.get(tcls, f'cls{tcls}')
+    sig, dom_cls, dom_name = compute_signature(
+        gt[r0:r1, c0:c1], data_norm[r0:r1, c0:c1], w_dom=w_dom, w_mean=w_mean)
+    return sig.astype(np.float32), dom_cls, dom_name
+
+
+def _resolve_foreign_class(cfg, gt, te_gt):
+    """Return the foreign class id. Honors cfg['foreign_class'] if set,
+    otherwise auto-picks a labeled class absent from the patch."""
+    fcls = cfg.get('foreign_class')
+    if fcls is not None:
+        return int(fcls)
+    return _pick_foreign_class(gt, np.unique(te_gt))
 
 
 def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6, cfar_lam=0.0):
@@ -665,6 +704,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
 RELOAD_OVERRIDE_KEYS = [
     'cfar_bg_window', 'cfar_guard', 'cfar_lam',
     'pfa_target', 'amplitude', 'target_fraction', 'edge_guard',
+    'target_class', 'foreign_class',
     'gmm_steps', 'gmm_K', 'local_scm_loading', 'baseline_eig_floor',
 ]
 
@@ -782,15 +822,15 @@ def main():
     print(f"test={len(te_raw)} px  ({H_b}×{W_b})", flush=True)
 
     # ---- In-patch signature (dominant class of the test patch) ----
-    sig_in, dom_cls, dom_name = compute_signature(
-        gt[r0:r1, c0:c1], data_norm[r0:r1, c0:c1],
-        w_dom=float(cfg['sig_dom_weight']), w_mean=float(cfg['sig_mean_weight']))
+    sig_in, dom_cls, dom_name = _resolve_inpatch_signature(
+        cfg, gt, data_norm, te_raw, test_box)
     sig_in = sig_in.astype(np.float32)
-    print(f"in-patch signature: dominant={dom_name}  ||s||={np.linalg.norm(sig_in):.4g}",
+    _tlbl = 'manual' if cfg.get('target_class') is not None else 'dominant'
+    print(f"in-patch signature: {_tlbl}={dom_name}  ||s||={np.linalg.norm(sig_in):.4g}",
           flush=True)
 
     # ---- Foreign signature: a class NOT in the patch, scaled to mean patch-pixel norm ----
-    fcls = _pick_foreign_class(gt, np.unique(te_gt))
+    fcls = _resolve_foreign_class(cfg, gt, te_gt)
     sig_for = None
     if fcls is not None:
         mu_for = data_norm.reshape(-1, D)[gt.ravel() == fcls].mean(axis=0)
@@ -901,14 +941,14 @@ def run_from_cfg(overrides: dict, dry_run: bool = False):
     te_gt = gt[r0:r1, c0:c1].ravel()
     print(f"test={len(te_raw)} px  ({H_b}×{W_b})", flush=True)
 
-    sig_in, dom_cls, dom_name = compute_signature(
-        gt[r0:r1, c0:c1], data_norm[r0:r1, c0:c1],
-        w_dom=float(cfg['sig_dom_weight']), w_mean=float(cfg['sig_mean_weight']))
+    sig_in, dom_cls, dom_name = _resolve_inpatch_signature(
+        cfg, gt, data_norm, te_raw, test_box)
     sig_in = sig_in.astype(np.float32)
-    print(f"in-patch signature: dominant={dom_name}  ||s||={np.linalg.norm(sig_in):.4g}",
+    _tlbl = 'manual' if cfg.get('target_class') is not None else 'dominant'
+    print(f"in-patch signature: {_tlbl}={dom_name}  ||s||={np.linalg.norm(sig_in):.4g}",
           flush=True)
 
-    fcls = _pick_foreign_class(gt, np.unique(te_gt))
+    fcls = _resolve_foreign_class(cfg, gt, te_gt)
     sig_for = None
     if fcls is not None:
         mu_for = data_norm.reshape(-1, D)[gt.ravel() == fcls].mean(axis=0)
