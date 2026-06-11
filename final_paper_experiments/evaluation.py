@@ -42,7 +42,10 @@ def partial_auc(labels: np.ndarray, scores: np.ndarray,
     mask = fpr <= fpr_max
     fpr_cut = np.append(fpr[mask], fpr_max)
     tpr_cut = np.append(tpr[mask], tpr_at_max)
-    raw_pauc = float(np.trapz(tpr_cut, fpr_cut))
+    # np.trapz was renamed to np.trapezoid (NumPy 2.x) and removed in newer
+    # versions -> resolve safely.
+    _trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz", None)
+    raw_pauc = float(_trapz(tpr_cut, fpr_cut))
     return raw_pauc / fpr_max
 
 

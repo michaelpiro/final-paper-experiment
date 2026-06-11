@@ -47,6 +47,8 @@ def main():
         os.path.dirname(os.path.abspath(__file__)), "config.yaml"))
     p.add_argument("--threads", type=int, default=1,
                    help="BLAS/OMP thread cap (1 = safest on macOS Accelerate)")
+    p.add_argument("--plot-only", metavar="RUN_DIR", default=None,
+                   help="regenerate figures from a finished run dir (no training)")
     args = p.parse_args()
 
     _set_threads(args.threads)
@@ -65,6 +67,11 @@ def main():
         torch.set_num_threads(args.threads)
     except Exception:
         pass
+
+    if args.plot_only:
+        from iid_core import replot
+        replot(args.plot_only)
+        return
 
     from iid_core import run_iid
     with open(args.config) as f:

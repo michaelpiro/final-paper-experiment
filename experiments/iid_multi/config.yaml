@@ -39,12 +39,13 @@ n_train_list: [
   1000,
   2000,
   4000,
-#  8000,
+  8000,
+  12000
 ]   # vs-n  (at rho = dsm_sigma_rho)
-rho_list: [0.1]
-#rho_list: [
-#  0.00001, 0.001, 0.005,0.01,0.3,0.5,0.07, 0.1,0.5, 1.0,3.0,10.0
-#]
+#rho_list: [0.1]
+rho_list: [
+  0.00001, 0.001, 0.005,0.01,0.3,0.5,0.07, 0.1,0.5, 1.0,3.0,10.0
+]
 n_fixed_for_rho: 1000                                      # n used for the vs-rho sweep
 
 # ----- metric operating points -----
@@ -116,7 +117,7 @@ lfi_detach_sigma: false        # Sigma in graph (matches original LRao code)
 gmm_K: 9
 
 # ----- reproducibility -----
-seed: [42, 43, 44, 45]   # list of seeds for multiple runs (with different train/test splits)
+seed: [42, 43, 44, 45, 46]   # list of seeds for multiple runs (with different train/test splits)
 
 # ----- output -----
 results_dir: experiments/iid_multi/results

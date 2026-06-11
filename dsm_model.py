@@ -807,17 +807,22 @@ def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
         mu_psi   = psi_0.mean(dim=0)
         centered = psi_0 - mu_psi
         Sigma    = (centered.T @ centered) / max(n - 1, 1)
-        # Guard the LAPACK call: non-finite input makes torch.linalg.svd raise
-        # on Linux but SEGFAULT on macOS (Accelerate). Raise a catchable error
-        # so the training loop aborts gracefully on every platform.
+        Sigma    = 0.5 * (Sigma + Sigma.T)           # symmetrize (numerical)
         if not torch.isfinite(Sigma).all():
             raise RuntimeError("non-finite Sigma in LFI (LRao training diverged)")
-        # Truncated pseudo-inverse (Zschetzsche et al. lfi_diag_autocorr).
-        # torch.linalg.svd is robust; no ridge added so training is unaffected.
-        U, S, Vh  = torch.linalg.svd(Sigma)
-        cutoff    = sigma_cutoff * S[0]
-        S_inv     = torch.where(S > cutoff, 1.0 / S, torch.zeros_like(S))
-        Sigma_inv = Vh.T @ torch.diag(S_inv) @ U.T
+        # Regularized inverse of the (symmetric PSD) score covariance.
+        # We use eigh (NOT svd): for a symmetric matrix eigh is more accurate
+        # and, crucially, its BACKWARD is far better conditioned -- the svd
+        # backward has 1/(s_i^2 - s_j^2) terms that blow up for close/degenerate
+        # singular values, and that blow-up is BLAS/torch-version dependent
+        # (so LRao diverged on some machines but not others). A relative
+        # eigenvalue FLOOR (instead of a hard truncation to 0) keeps Sigma_inv
+        # bounded, which also removes the unbounded-objective divergence.
+        evals, evecs = torch.linalg.eigh(Sigma)      # ascending, symmetric
+        lam_max = evals[-1].clamp_min(1e-12)
+        floor = torch.clamp(evals, min=sigma_cutoff * lam_max)   # relative floor
+        inv = 1.0 / floor
+        Sigma_inv = (evecs * inv) @ evecs.T
 
     # Full Jacobian G = E[∂Ψ(x)/∂x] via vmap+jacrev — one vectorised backward pass
     # instead of 2d sequential forward passes. G shape: (d_out, d).

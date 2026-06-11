@@ -121,6 +121,18 @@ def _roc(labels: np.ndarray, scores: np.ndarray):
         return np.linspace(0, 1, n), np.linspace(0, 1, n), float('nan')
 
 
+# np.trapz was renamed to np.trapezoid in NumPy 2.x and REMOVED in newer
+# versions (np.trapz raises AttributeError). Older code that called np.trapz
+# inside a try/except returned NaN -> the partial-AUC figure came out EMPTY.
+# Resolve the trapezoid rule safely, with a manual fallback if neither exists.
+def _trapz(y, x):
+    fn = getattr(np, "trapezoid", None) or getattr(np, "trapz", None)
+    if fn is not None:
+        return fn(y, x)
+    y = np.asarray(y, float); x = np.asarray(x, float)   # manual trapezoid
+    return float(np.sum((x[1:] - x[:-1]) * (y[1:] + y[:-1]) / 2.0))
+
+
 def _pauc(labels: np.ndarray, scores: np.ndarray, fpr_max: float = 0.1) -> float:
     """Partial AUC over FPR ∈ [0, fpr_max], normalized to [0,1] (so 0.5≈chance)."""
     try:
@@ -129,8 +141,9 @@ def _pauc(labels: np.ndarray, scores: np.ndarray, fpr_max: float = 0.1) -> float
         keep = fpr < fpr_max
         fpr_c = np.concatenate([fpr[keep], [fpr_max]])
         tpr_c = np.concatenate([tpr[keep], [tpr_at]])
-        return float(np.trapz(tpr_c, fpr_c) / fpr_max)
-    except Exception:
+        return float(_trapz(tpr_c, fpr_c) / fpr_max)
+    except Exception as exc:
+        print(f"      [warn] pAUC failed: {exc!r}", flush=True)
         return float('nan')
 
 
@@ -355,22 +368,26 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
                 dynamic_ncols=True, leave=False)
     for ep in pbar:
         model.train()
-        perm = torch.randperm(N); tot = 0.0; nb = 0
+        perm = torch.randperm(N)
+        tot = 0.0
+        nb = 0
         try:
             for i in range(0, N, bs):
-                b    = X[perm[i:i + bs]]
+                opt.zero_grad()
+                b = X[perm[i:i + bs]].detach()
                 loss = lfi_loss_mode2(model, b, cfg['lfi_delta_theta'],
                                       cfg['lfi_sigma_cutoff'],
                                       detach_sigma=cfg['lfi_detach_sigma'])
                 if not torch.isfinite(loss):
                     raise FloatingPointError("non-finite LRao loss")
-                opt.zero_grad(); loss.backward()
+                loss.backward()
                 # clip grads: the LFI objective is unbounded, so without this
                 # the score net can blow up to Inf/NaN in a single step (the
                 # divergence that then crashes the covariance SVD).
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 opt.step()
-                tot += loss.item(); nb += 1
+                tot += loss.item()
+                nb += 1
         except Exception as exc:
             print(f"      [warn] LRao {label} aborted at epoch {ep}: {exc}",
                   flush=True)
@@ -634,11 +651,18 @@ def _apply_log_xticks(ax, x):
 
 
 def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
-             out_pdf: str, logx: bool = False, series_std: dict = None):
+             out_pdf: str, logx: bool = False, series_std: dict = None,
+             mark_x: float = None, mark_y: float = None,
+             mark_label: str = 'KDE ρ', top_series: str = None):
     """Generic 'metric vs x' line plot.
 
     series      : {det -> list of mean values}
     series_std  : optional {det -> list of std values} — draws ±1σ shaded band
+    mark_x      : optional x to highlight with a vertical line (e.g. the ρ the
+                  KDE/auto selector picks); mark_y adds a star at (mark_x, mark_y).
+    top_series  : optional detector name (e.g. 'DSM'); marks its highest and
+                  second-highest y-values with right-side y-ticks (the values)
+                  + point highlights, so the best achievable level is readable.
     """
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
     x = np.asarray(xvals, dtype=float)
@@ -653,12 +677,40 @@ def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
         if series_std and det in series_std:
             sd = np.asarray(series_std[det], dtype=float)
             ax.fill_between(x, ys - sd, ys + sd, alpha=0.15, color=c)
+    if mark_x is not None and np.isfinite(mark_x):
+        ax.axvline(mark_x, color='k', ls='--', lw=1.2, alpha=0.7,
+                   label=f'{mark_label}={mark_x:.3g}')
+        if mark_y is not None and np.isfinite(mark_y):
+            ax.plot([mark_x], [mark_y], marker='*', ms=15, color='k',
+                    zorder=5, label='_nolegend_')
     if logx:
         _apply_log_xticks(ax, x)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(alpha=0.3, which='both')
+
+    # highlight + label the highest / second-highest value of `top_series`
+    if top_series and top_series in series and series[top_series] is not None:
+        yt = np.asarray(series[top_series], dtype=float)
+        fin = np.isfinite(yt)
+        if fin.sum() >= 1:
+            c = _det_color(top_series)
+            order = [i for i in np.argsort(yt) if fin[i]][::-1]   # desc, finite
+            top = order[:2]
+            for rank, i in enumerate(top):
+                ax.plot([x[i]], [yt[i]], color=c, zorder=7,
+                        marker='*' if rank == 0 else 'o',
+                        ms=15 if rank == 0 else 10, mec='k', mew=0.8)
+                # value label next to the point: best above, 2nd below
+                dy = 11 if rank == 0 else -15
+                tag = 'best' if rank == 0 else '2nd'
+                ax.annotate(f'{tag} {yt[i]:.3f}', (x[i], yt[i]),
+                            textcoords='offset points', xytext=(0, dy),
+                            ha='center', va='bottom' if dy > 0 else 'top',
+                            fontsize=8, fontweight='bold', color=c, zorder=8,
+                            bbox=dict(boxstyle='round,pad=0.2', fc='white',
+                                      ec=c, lw=0.8, alpha=0.9))
     ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.02, 1.0),
               borderaxespad=0.)
     fig.tight_layout()
@@ -738,6 +790,7 @@ def run_iid(cfg: dict, mode: str):
     n_list   = sorted(set(_ensure_list(cfg['n_train_list'])))
     rho_list = sorted(set(_ensure_list(cfg.get(
         'rho_list', [0.001, 0.003, 0.01, 0.03, 0.1, 0.3]))))
+
     # dsm_sigma_rho may be a number, or 'auto'/'auto-sm' (data-driven per-n
     # sigma via Parzen-bandwidth LOO; see train_dsm_local). rho_fixed is the
     # numeric reference still needed for the Reg-AMF loading and ROC pick.
@@ -905,6 +958,36 @@ def run_iid(cfg: dict, mode: str):
         json.dump(metrics, open(os.path.join(run_dir, 'metrics.json'), 'w'),
                   indent=2, default=str)
 
+    # ---- the rho actually chosen by our KDE/auto selector ------------------
+    # Compute the sigma the DSM uses (Parzen-LOO / Ledoit-Wolf) on the SAME
+    # whitened tr_f, train DSM at exactly that rho, and record it so the vs-rho
+    # figure can mark where the data-driven choice lands on the curve.
+    try:
+        W_f = _make_whitening(tr_f, cfg, seed=seed)
+        Zw = W_f(torch.tensor(np.asarray(tr_f, dtype=np.float32))
+                 ).detach().cpu().numpy()
+        sel = str(cfg.get('dsm_sigma_rho', 'auto-sm')).lower()
+        if sel in ('lw', 'ledoit', 'ledoitwolf'):
+            sig_kde = select_sigma_ledoitwolf(Zw, seed=seed)
+        else:
+            crit = 'scorematch' if sel.endswith('sm') else 'loglik'
+            sig_kde = select_sigma_parzen(Zw, seed=seed, criterion=crit)
+        rho_kde = float(sig_kde ** 2)
+        dsm_k, h_k = train_dsm_local(tr_f, {**cfg, 'dsm_sigma_rho': rho_kde},
+                                     seed, f'rhoKDE_n{n_fixed}')
+        loss_curves[f'DSM_rhoKDE_n{n_fixed}'] = h_k
+        sc_k = score_dsm_add(dsm_k, tr_f, test_planted, s_raw)
+        au_k, _, pd_k = _mtr(sc_k)
+        metrics['rho_kde'] = rho_kde
+        metrics['vs_rho_kde'] = {'rho': rho_kde, 'auc': au_k, 'pd': pd_k}
+        store[f'vsRho/DSM_rhoKDE'] = np.asarray(sc_k, np.float32)
+        print(f"  ρ_KDE={rho_kde:<.4g}  DSM auc={au_k:.3f} "
+              f"pd@{pfa}={pd_k:.3f}  (the rho we actually use)", flush=True)
+        json.dump(metrics, open(os.path.join(run_dir, 'metrics.json'), 'w'),
+                  indent=2, default=str)
+    except Exception as exc:
+        print(f"  [warn] KDE-rho point skipped: {exc}", flush=True)
+
     # ROC at rho_fixed (use the ρ in rho_list closest to dsm_sigma_rho)
     rho_roc = min(rho_list, key=lambda r: abs(r - rho_fixed))
     roc_rho = {d: store[f'vsRho/{d}_rho{rho_roc}'] for d in DETS}
@@ -933,18 +1016,157 @@ def run_iid(cfg: dict, mode: str):
     _plot_vs(n_list, pd_n, 'training samples  n', f'Pd @ Pfa={pfa}',
              f'Pd @ Pfa={pfa} vs n', os.path.join(fig_dir, 'pd_at_fa_vs_n.pdf'),
              logx=True)
+    _rk = metrics.get('vs_rho_kde', {})
     _plot_vs(rho_list, auc_r, r'DSM noise level  $\rho$', 'AUC',
              f'AUC vs ρ (n={n_fixed}, additive)',
-             os.path.join(fig_dir, 'auc_vs_rho.pdf'), logx=True)
+             os.path.join(fig_dir, 'auc_vs_rho.pdf'), logx=True,
+             mark_x=_rk.get('rho'), mark_y=_rk.get('auc'), top_series='DSM')
     _plot_vs(rho_list, pd_r, r'DSM noise level  $\rho$', f'Pd @ Pfa={pfa}',
              f'Pd @ Pfa={pfa} vs ρ (n={n_fixed})',
-             os.path.join(fig_dir, 'pdet_at_pfa_vs_rho.pdf'), logx=True)
+             os.path.join(fig_dir, 'pdet_at_pfa_vs_rho.pdf'), logx=True,
+             mark_x=_rk.get('rho'), mark_y=_rk.get('pd'))
     plot_loss_panel(loss_curves, f'n{n_fixed}',
                     os.path.join(fig_dir, f'loss_curves_n{n_fixed}.png'))
 
     elapsed_min = (time.time() - t_start) / 60.0
     print(f"\nDONE in {elapsed_min:.1f} min. Results -> {run_dir}", flush=True)
     return run_dir, metrics
+
+
+# ---------------------------------------------------------------------------
+# Re-plot only — regenerate figures from a finished run WITHOUT retraining
+# ---------------------------------------------------------------------------
+
+def replot(run_dir: str, recompute: bool = True):
+    """Regenerate all figures for a finished run, no training.
+
+    Works on a single-seed run dir (has metrics.json [+ scores.npz]) or an
+    aggregate dir (metrics_aggregate.json). If ``recompute`` and the per-pixel
+    scores.npz is present, the AUC / partial-AUC / Pd metrics are recomputed
+    from the saved scores and metrics.json is rewritten (this also repairs any
+    metric that was NaN in an older run, e.g. a partial-AUC computed before the
+    np.trapz fix). Otherwise the figures are drawn from the stored numbers.
+    """
+    import glob as _glob
+    agg_file = os.path.join(run_dir, 'metrics_aggregate.json')
+    is_agg = os.path.exists(agg_file)
+    mfile = agg_file if is_agg else os.path.join(run_dir, 'metrics.json')
+    with open(mfile) as f:
+        m = json.load(f)
+
+    fig_dir = os.path.join(run_dir, 'figures')
+    os.makedirs(fig_dir, exist_ok=True)
+    DETS = list(m['vs_n'].keys())
+    n_list, rho_list = m['n_list'], m['rho_list']
+    n_fixed = m.get('n_fixed')
+    pfa = float(m.get('pfa', 0.1))
+    pauc_fpr = float(m.get('pauc_fpr', 0.1))
+    sp = os.path.join(run_dir, 'scores.npz')
+
+    # AGGREGATE dir has no scores.npz of its own -> recompute each seed sub-run
+    # from ITS scores.npz, then re-aggregate (mean/std). This is what makes
+    # `--plot-only <agg_dir>` actually repair a stale (e.g. NaN partial-AUC)
+    # aggregate instead of just re-drawing the old numbers.
+    if is_agg and recompute:
+        seed_dirs = sorted(_glob.glob(os.path.join(run_dir, 'seed_*', '*')))
+        seed_dirs = [d for d in seed_dirs
+                     if os.path.exists(os.path.join(d, 'metrics.json'))]
+        per = []
+        for sd in seed_dirs:
+            replot(sd, recompute=True)                 # fixes that seed's metrics+figs
+            with open(os.path.join(sd, 'metrics.json')) as f:
+                per.append(json.load(f))
+        if per:
+            def _ag(getter):
+                arr = np.array([[float(v) for v in getter(p)] for p in per],
+                               dtype=float)
+                return arr.mean(0).tolist(), arr.std(0).tolist()
+            for d in DETS:
+                for me in ('auc', 'pauc', 'pd'):
+                    if me in per[0]['vs_n'][d]:
+                        mu, sd_ = _ag(lambda p, d=d, me=me: p['vs_n'][d][me])
+                        m['vs_n'][d][me] = mu
+                        m['vs_n'][d][f'{me}_std'] = sd_
+                for me in ('auc', 'pd'):
+                    mu, sd_ = _ag(lambda p, d=d, me=me: p['vs_rho'][d][me])
+                    m['vs_rho'][d][me] = mu
+                    m['vs_rho'][d][f'{me}_std'] = sd_
+            json.dump(m, open(mfile, 'w'), indent=2, default=str)
+            print(f"  re-aggregated {len(per)} seed runs from their scores.npz",
+                  flush=True)
+
+    # optionally recompute metrics straight from the saved per-pixel scores
+    if recompute and not is_agg and os.path.exists(sp):
+        store = np.load(sp)
+        keys = set(store.files)
+        labels = store['labels']
+        for d in DETS:
+            an, pn, dn = [], [], []
+            for n in n_list:
+                k = f'vsN/{d}_n{n}'
+                if k in keys:
+                    sc = store[k]
+                    an.append(_auc(labels, sc)); pn.append(_pauc(labels, sc, pauc_fpr))
+                    dn.append(_pd_at_fa(labels, sc, pfa))
+            if an:
+                m['vs_n'][d].update(auc=an, pauc=pn, pd=dn)
+            ar, pr = [], []
+            for rho in rho_list:
+                k = f'vsRho/{d}_rho{rho}'
+                if k in keys:
+                    sc = store[k]
+                    ar.append(_auc(labels, sc)); pr.append(_pd_at_fa(labels, sc, pfa))
+            if ar:
+                m['vs_rho'][d].update(auc=ar, pd=pr)
+        json.dump(m, open(mfile, 'w'), indent=2, default=str)
+        print(f"  recomputed metrics from {os.path.basename(sp)}", flush=True)
+
+    suf = f"  (n={len(m.get('seeds', []))} seeds)" if is_agg else ''
+    col = lambda sw, me: {d: m[sw][d].get(me) for d in DETS}
+    std = (lambda sw, me: {d: m[sw][d].get(f'{me}_std') for d in DETS}) if is_agg \
+        else (lambda sw, me: None)
+
+    _plot_vs(n_list, col('vs_n', 'auc'), 'training samples  n', 'AUC',
+             f'AUC vs n{suf}', os.path.join(fig_dir, 'auc_vs_n.pdf'),
+             logx=True, series_std=std('vs_n', 'auc'))
+    _plot_vs(n_list, col('vs_n', 'pauc'), 'training samples  n',
+             f'partial AUC (Pfa<{pauc_fpr})', f'Partial AUC (Pfa<{pauc_fpr}) vs n{suf}',
+             os.path.join(fig_dir, 'pauc_vs_n.pdf'),
+             logx=True, series_std=std('vs_n', 'pauc'))
+    _plot_vs(n_list, col('vs_n', 'pd'), 'training samples  n', f'Pd @ Pfa={pfa}',
+             f'Pd @ Pfa={pfa} vs n{suf}', os.path.join(fig_dir, 'pd_at_fa_vs_n.pdf'),
+             logx=True, series_std=std('vs_n', 'pd'))
+    _rk = m.get('vs_rho_kde', {})
+    _plot_vs(rho_list, col('vs_rho', 'auc'), r'DSM noise level  $\rho$', 'AUC',
+             f'AUC vs ρ (n={n_fixed}){suf}', os.path.join(fig_dir, 'auc_vs_rho.pdf'),
+             logx=True, series_std=std('vs_rho', 'auc'),
+             mark_x=_rk.get('rho'), mark_y=_rk.get('auc'), top_series='DSM')
+    _plot_vs(rho_list, col('vs_rho', 'pd'), r'DSM noise level  $\rho$',
+             f'Pd @ Pfa={pfa}', f'Pd @ Pfa={pfa} vs ρ (n={n_fixed}){suf}',
+             os.path.join(fig_dir, 'pdet_at_pfa_vs_rho.pdf'),
+             logx=True, series_std=std('vs_rho', 'pd'),
+             mark_x=_rk.get('rho'), mark_y=_rk.get('pd'))
+
+    # ROC curves from the saved per-pixel scores (single-seed runs only)
+    if os.path.exists(sp):
+        store = np.load(sp)
+        keys = set(store.files); labels = store['labels']
+        nmax = n_list[-1]
+        roc_n = {d: store[f'vsN/{d}_n{nmax}'] for d in DETS
+                 if f'vsN/{d}_n{nmax}' in keys}
+        if roc_n:
+            _plot_roc(roc_n, labels, f'ROC — n={nmax} (additive)',
+                      os.path.join(fig_dir, 'roc_at_nmax.pdf'))
+        rfx = m.get('rho_fixed')
+        if rfx is not None and rho_list:
+            rr = min(rho_list, key=lambda r: abs(r - rfx))
+            roc_r = {d: store[f'vsRho/{d}_rho{rr}'] for d in DETS
+                     if f'vsRho/{d}_rho{rr}' in keys}
+            if roc_r:
+                _plot_roc(roc_r, labels, f'ROC — n={n_fixed}, ρ={rr} (additive)',
+                          os.path.join(fig_dir, 'roc_at_nfixed.pdf'))
+    print(f"replotted figures -> {fig_dir}", flush=True)
+    return fig_dir
 
 
 # ---------------------------------------------------------------------------
@@ -1004,6 +1226,11 @@ def run_iid_multi_seed(cfg: dict, mode: str):
         'vs_n':   {d: {} for d in DETS},
         'vs_rho': {d: {} for d in DETS},
     }
+    # mean KDE/auto-rho point across seeds (the rho our DSM actually uses)
+    _kde = [m['vs_rho_kde'] for m in all_metrics if 'vs_rho_kde' in m]
+    if _kde:
+        agg['vs_rho_kde'] = {k: float(np.mean([d[k] for d in _kde]))
+                             for k in ('rho', 'auc', 'pd')}
     for d in DETS:
         for metric in ('auc', 'pauc', 'pd'):
             if metric in all_metrics[0]['vs_n'][d]:
@@ -1054,14 +1281,17 @@ def run_iid_multi_seed(cfg: dict, mode: str):
              f'Pd @ Pfa={pfa}', f'Pd @ Pfa={pfa} vs n{suf}',
              os.path.join(fig_dir,'pd_at_fa_vs_n.pdf'),
              logx=True, series_std=_std('vs_n','pd'))
+    _rk = agg.get('vs_rho_kde', {})
     _plot_vs(rho_list, _mean('vs_rho','auc'), r'DSM noise level  $\rho$', 'AUC',
              f'AUC vs ρ (n={n_fixed}){suf}',
              os.path.join(fig_dir,'auc_vs_rho.pdf'),
-             logx=True, series_std=_std('vs_rho','auc'))
+             logx=True, series_std=_std('vs_rho','auc'),
+             mark_x=_rk.get('rho'), mark_y=_rk.get('auc'), top_series='DSM')
     _plot_vs(rho_list, _mean('vs_rho','pd'), r'DSM noise level  $\rho$',
              f'Pd @ Pfa={pfa}', f'Pd @ Pfa={pfa} vs ρ (n={n_fixed}){suf}',
              os.path.join(fig_dir,'pdet_at_pfa_vs_rho.pdf'),
-             logx=True, series_std=_std('vs_rho','pd'))
+             logx=True, series_std=_std('vs_rho','pd'),
+             mark_x=_rk.get('rho'), mark_y=_rk.get('pd'))
 
     # ROC summary bar: mean AUC ± std at n_max
     if 'roc_at_nmax' in agg:
