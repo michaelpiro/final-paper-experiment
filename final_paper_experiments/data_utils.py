@@ -209,30 +209,53 @@ def plant_targets(test_bkg: np.ndarray,
                   amplitude: float,
                   tgt_fraction: float,
                   model: str = 'additive',
-                  seed: int = 0):
+                  seed: int = 0,
+                  spatial_shape: tuple = None,
+                  edge_guard: int = 0):
     """
     Plant target signatures into a random subset of test pixels.
 
     Parameters
     ----------
-    test_bkg     : (n_test, d) — clean background test pixels
-    s            : (d,) — unit-norm target signature
-    amplitude    : target amplitude θ
-    tgt_fraction : fraction of test pixels to contaminate
-    model        : 'additive'    → y = w + θ·s
-                   'replacement' → y = θ·s + (1-θ)·w
-    seed         : RNG seed
+    test_bkg       : (n_test, d) — clean background test pixels (row-major flat)
+    s              : (d,) — unit-norm target signature
+    amplitude      : target amplitude θ
+    tgt_fraction   : fraction of test pixels to contaminate
+    model          : 'additive'    → y = w + θ·s
+                     'replacement' → y = θ·s + (1-θ)·w
+    seed           : RNG seed
+    spatial_shape  : (H, W) of the test box — required when edge_guard > 0
+    edge_guard     : exclude pixels within this many pixels of any box edge
+                     from the candidate pool. Use ≥ k//2 to avoid boundary
+                     pixels where local-SCM detectors get reflect-padded
+                     neighbors (which inflate false alarms). Default 0 = off.
 
     Returns
     -------
     test_data : (n_test, d) — test pixels with planted targets
     labels    : (n_test,)   — binary (1 = target pixel)
-    tgt_idx   : indices of contaminated pixels
+    tgt_idx   : indices of contaminated pixels (into the flat n_test array)
     """
-    n_test  = len(test_bkg)
-    n_tgt   = max(1, int(round(n_test * tgt_fraction)))
+    n_test = len(test_bkg)
+
+    # Build the candidate pool (all pixels, or interior-only when edge_guard>0).
+    if edge_guard > 0 and spatial_shape is not None:
+        H, W = spatial_shape
+        g = int(edge_guard)
+        rows = np.arange(n_test) // W
+        cols = np.arange(n_test) %  W
+        interior = np.where(
+            (rows >= g) & (rows < H - g) &
+            (cols >= g) & (cols < W - g)
+        )[0]
+        if len(interior) == 0:
+            interior = np.arange(n_test)   # fallback: guard too large
+    else:
+        interior = np.arange(n_test)
+
+    n_tgt   = max(1, int(round(len(interior) * tgt_fraction)))
     labels  = np.zeros(n_test, dtype=int)
-    tgt_idx = np.random.default_rng(seed).choice(n_test, size=n_tgt, replace=False)
+    tgt_idx = np.random.default_rng(seed).choice(interior, size=n_tgt, replace=False)
     labels[tgt_idx] = 1
 
     test_data = test_bkg.copy()

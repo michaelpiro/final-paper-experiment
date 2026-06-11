@@ -23,6 +23,7 @@ box_size_ablation: [
 # Target planting
 amplitude:        0.15
 target_fraction:  0.10
+edge_guard:       5          # don't plant targets within this many px of box edge
 
 # spatial window
 k: 5                  # spatial neighborhood window size (k×k - 1 neighbors)

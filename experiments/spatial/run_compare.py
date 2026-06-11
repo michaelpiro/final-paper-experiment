@@ -144,7 +144,7 @@ DEFAULT_CFG = dict(
     min_pixels=2000,
     random_scenario_seeds=[42, 123, 456, 789],
     sig_dom_weight=0.8, sig_mean_weight=0.2,
-    amplitude=0.15, target_fraction=0.10,
+    amplitude=0.15, target_fraction=0.10, edge_guard=5,
     n_budget=None,               # None = full train box (no subsampling); int = side-crop
     k=5,
     local_scm_loading=1e-8,
@@ -455,9 +455,11 @@ def run_detection(sig, sig_label, out_dir, ctx):
     all_pfa = sorted(set(PFA_LEVELS) | {pfa_t})
 
     print(f"\n########## DETECTION RUN: {sig_label} ##########", flush=True)
+    edge_guard = int(cfg.get('edge_guard', 5))
     planted, labels, tgt_idx = plant_targets(
         te_raw, sig, cfg['amplitude'], cfg['target_fraction'],
-        model='additive', seed=seed)
+        model='additive', seed=seed,
+        spatial_shape=(H_b, W_b), edge_guard=edge_guard)
     planted = planted.astype(np.float32)
     print(f"[{sig_label}] planted {int(labels.sum())} targets  ||s||={np.linalg.norm(sig):.4g}",
           flush=True)
@@ -691,7 +693,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
 # the trained nets or the train/test boxes — only scoring / planting / plots).
 RELOAD_OVERRIDE_KEYS = [
     'cfar_bg_window', 'cfar_guard', 'cfar_lam', 'pfa_target', 'amplitude', 'target_fraction',
-    'ridge_n_mc', 'gmm_steps', 'gmm_K', 'local_scm_loading', 'baseline_eig_floor',
+    'edge_guard', 'ridge_n_mc', 'gmm_steps', 'gmm_K', 'local_scm_loading', 'baseline_eig_floor',
 ]
 
 
