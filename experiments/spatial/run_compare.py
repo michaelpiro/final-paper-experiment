@@ -720,7 +720,10 @@ def _build_models_from_ckpt(ckpt, D, cfg, device):
 
     nm = NeighborMLPDenoiser(
         D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
-        enc_hidden=cfg['nmlp_enc_hidden'], score_hidden=cfg['nmlp_score_hidden'],
+        enc_hidden=cfg.get('nmlp_enc_hidden'),
+        score_hidden=cfg.get('nmlp_score_hidden'),
+        hidden=cfg.get('nmlp_hidden', 128),
+        n_layers=cfg.get('nmlp_n_layers', 3),
         sigma=_whitened_sigma(cfg), activation=cfg['activation'],
         whitening=_placeholder_whitening(D))
     nm.load_state_dict(ckpt['nmlp']); nm.to(device).eval()
