@@ -256,11 +256,11 @@ def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6, cfar_lam=0.0):
     H, W = shape
     q = np.asarray(flat_scores, dtype=np.float64).reshape(H, W)
     nb, ng = bg * bg, (guard * guard if guard and guard > 0 else 0)
-    m_bg  = uniform_filter(q,     size=bg, mode='reflect')
-    s2_bg = uniform_filter(q * q, size=bg, mode='reflect')
+    m_bg  = uniform_filter(q,     size=bg, mode='wrap')
+    s2_bg = uniform_filter(q * q, size=bg, mode='wrap')
     if ng > 0:
-        m_g  = uniform_filter(q,     size=guard, mode='reflect')
-        s2_g = uniform_filter(q * q, size=guard, mode='reflect')
+        m_g  = uniform_filter(q,     size=guard, mode='wrap')
+        s2_g = uniform_filter(q * q, size=guard, mode='wrap')
     else:
         m_g = s2_g = 0.0
     denom = max(nb - ng, 1)
@@ -297,10 +297,10 @@ def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_
     H, W = shape
     dev = next(model.parameters()).device
     q_i = torch.tensor(np.asarray(score_flat, np.float32), device=dev)        # (HW,)
-    # neighbor q-values via unfold of the score map (reflect-padded k×k window)
+    # neighbor q-values via unfold of the score map (circular-padded k×k window)
     p = k // 2
     qmap = q_i.reshape(1, 1, H, W)
-    patches = F.unfold(F.pad(qmap, (p, p, p, p), mode='reflect'), kernel_size=k)  # (1, k*k, HW)
+    patches = F.unfold(F.pad(qmap, (p, p, p, p), mode='circular'), kernel_size=k)  # (1, k*k, HW)
     patches = patches.reshape(k * k, H * W).t()                               # (HW, k*k)
     cidx = (k * k) // 2
     keep = [m for m in range(k * k) if m != cidx]

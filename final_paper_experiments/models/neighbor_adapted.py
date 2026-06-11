@@ -45,12 +45,14 @@ def extract_neighborhoods(img: torch.Tensor, k: int):
     -------
     centers   : (H*W, D)        the center pixel of each window
     neighbors : (H*W, k*k-1, D) the k x k window minus the center
-    Reflect-padded at the image border.
+    Circular-padded at the image border (wrap-around gives slightly varied
+    neighbors instead of mirrored duplicates, reducing AMF-local false alarms
+    at edges).
     """
     H, W, D = img.shape
     p = k // 2
     x = img.permute(2, 0, 1).unsqueeze(0)           # (1, D, H, W)
-    x = F.pad(x, (p, p, p, p), mode='reflect')
+    x = F.pad(x, (p, p, p, p), mode='circular')
     patches = F.unfold(x, kernel_size=k, padding=0)  # (1, D*k*k, H*W)
     patches = patches.reshape(D, k * k, H * W).permute(2, 1, 0)  # (HW, k*k, D)
 
