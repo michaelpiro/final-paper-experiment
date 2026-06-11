@@ -4,13 +4,10 @@ run_compare.py — Focused spatial detector comparison (single scenario).
 Detectors
 ---------
   DSM            — our global per-pixel score (ScoreNet, no spatial context)
-  CF-Attn        — spatial score net, global normalization      (Ours, spatial)
-  CF-Attn-CFAR   — spatial score net, local-Fisher normalization (Ours, spatial)
+  LinearDSM      — neighbor-adapted LINEAR score (ridge regression head, paper §6.1)
   NeighborMLP    — spatial denoiser score net                    (Ours, spatial)
   AMF            — Adaptive Matched Filter (global SCM)
   AMF-local      — AMF on the per-pixel k×k window SCM (same window as spatial nets)
-  CEM            — Constrained Energy Minimization (global autocorrelation)
-  CEM-local      — CEM on the per-pixel k×k window autocorrelation
   GMM-Levin      — Levin product-GMM GLRT
 
 Deep nets train on GPU (cuda) when available.
@@ -40,7 +37,7 @@ Usage
   python -u experiments/spatial/run_compare.py --config experiments/spatial/colab.yaml \
         --results_dir /content/drive/MyDrive/final_paper/compare_results
 """
-import argparse, json, os, sys, time
+import argparse, copy, json, os, sys, time
 from datetime import datetime
 
 _EXP = os.path.dirname(os.path.abspath(__file__))
@@ -67,20 +64,17 @@ from final_paper_experiments.evaluation import (
     partial_auc, dr_at_fpr, auc_safe, roc_safe, cfar_threshold, per_class_fpr,
     compute_signature, generate_random_boxes, scores_to_spatial_map,
 )
-from dsm_model import ScoreNet
-from cfattn_model import (
-    CFAttnGaussianScoreNet, score_cfattn_additive, score_cfattn_additive_cfar,
-)
-from neighbor_mlp_model import NeighborMLPDenoiser, score_nmlp_additive
-from local_detectors import amf_cem_local_scm, amf_global, cem_global
+from dsm_model import ScoreNet, dsm_loss
+from neighbor_mlp_model import NeighborMLPDenoiser, score_nmlp_additive, neighbor_mlp_dsm_loss
+from local_detectors import amf_cem_local_scm, amf_global
 from final_paper_experiments.models.neighbor_adapted import (
     NeighborAdaptedScore, dsm_loss as ridge_dsm_loss, adapted_score_field,
 )
 from tqdm import tqdm
 
-# Reuse the (whitening-aware, GPU) training helpers from the main runner.
+# Shared helpers from the main runner.
 from run_colab import (
-    _crop_pca_box, _train_dsm, _train_cfattn, _train_nmlp,
+    _crop_pca_box,
     _make_whitening, _whiten_np, _whitened_sigma, _placeholder_whitening,
 )
 
@@ -103,34 +97,20 @@ HIT_MARK    = '#39ff14'   # lime — true detections
 # Fixed display order + colors for the detectors.
 DET_ORDER = [
     'DSM',
-    'CF-Attn',
-    'CF-Attn-CFAR',
+    'LinearDSM',
     'NeighborMLP',
-    'NeighborMLP-CFAR',
-    # 'NeighborRidge',
-    # 'NeighborRidge-CFAR',
     'AMF',
     'AMF-local',
-    # 'CEM', 'CEM-local',
-    'GMM-Levin'
+    'GMM-Levin',
 ]
 DET_COLORS = {
-    'DSM': '#ff7f0e',
-    'CF-Attn': '#aec7e8',
-    'CF-Attn-CFAR': '#1f77b4',
-    'NeighborMLP': '#2ca02c',
-    'NeighborMLP-CFAR': '#006d2c',
-    'NeighborRidge': '#17becf',
-    'NeighborRidge-CFAR': '#0e6b78',
-    'AMF': '#9467bd',
-    'AMF-local': '#c5b0d5',
-    'CEM': '#8c564b',
-    'CEM-local': '#e7969c',
-    'GMM-Levin': '#e377c2',
+    'DSM':        '#ff7f0e',   # orange
+    'LinearDSM':  '#17becf',   # teal
+    'NeighborMLP':'#2ca02c',   # green
+    'AMF':        '#9467bd',   # purple
+    'AMF-local':  '#c5b0d5',   # light purple
+    'GMM-Levin':  '#e377c2',   # pink
 }
-
-# Detectors that get a local-CFAR (windowed score-map normalization) sibling.
-CFAR_BASE = ['NeighborMLP', 'NeighborRidge']
 
 # Pfa levels for the false-alarm overlays.
 PFA_LEVELS = [0.01, 0.05, 0.10]
@@ -149,21 +129,14 @@ DEFAULT_CFG = dict(
     k=5,
     local_scm_loading=1e-8,
     baseline_eig_floor=1e-12,
-    # local-CFAR (windowed score-map normalization) for NeighborMLP/Ridge
-    cfar_bg_window=11,   # background window side (odd)
-    cfar_guard=3,        # guard window side (odd, excluded from the bg stats)
-    cfar_lam=0.0,        # blend: 0=pure local, 1=pure global, (0,1)=mix
-    # CF-Attn
-    cfattn_h=64, cfattn_K=9, cfattn_epochs=300, cfattn_lr=3e-4, cfattn_eps=1e-4,
-    lam_ent=0.05, lam_div=0.05, lam_cov=1e-5,
     # NeighborMLP — encoder: D→enc_hidden→d_lat ; denoiser: (D+(K+1)*d_lat)→score_hidden→D
     nmlp_d_lat=16, nmlp_K=8, nmlp_enc_hidden=[128, 64], nmlp_score_hidden=[128],
-    nmlp_epochs=300, nmlp_lr=3e-4, nmlp_batch=256,
+    nmlp_epochs=1000, nmlp_lr=3e-4, nmlp_batch=256,
     # DSM
     dsm_hidden=[64, 64], dsm_epochs=1000, dsm_lr=5e-4,
-    # NeighborRidge (neighbor-adapted ridge score head)
+    # LinearDSM (neighbor-adapted ridge score head, paper §6.1)
     ridge_M=256, ridge_hidden=[128, 128], ridge_lam_init=0.1,
-    ridge_epochs=300, ridge_lr=3e-4, ridge_batch=256, ridge_n_mc=8,
+    ridge_epochs=1000, ridge_lr=3e-4, ridge_batch=256, ridge_n_mc=8,
     # shared
     activation='silu', dsm_sigma_rho=0.01,
     whiten_mode='zca', whiten_eig_floor=1e-5,
@@ -175,8 +148,8 @@ DEFAULT_CFG = dict(
 )
 
 DRYRUN_OVERRIDES = dict(
-    cfattn_epochs=8, nmlp_epochs=8, dsm_epochs=20, ridge_epochs=8, ridge_n_mc=2,
-    cfattn_K=4, nmlp_K=4, ridge_M=64,
+    nmlp_epochs=8, dsm_epochs=20, ridge_epochs=8, ridge_n_mc=2,
+    nmlp_K=4, ridge_M=64,
     n_budget=400,   # dry-run only: contiguous side-crop for speed (still spatial)
 )
 
@@ -324,7 +297,88 @@ def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_
 
 
 # ---------------------------------------------------------------------------
-# NeighborRidge — neighbor-adapted ridge score head (paper Section 6.2 / 8.2).
+# Best-epoch training functions (restore lowest-loss checkpoint at end of training)
+# ---------------------------------------------------------------------------
+
+def _train_dsm_best(tr_raw, cfg, device):
+    """Train global DSM with best-epoch tracking (restores lowest-loss weights)."""
+    D = tr_raw.shape[1]
+    W = _make_whitening(tr_raw, cfg, device)
+    sigma = _whitened_sigma(cfg)
+    net = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'], whitening=W).to(device)
+    net.sigma = sigma
+    opt = torch.optim.Adam(net.parameters(), lr=cfg['dsm_lr'], weight_decay=cfg['weight_decay'])
+    Xtr = torch.tensor(tr_raw, dtype=torch.float32).to(device)
+    P = len(Xtr)
+    E = int(cfg['dsm_epochs'])
+    best_loss, best_state = float('inf'), None
+    pbar = tqdm(range(E), desc='DSM', dynamic_ncols=True, leave=False)
+    last = float('nan')
+    for ep in pbar:
+        perm = torch.randperm(P, device=device)
+        ep_loss = 0.0; nb = 0
+        for i in range(0, P, cfg['batch_size']):
+            b = Xtr[perm[i:i + cfg['batch_size']]]
+            loss = dsm_loss(net, b, sigma)
+            opt.zero_grad(); loss.backward(); opt.step()
+            ep_loss += float(loss.item()); nb += 1
+        last = ep_loss / max(nb, 1)
+        pbar.set_postfix(loss=f'{last:.4f}')
+        if last < best_loss:
+            best_loss = last
+            best_state = copy.deepcopy(net.state_dict())
+        if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
+            print(f"    [DSM] epoch {ep+1}/{E}  loss={last:.4f}  best={best_loss:.4f}", flush=True)
+    net.load_state_dict(best_state)
+    net._final_loss = best_loss
+    net.eval()
+    return net
+
+
+def _train_nmlp_best(tr_raw, tr_nbr, cfg, device):
+    """Train NeighborMLP with best-epoch tracking."""
+    D = tr_raw.shape[1]
+    W = _make_whitening(tr_raw, cfg, device)
+    sigma = _whitened_sigma(cfg)
+    nmlp = NeighborMLPDenoiser(
+        D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
+        enc_hidden=cfg.get('nmlp_enc_hidden'),
+        score_hidden=cfg.get('nmlp_score_hidden'),
+        hidden=cfg.get('nmlp_hidden', 128),
+        n_layers=cfg.get('nmlp_n_layers', 3),
+        sigma=sigma, activation=cfg['activation'], whitening=W).to(device)
+    opt = torch.optim.AdamW(nmlp.parameters(), lr=cfg['nmlp_lr'], weight_decay=cfg['weight_decay'])
+    Xtr = torch.tensor(tr_raw, dtype=torch.float32).to(device)
+    Ntr = torch.tensor(tr_nbr, dtype=torch.float32).to(device)
+    P = len(Xtr)
+    E = int(cfg['nmlp_epochs'])
+    best_loss, best_state = float('inf'), None
+    pbar = tqdm(range(E), desc='NeighborMLP', dynamic_ncols=True, leave=False)
+    last = float('nan')
+    for ep in pbar:
+        perm = torch.randperm(P, device=device)
+        ep_loss = 0.0; nb = 0
+        for i in range(0, P, cfg['nmlp_batch']):
+            sel = perm[i:i + cfg['nmlp_batch']]
+            loss = neighbor_mlp_dsm_loss(nmlp, Xtr[sel], Ntr[sel])
+            opt.zero_grad(); loss.backward(); opt.step()
+            ep_loss += float(loss.item()); nb += 1
+        last = ep_loss / max(nb, 1)
+        pbar.set_postfix(loss=f'{last:.4f}')
+        if last < best_loss:
+            best_loss = last
+            best_state = copy.deepcopy(nmlp.state_dict())
+        if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
+            print(f"    [NeighborMLP] epoch {ep+1}/{E}  loss={last:.4f}  best={best_loss:.4f}",
+                  flush=True)
+    nmlp.load_state_dict(best_state)
+    nmlp._final_loss = best_loss
+    nmlp.eval()
+    return nmlp
+
+
+# ---------------------------------------------------------------------------
+# LinearDSM (NeighborRidge) — neighbor-adapted ridge score head (paper §6.1).
 # Shared encoder + global linear head W0 + per-pixel LOCAL head solved in closed
 # form by ridge regression over the k×k neighbors, shrinking toward W0 when the
 # neighborhood is uninformative (boundaries). Whitening is applied externally
@@ -333,12 +387,13 @@ def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_
 # ---------------------------------------------------------------------------
 
 def _train_ridge(tr_raw, tr_nbr, cfg, device, seed):
+    """Train LinearDSM (NeighborAdaptedScore) with best-epoch tracking."""
     torch.manual_seed(seed)
     D = tr_raw.shape[1]
     W = _make_whitening(tr_raw, cfg, device)
     sigma = _whitened_sigma(cfg)
-    Xc = torch.tensor(_whiten_np(W, tr_raw, device), dtype=torch.float32).to(device)   # (N, D)
-    Xn = torch.tensor(_whiten_np(W, tr_nbr, device), dtype=torch.float32).to(device)   # (N, K, D)
+    Xc = torch.tensor(_whiten_np(W, tr_raw, device), dtype=torch.float32).to(device)
+    Xn = torch.tensor(_whiten_np(W, tr_nbr, device), dtype=torch.float32).to(device)
     model = NeighborAdaptedScore(
         D=D, M=int(cfg.get('ridge_M', 256)),
         hidden=tuple(cfg.get('ridge_hidden', [128, 128])),
@@ -347,10 +402,10 @@ def _train_ridge(tr_raw, tr_nbr, cfg, device, seed):
                             weight_decay=cfg['weight_decay'])
     P  = len(Xc)
     bs = int(cfg.get('ridge_batch', 256))
-    pbar = tqdm(range(int(cfg.get('ridge_epochs', 300))), desc='NeighborRidge',
-                dynamic_ncols=True, leave=False)
+    E  = int(cfg.get('ridge_epochs', 1000))
+    best_loss, best_state = float('inf'), None
+    pbar = tqdm(range(E), desc='LinearDSM', dynamic_ncols=True, leave=False)
     last = float('nan')
-    E = int(cfg.get('ridge_epochs', 300))
     for ep in pbar:
         perm = torch.randperm(P, device=device)
         ep_loss = 0.0; nb = 0
@@ -361,9 +416,14 @@ def _train_ridge(tr_raw, tr_nbr, cfg, device, seed):
             ep_loss += float(loss.item()); nb += 1
         last = ep_loss / max(nb, 1)
         pbar.set_postfix(loss=f'{last:.4f}')
+        if last < best_loss:
+            best_loss = last
+            best_state = copy.deepcopy(model.state_dict())
         if ep == 0 or (ep + 1) % max(E // 10, 1) == 0:
-            print(f"    [NeighborRidge] epoch {ep+1}/{E}  loss={last:.4f}", flush=True)
-    model._final_loss = last
+            print(f"    [LinearDSM] epoch {ep+1}/{E}  loss={last:.4f}  best={best_loss:.4f}",
+                  flush=True)
+    model.load_state_dict(best_state)
+    model._final_loss = best_loss
     model._whitening = W
     model.eval()
     return model
@@ -418,22 +478,17 @@ def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
     floor = float(cfg.get('baseline_eig_floor', 1e-12))
     if models.get('dsm') is not None:
         out['DSM'] = dsm_additive(pix, tr_raw, models['dsm'], sig)
-    if models.get('cfattn') is not None:
-        out['CF-Attn'] = score_cfattn_additive(models['cfattn'], pix, nbr, tr_raw, tr_nbr, sig)
-        out['CF-Attn-CFAR'] = score_cfattn_additive_cfar(models['cfattn'], pix, nbr, sig)
     if models.get('nmlp') is not None:
         out['NeighborMLP'] = score_nmlp_additive(models['nmlp'], pix, nbr, tr_raw, tr_nbr, sig)
     if models.get('ridge') is not None:
-        out['NeighborRidge'] = score_ridge_additive(models['ridge'], pix, nbr, tr_raw, tr_nbr, sig, cfg)
+        out['LinearDSM'] = score_ridge_additive(models['ridge'], pix, nbr, tr_raw, tr_nbr, sig, cfg)
     out['AMF'] = amf_global(pix, tr_raw, sig, eig_floor=floor)
-    out['CEM'] = cem_global(pix, tr_raw, sig, eig_floor=floor)
-    out['GMM-Levin'] = gmm_glrt_levin_additive(pix, tr_raw, sig,
-                                               p_steps=cfg.get('gmm_steps', 50))
-    amf_loc, cem_loc = amf_cem_local_scm(
+    amf_loc, _ = amf_cem_local_scm(
         pix, nbr, sig, device=device,
         loading=float(cfg.get('local_scm_loading', 1e-8)))
     out['AMF-local'] = amf_loc
-    out['CEM-local'] = cem_loc
+    out['GMM-Levin'] = gmm_glrt_levin_additive(pix, tr_raw, sig,
+                                               p_steps=cfg.get('gmm_steps', 50))
     return out
 
 
@@ -468,28 +523,6 @@ def run_detection(sig, sig_label, out_dir, ctx):
     test_scores = score_all(planted, te_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
     print("Scoring detectors (train, for CFAR thresholds) ...", flush=True)
     train_scores = score_all(tr_raw, tr_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
-
-    # ---- Local-CFAR siblings for the score nets ----
-    bg = int(cfg.get('cfar_bg_window', 11))
-    guard = int(cfg.get('cfar_guard', 3))
-    lam = float(cfg.get('cfar_lam', 0.0))
-    k_win = int(cfg['k'])
-    tr0, tr1, tc0, tc1 = ctx['train_box']
-    tr_shape = (tr1 - tr0, tc1 - tc0)
-    # NeighborMLP-CFAR: local Fisher from the model's OWN top-K selected neighbors.
-    if 'NeighborMLP' in test_scores and models.get('nmlp') is not None:
-        test_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
-            test_scores['NeighborMLP'], models['nmlp'], planted, te_nbr, (H_b, W_b), k_win,
-            cfar_lam=lam)
-        train_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
-            train_scores['NeighborMLP'], models['nmlp'], tr_raw, tr_nbr, tr_shape, k_win,
-            cfar_lam=lam)
-    # NeighborRidge-CFAR: windowed score-map normalization (ridge uses all neighbors).
-    if 'NeighborRidge' in test_scores:
-        test_scores['NeighborRidge-CFAR'] = _cfar_normalize_map(
-            test_scores['NeighborRidge'], (H_b, W_b), bg, guard, cfar_lam=lam)
-        train_scores['NeighborRidge-CFAR'] = _cfar_normalize_map(
-            train_scores['NeighborRidge'], tr_shape, bg, guard, cfar_lam=lam)
 
     DETS = [d for d in DET_ORDER if d in test_scores]
     print(f"Active detectors: {DETS}", flush=True)
@@ -700,25 +733,18 @@ RELOAD_OVERRIDE_KEYS = [
 def _save_models(run_dir, models, cfg, sidx, train_box, test_box):
     torch.save({
         'cfg': cfg, 'sidx': sidx, 'train_box': train_box, 'test_box': test_box,
-        'dsm':    models['dsm'].state_dict(),
-        'cfattn': models['cfattn'].state_dict(),
-        'nmlp':   models['nmlp'].state_dict(),
-        'ridge':  models['ridge'].state_dict(),
+        'dsm':   models['dsm'].state_dict(),
+        'nmlp':  models['nmlp'].state_dict(),
+        'ridge': models['ridge'].state_dict(),
     }, os.path.join(run_dir, 'models.pt'))
     print(f"  saved models -> {os.path.join(run_dir, 'models.pt')}", flush=True)
 
 
 def _build_models_from_ckpt(ckpt, D, cfg, device):
-    """Reconstruct the 4 nets and load their weights (incl. frozen whitening)."""
+    """Reconstruct the 3 nets and load their weights (incl. frozen whitening)."""
     dsm = ScoreNet(D, list(cfg['dsm_hidden']), cfg['activation'],
                    whitening=_placeholder_whitening(D))
     dsm.load_state_dict(ckpt['dsm']); dsm.to(device).eval()
-
-    cf = CFAttnGaussianScoreNet(
-        D=D, h=cfg['cfattn_h'], K=cfg['cfattn_K'],
-        sigma=_whitened_sigma(cfg), eps=cfg.get('cfattn_eps', 1e-4),
-        whitening=_placeholder_whitening(D))
-    cf.load_state_dict(ckpt['cfattn']); cf.to(device).eval()
 
     nm = NeighborMLPDenoiser(
         D=D, d_lat=cfg['nmlp_d_lat'], K=cfg['nmlp_K'],
@@ -734,10 +760,10 @@ def _build_models_from_ckpt(ckpt, D, cfg, device):
         D=D, M=int(cfg.get('ridge_M', 256)),
         hidden=tuple(cfg.get('ridge_hidden', [128, 128])),
         k=int(cfg['k']), lam_init=float(cfg.get('ridge_lam_init', 0.1)))
-    rg._whitening = _placeholder_whitening(D)   # so the buffers exist for load
+    rg._whitening = _placeholder_whitening(D)
     rg.load_state_dict(ckpt['ridge']); rg.to(device).eval()
 
-    return {'dsm': dsm, 'cfattn': cf, 'nmlp': nm, 'ridge': rg}
+    return {'dsm': dsm, 'nmlp': nm, 'ridge': rg}
 
 
 # ---------------------------------------------------------------------------
@@ -849,22 +875,19 @@ def main():
         print("Loading trained nets (no training) ...", flush=True)
         models = _build_models_from_ckpt(ckpt, D, cfg, device)
     else:
-        print("Training deep nets ...", flush=True)
+        print("Training deep nets (best-epoch checkpointing) ...", flush=True)
         def _fl(m):
             return getattr(m, '_final_loss', float('nan'))
         t0 = time.time()
-        dsm_net = _train_dsm(tr_raw, cfg, device)
-        print(f"  DSM done ({time.time() - t0:.0f}s)  final loss={_fl(dsm_net):.4f}", flush=True)
+        dsm_net = _train_dsm_best(tr_raw, cfg, device)
+        print(f"  DSM done ({time.time()-t0:.0f}s)  best loss={_fl(dsm_net):.4f}", flush=True)
         t0 = time.time()
-        cfattn = _train_cfattn(tr_raw, tr_nbr, cfg, device, seed)
-        print(f"  CF-Attn done ({time.time() - t0:.0f}s)  final loss={_fl(cfattn):.4f}", flush=True)
-        t0 = time.time()
-        nmlp = _train_nmlp(tr_raw, tr_nbr, cfg, device)
-        print(f"  NeighborMLP done ({time.time() - t0:.0f}s)  final loss={_fl(nmlp):.4f}", flush=True)
+        nmlp = _train_nmlp_best(tr_raw, tr_nbr, cfg, device)
+        print(f"  NeighborMLP done ({time.time()-t0:.0f}s)  best loss={_fl(nmlp):.4f}", flush=True)
         t0 = time.time()
         ridge = _train_ridge(tr_raw, tr_nbr, cfg, device, seed)
-        print(f"  NeighborRidge done ({time.time() - t0:.0f}s)  final loss={_fl(ridge):.4f}", flush=True)
-        models = {'dsm': dsm_net, 'cfattn': cfattn, 'nmlp': nmlp, 'ridge': ridge}
+        print(f"  LinearDSM done ({time.time()-t0:.0f}s)  best loss={_fl(ridge):.4f}", flush=True)
+        models = {'dsm': dsm_net, 'nmlp': nmlp, 'ridge': ridge}
         _save_models(run_dir, models, cfg, sidx, tr_box_eff, test_box)
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
@@ -891,6 +914,151 @@ def main():
             ok = ok and os.path.exists(os.path.join(run_dir, 'foreign', 'summary_table.csv'))
         print("DRY-RUN:", "ALL OUTPUTS PRESENT ✓" if ok else "MISSING OUTPUTS ✗")
         sys.exit(0 if ok else 1)
+
+
+# ---------------------------------------------------------------------------
+# Programmatic API (for Colab notebooks — no argparse needed)
+# ---------------------------------------------------------------------------
+
+def run_from_cfg(overrides: dict, dry_run: bool = False):
+    """Run one full scenario (train → detect → save) from a plain dict.
+
+    Merges ``overrides`` on top of ``DEFAULT_CFG``.
+    Returns the output ``run_dir``.
+    """
+    cfg = dict(DEFAULT_CFG)
+    cfg.update(overrides)
+    if dry_run:
+        cfg.update(DRYRUN_OVERRIDES)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}", flush=True)
+    seed = int(cfg['seed'])
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = os.path.join(cfg['results_dir'], f'compare_{ts}')
+    os.makedirs(run_dir, exist_ok=True)
+    yaml.dump(cfg, open(os.path.join(run_dir, 'config.yaml'), 'w'), sort_keys=False)
+
+    print("Loading data ...", flush=True)
+    data_norm, gt = load_and_normalize(cfg['dataset'], mode=cfg['norm_mode'])
+    H, W, D = data_norm.shape
+    print(f"Image {H}×{W}×{D}", flush=True)
+
+    manual_path = cfg.get('manual_boxes_path')
+    manual = json.load(open(manual_path)) if (manual_path and os.path.exists(manual_path)) else []
+    random_sc = generate_random_boxes(
+        gt, n=4, min_pixels=int(cfg['min_pixels']),
+        seeds=tuple(cfg['random_scenario_seeds']))
+    scenarios = manual + random_sc
+    sidx = int(cfg['scenario_index']) % len(scenarios)
+    scenario = scenarios[sidx]
+    train_box, test_box = scenario['train_box'], scenario['test_box']
+    print(f"Scenario {sidx}: train_box={train_box}  test_box={test_box}", flush=True)
+
+    k = int(cfg['k'])
+    tr_box_eff = _side_crop_box(train_box, cfg.get('n_budget'))
+    tr_raw, tr_nbr = _crop_pca_box(data_norm, tr_box_eff, k)
+    tr_raw = tr_raw.astype(np.float32)
+    tr_nbr = tr_nbr.astype(np.float32)
+    print(f"train={len(tr_raw)} px  (box {tr_box_eff})", flush=True)
+
+    r0, r1, c0, c1 = test_box
+    H_b, W_b = r1 - r0, c1 - c0
+    te_raw, te_nbr = _crop_pca_box(data_norm, test_box, k)
+    te_raw = te_raw.astype(np.float32)
+    te_nbr = te_nbr.astype(np.float32)
+    te_gt = gt[r0:r1, c0:c1].ravel()
+    print(f"test={len(te_raw)} px  ({H_b}×{W_b})", flush=True)
+
+    sig_in, dom_cls, dom_name = compute_signature(
+        gt[r0:r1, c0:c1], data_norm[r0:r1, c0:c1],
+        w_dom=float(cfg['sig_dom_weight']), w_mean=float(cfg['sig_mean_weight']))
+    sig_in = sig_in.astype(np.float32)
+    print(f"in-patch signature: dominant={dom_name}  ||s||={np.linalg.norm(sig_in):.4g}",
+          flush=True)
+
+    fcls = _pick_foreign_class(gt, np.unique(te_gt))
+    sig_for = None
+    if fcls is not None:
+        mu_for = data_norm.reshape(-1, D)[gt.ravel() == fcls].mean(axis=0)
+        scalar = float(np.linalg.norm(te_raw, axis=1).mean())
+        sig_for = (mu_for / (np.linalg.norm(mu_for) + 1e-12) * scalar).astype(np.float32)
+        print(f"foreign signature: class={CLS_NAMES[fcls]}  scaled ||s||={scalar:.4g}", flush=True)
+
+    print("Training deep nets (best-epoch checkpointing) ...", flush=True)
+    def _fl(m): return getattr(m, '_final_loss', float('nan'))
+    t0 = time.time()
+    dsm_net = _train_dsm_best(tr_raw, cfg, device)
+    print(f"  DSM done ({time.time()-t0:.0f}s)  best loss={_fl(dsm_net):.4f}", flush=True)
+    t0 = time.time()
+    nmlp = _train_nmlp_best(tr_raw, tr_nbr, cfg, device)
+    print(f"  NeighborMLP done ({time.time()-t0:.0f}s)  best loss={_fl(nmlp):.4f}", flush=True)
+    t0 = time.time()
+    ridge = _train_ridge(tr_raw, tr_nbr, cfg, device, seed)
+    print(f"  LinearDSM done ({time.time()-t0:.0f}s)  best loss={_fl(ridge):.4f}", flush=True)
+    models = {'dsm': dsm_net, 'nmlp': nmlp, 'ridge': ridge}
+    _save_models(run_dir, models, cfg, sidx, tr_box_eff, test_box)
+
+    ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
+               tr_raw=tr_raw, tr_nbr=tr_nbr, te_raw=te_raw, te_nbr=te_nbr,
+               te_gt=te_gt, data_norm=data_norm, gt=gt,
+               test_box=test_box, train_box=tr_box_eff, sidx=sidx)
+
+    run_detection(sig_in, f'inpatch-{dom_name}', run_dir, ctx)
+    if sig_for is not None:
+        run_detection(sig_for, f'foreign-{CLS_NAMES[fcls]}',
+                      os.path.join(run_dir, 'foreign'), ctx)
+
+    print(f"\nDone.  Results: {run_dir}", flush=True)
+    return run_dir
+
+
+def show_plots_from_dir(run_dir: str, sub: str = None, inline: bool = True):
+    """Load and display all saved PNG figures from a result directory.
+
+    Parameters
+    ----------
+    run_dir : path to the timestamped results folder (e.g.
+              '/content/drive/MyDrive/spatial_results/compare_20260611_123456')
+    sub     : optional sub-folder name ('foreign') to show the foreign-signature run
+    inline  : if True, display using IPython (Colab); if False, just print paths.
+    """
+    target_dir = os.path.join(run_dir, sub) if sub else run_dir
+    FIGS = [
+        'false_color', 'label_map_targets', 'signatures',
+        'detection_maps', 'detected_pfa', 'roc', 'pfa_per_class',
+        'false_alarms_falsecolor', 'false_alarms_labelmap',
+    ]
+    found = []
+    for name in FIGS:
+        p = os.path.join(target_dir, f'{name}.png')
+        if os.path.exists(p):
+            found.append(p)
+        else:
+            print(f"  [missing] {name}.png")
+
+    if inline:
+        try:
+            from IPython.display import display, Image as IPImage
+            for p in found:
+                print(f"── {os.path.basename(p)} ──")
+                display(IPImage(p, width=900))
+        except ImportError:
+            print("IPython not available; printing paths only:")
+            for p in found:
+                print(p)
+    else:
+        for p in found:
+            print(p)
+
+    # Summary table
+    csv_path = os.path.join(target_dir, 'summary_table.md')
+    if os.path.exists(csv_path):
+        print("\n=== Summary Table ===")
+        print(open(csv_path).read())
 
 
 if __name__ == '__main__':
