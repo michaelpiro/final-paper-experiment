@@ -1059,5 +1059,170 @@ def show_plots_from_dir(run_dir: str, sub: str = None, inline: bool = True):
         print(open(csv_path).read())
 
 
+# ---------------------------------------------------------------------------
+# Multi-seed runner: repeat a scenario over several seeds and aggregate the
+# per-detector metrics into a mean±std table + bar figures with error bars.
+# Each seed reseeds BOTH target planting and net training, giving honest error
+# bars over the two sources of randomness.
+# ---------------------------------------------------------------------------
+
+_AGG_METRICS = ['AUC', 'pAUC@0.05', 'Pd@Pfa=0.05', 'Pd_cfar', 'Pfa_avg', 'Pfa_max']
+
+
+def _collect_sig_dirs(run_dir):
+    """Return [(sig_label, dir)] for each signature run present under run_dir."""
+    out = []
+    if os.path.exists(os.path.join(run_dir, 'metrics.json')):
+        out.append(('inpatch', run_dir))
+    fdir = os.path.join(run_dir, 'foreign')
+    if os.path.exists(os.path.join(fdir, 'metrics.json')):
+        out.append(('foreign', fdir))
+    return out
+
+
+def _aggregate_rows(rows_per_seed):
+    """rows_per_seed: list (over seeds) of {detector: {metric: value}}.
+    Returns {detector: {metric: (mean, std, n)}}, ordered by DET_ORDER."""
+    dets = [d for d in DET_ORDER if any(d in r for r in rows_per_seed)]
+    agg = {}
+    for d in dets:
+        agg[d] = {}
+        for m in _AGG_METRICS:
+            vals = [r[d][m] for r in rows_per_seed if d in r and m in r[d]
+                    and r[d][m] == r[d][m]]   # drop NaN
+            if vals:
+                agg[d][m] = (float(np.mean(vals)), float(np.std(vals)), len(vals))
+    return agg
+
+
+def _write_agg_table(agg, out_path, title):
+    """Write a mean±std markdown + csv table. Returns the markdown string."""
+    dets = list(agg.keys())
+    lines_md = [f'### {title}  (mean ± std over seeds)', '',
+                '| Detector | ' + ' | '.join(_AGG_METRICS) + ' |',
+                '|' + '|'.join(['---'] * (len(_AGG_METRICS) + 1)) + '|']
+    csv = ['Detector,' + ','.join(f'{m}_mean,{m}_std' for m in _AGG_METRICS)]
+    for d in dets:
+        cells = []
+        csv_cells = [d]
+        for m in _AGG_METRICS:
+            if m in agg[d]:
+                mu, sd, _ = agg[d][m]
+                cells.append(f'{mu:.3f} ± {sd:.3f}')
+                csv_cells += [f'{mu:.4f}', f'{sd:.4f}']
+            else:
+                cells.append('—'); csv_cells += ['', '']
+        lines_md.append('| ' + d + ' | ' + ' | '.join(cells) + ' |')
+        csv.append(','.join(csv_cells))
+    md = '\n'.join(lines_md) + '\n'
+    open(out_path + '.md', 'w').write(md)
+    open(out_path + '.csv', 'w').write('\n'.join(csv) + '\n')
+    return md
+
+
+def _agg_bar_fig(agg, metrics, out_path, title, target_line=None):
+    """Grouped bar chart of mean±std for the given metrics, per detector."""
+    dets = list(agg.keys())
+    x = np.arange(len(dets))
+    nb = len(metrics)
+    bw = 0.8 / max(nb, 1)
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    for j, m in enumerate(metrics):
+        mus = [agg[d].get(m, (np.nan,))[0] for d in dets]
+        sds = [agg[d].get(m, (np.nan, np.nan))[1] for d in dets]
+        ax.bar(x + j * bw, mus, bw, yerr=sds, capsize=3, label=m,
+               color=[DET_COLORS.get(d, '#888') for d in dets] if nb == 1 else None,
+               alpha=0.9)
+    if target_line is not None:
+        ax.axhline(target_line, color='k', ls=':', lw=1, label=f'target={target_line:g}')
+    ax.set_xticks(x + 0.4 - bw / 2)
+    ax.set_xticklabels(dets, rotation=30, ha='right', fontsize=8)
+    ax.set_ylabel('value'); ax.set_title(title, fontsize=10)
+    ax.legend(fontsize=8); ax.grid(axis='y', alpha=0.25)
+    _savefig(fig, out_path)
+
+
+def run_multiseed(overrides: dict, seeds=(42, 43, 44, 45, 46)):
+    """Run one scenario over `seeds`, aggregate per-detector metrics, and write
+    a mean±std table + bar figures. Returns the parent run directory."""
+    base = dict(DEFAULT_CFG); base.update(overrides)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    parent = os.path.join(base['results_dir'], f'multiseed_{ts}')
+    os.makedirs(parent, exist_ok=True)
+    print(f"\n########## MULTI-SEED  seeds={list(seeds)}  -> {parent}", flush=True)
+
+    seed_dirs = []
+    per_sig = {}     # sig_label -> list over seeds of {detector: {metric: val}}
+    for si, s in enumerate(seeds):
+        print(f"\n===== seed {s}  ({si+1}/{len(seeds)}) =====", flush=True)
+        ov = dict(overrides)
+        ov['seed'] = int(s)
+        ov['results_dir'] = os.path.join(parent, 'seeds')
+        rd = run_from_cfg(ov)
+        seed_dirs.append(rd)
+        for sig_label, d in _collect_sig_dirs(rd):
+            m = json.load(open(os.path.join(d, 'metrics.json')))
+            row_map = {r['Detector']: r for r in m['rows']}
+            per_sig.setdefault(sig_label, []).append(row_map)
+
+    # ---- aggregate + write per signature ----
+    pfa_t = float(base.get('pfa_target', 0.05))
+    summary = {}
+    for sig_label, rows_seeds in per_sig.items():
+        agg = _aggregate_rows(rows_seeds)
+        summary[sig_label] = agg
+        md = _write_agg_table(
+            agg, os.path.join(parent, f'summary_{sig_label}'),
+            f'{sig_label} — {len(rows_seeds)} seeds')
+        print(f"\n=== AGGREGATE [{sig_label}] ===\n{md}", flush=True)
+        _agg_bar_fig(agg, ['AUC', 'pAUC@0.05'],
+                     os.path.join(parent, f'{sig_label}_auc_bar.pdf'),
+                     f'{sig_label}: AUC & pAUC@0.05 (mean±std)')
+        _agg_bar_fig(agg, ['Pd@Pfa=0.05', 'Pd_cfar'],
+                     os.path.join(parent, f'{sig_label}_pd_bar.pdf'),
+                     f'{sig_label}: Pd@Pfa vs Pd at train-CFAR threshold (mean±std)')
+        _agg_bar_fig(agg, ['Pfa_avg', 'Pfa_max'],
+                     os.path.join(parent, f'{sig_label}_pfa_bar.pdf'),
+                     f'{sig_label}: realized Pfa at train-CFAR threshold (mean±std)',
+                     target_line=pfa_t)
+
+    json.dump({'seeds': list(seeds), 'seed_dirs': seed_dirs,
+               'overrides': {k: v for k, v in overrides.items()}},
+              open(os.path.join(parent, 'multiseed_meta.json'), 'w'),
+              indent=2, default=str)
+    print(f"\nDone.  Multi-seed results: {parent}", flush=True)
+    print(f"Representative per-seed figures: {seed_dirs[0]}", flush=True)
+    return parent
+
+
+def show_multiseed(parent_dir: str, rep_seed_figs: bool = True, inline: bool = True):
+    """Display the aggregate tables + bar figures, and (optionally) the
+    qualitative figures from the first seed as a representative example."""
+    import glob
+    # aggregate tables + bar charts
+    for md in sorted(glob.glob(os.path.join(parent_dir, 'summary_*.md'))):
+        print('\n' + open(md).read())
+    bars = sorted(glob.glob(os.path.join(parent_dir, '*_bar.png')))
+    if inline:
+        try:
+            from IPython.display import display, Image as IPImage
+            for p in bars:
+                print(f'── {os.path.basename(p)} ──'); display(IPImage(p, width=850))
+        except ImportError:
+            for p in bars: print(p)
+    else:
+        for p in bars: print(p)
+
+    if rep_seed_figs:
+        meta_p = os.path.join(parent_dir, 'multiseed_meta.json')
+        if os.path.exists(meta_p):
+            meta = json.load(open(meta_p))
+            rep = meta['seed_dirs'][0]
+            print(f"\n=== Representative qualitative figures (seed {meta['seeds'][0]}) ===")
+            for sig in _collect_sig_dirs(rep):
+                show_plots_from_dir(rep, sub=(None if sig[0] == 'inpatch' else 'foreign'),
+                                    inline=inline)
+
+
 if __name__ == '__main__':
     main()
