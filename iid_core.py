@@ -460,22 +460,43 @@ def run_classical_additive(train_raw, test_planted, s_raw, reg_sigma, cfg, mode)
 # Figures
 # ---------------------------------------------------------------------------
 
+# One distinct hue per detector. The set that can co-occur in a single figure is
+# {AMF, GMM-Levin, DSM, LDSM, LRao, LRao-MLP}, so these six must all differ
+# (e.g. LDSM is orange — not a 2nd red — and LRao-MLP is pink — not a 2nd green).
 DETECTOR_COLORS = {
-    'AMF':       '#1f77b4',
-    'GMM-Levin': '#9467bd',
-    'DLTD':      '#e6550d',   # orange
-    'SMGLRT':    '#8c564b',   # brown
-    'DSM':       '#d62728',   # red   — nonlinear DSM
-    'LDSM':      '#9b2226',   # dark red — linear DSM
-    'DSM-lin':   '#9b2226',   # dark red  — legacy alias
-    'DSM-MLP':   '#e07070',   # light red — legacy alias
-    'LRao':      '#2ca02c',   # green — linear LRao
-    'LRao-MLP':  '#17a72c',   # bright green — MLP LRao
+    'AMF':       '#1f77b4',   # blue
+    'GMM-Levin': '#9467bd',   # purple
+    'DSM':       '#d62728',   # red    — nonlinear DSM
+    'LDSM':      '#ff7f0e',   # orange — linear DSM
+    'LRao':      '#2ca02c',   # green  — linear LRao
+    'LRao-MLP':  '#e377c2',   # pink   — MLP LRao
+    'DLTD':      '#8c564b',   # brown
+    'SMGLRT':    '#7f7f7f',   # grey
+    'DSM-lin':   '#ff7f0e',   # orange — legacy alias of LDSM
+    'DSM-MLP':   '#d62728',   # red    — legacy alias of DSM
+}
+
+# Distinct marker per detector (so the curves are also separable in grayscale).
+DETECTOR_MARKERS = {
+    'AMF':       'o',
+    'GMM-Levin': '^',
+    'DSM':       'D',
+    'LDSM':      's',
+    'LRao':      'v',
+    'LRao-MLP':  'P',
+    'DLTD':      'X',
+    'SMGLRT':    '*',
+    'DSM-lin':   's',
+    'DSM-MLP':   'D',
 }
 
 
 def _det_color(det: str):
     return DETECTOR_COLORS.get(det, '#444444')
+
+
+def _det_marker(det: str):
+    return DETECTOR_MARKERS.get(det, 'o')
 
 
 def _savefig(fig, pdf_path: str, dpi: int = 150):
@@ -512,8 +533,8 @@ def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
         if ys is None or all(v != v for v in ys):     # all-NaN
             continue
         ys = np.asarray(ys, dtype=float)
-        style = dict(marker='D', lw=2.2) if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao', 'LRao-MLP') \
-            else dict(marker='o', lw=1.4)
+        lw = 2.2 if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao', 'LRao-MLP') else 1.4
+        style = dict(marker=_det_marker(det), lw=lw)
         c = _det_color(det)
         ax.plot(x, ys, color=c, label=det, **style)
         if series_std and det in series_std:
