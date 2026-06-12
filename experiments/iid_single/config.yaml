@@ -11,7 +11,7 @@ dataset: data/pavia-u.mat
 norm_mode: none                # RAW sensor values — no scaling (no PCA anywhere)
 whiten_mode: zca               # frozen whitening first layer: zca | pca | cholesky
 whiten_eig_floor:      0      # DSM: 0 = spectral-gap adaptive floor (detects natural noise floor)
-lrao_whiten_eig_floor: 0.01               # LRao floor (× λ_max) — cut near-zero dirs to keep C_Ψ invertible
+lrao_whiten_eig_floor: 0.0000000001               # LRao floor (× λ_max) — cut near-zero dirs to keep C_Ψ invertible
 
 # ----- classes (single-class: ONE background class vs ONE target class) -----
 bkg_cls: 2                     # asphalt
@@ -25,12 +25,12 @@ test_size: 2000
 
 # ----- sweep axes -----
 # Full paper sweep — trim for quick tests by editing the lists below
-n_train_list: [20,40, 60, 100, 200, 500, 1000, 2000,4000, 8000,12000]
+n_train_list: [20,40, 60, 100, 200, 500, 1000, 2000]
 
 rho_list: [
   0.00001, 0.001, 0.005,0.01,0.3,0.5,0.07, 0.1,0.5, 1.0,3.0,10.0
 ]
-n_fixed_for_rho: 1000           # n used for the vs-rho sweep
+n_fixed_for_rho: 400           # n used for the vs-rho sweep
 
 # ----- metric operating points -----
 pfa: 0.1                       # Pd @ this Pfa
@@ -46,7 +46,7 @@ dsm2_label: "DSM"       # nonlinear DSM label
 
 # ----- training budgets -----
 dsm_epochs: 2000
-lrao_epochs: 50
+lrao_epochs: 2000
 
 # ----- optimizer (DSM, LRao) -----
 lr: 0.0005
@@ -54,12 +54,16 @@ weight_decay: 0.00005
 batch_size: 512
 
 # ----- DSM specifics -----
-dsm_sigma_rho: 0.1            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (whitened)
+dsm_sigma_rho: 0.1      # current — fixed numeric ρ (KDE OFF)
+#dsm_sigma_rho: 'auto'    # KDE: Parzen LOO log-likelihood
+#dsm_sigma_rho: 'auto-sm' # KDE: Parzen LOO score-matching
+#dsm_sigma_rho: 'lw'      # Ledoit-Wolf shrinkage (Gaussian, not KDE)
 
 # ----- LRao Mode-2 specifics -----
 lfi_delta_theta: 0.01
-lfi_sigma_cutoff: 0.001
-lfi_detach_sigma: false        # Sigma in graph (matches original LRao code)
+lfi_sigma_cutoff: 0.000001
+lfi_detach_sigma: true       # detach Sigma → no incentive to collapse its variance (stable)
+lrao_grad_clip: 1.0          # max grad-norm for LRao (0 = off)
 
 # ----- GMM-family detectors -----
 gmm_K: 2

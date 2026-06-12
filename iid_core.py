@@ -43,6 +43,7 @@ Use this module from run_iid_single.py and run_iid_multi.py.
 ============================================================================
 """
 
+import copy
 import os
 import sys
 import json
@@ -74,6 +75,7 @@ from final_paper_experiments.baselines.detectors import (
 from final_paper_experiments.baselines.gmm_glrt_levin import gmm_glrt_levin_additive
 from dsm_model import (
     ScoreNet, Whitening, dsm_loss, lfi_loss_mode2, compute_lfi_detector_scores_mode2,
+    select_sigma_parzen, select_sigma_ledoitwolf,
 )
 
 
@@ -160,37 +162,100 @@ def train_dsm_local(train_raw: np.ndarray, cfg: dict,
     The net whitens internally, DSM noise is isotropic in whitened space
     (σ=√ρ), and forward returns the DATA-SPACE score (detection uses raw sig).
     Trains on GPU if cfg['device'] is set (or CUDA is available and not disabled).
+
+    Best-epoch selection (checked every val_check_every epochs and at the final epoch):
+      val_fraction = 0  (default) — use all data for training; checkpoint by train loss.
+      val_fraction > 0            — hold out that fraction for validation; checkpoint by val loss.
     """
     torch.manual_seed(seed)
     device = torch.device(cfg.get('device', 'cpu'))
     D = train_raw.shape[1]
     W = _make_whitening(train_raw, cfg)
-    sigma = float(np.sqrt(cfg['dsm_sigma_rho']))     # whitened cov≈I ⇒ σ²=ρ·1
+
+    # --- DSM noise level sigma -----------------------------------------------
+    # Numeric dsm_sigma_rho  -> sigma = sqrt(rho)  (whitened cov≈I ⇒ σ²=ρ·1).
+    # String dsm_sigma_rho   -> data-driven KDE-bandwidth selection, done BEFORE
+    # training in the whitened space the DSM noise lives in (plug-and-play; set
+    # dsm_sigma_rho back to a number to disable):
+    #   'auto'/'auto-loglik' -> Parzen LOO log-likelihood
+    #   'auto-sm'            -> Parzen LOO score-matching
+    #   'lw'/'ledoitwolf'    -> Ledoit-Wolf shrinkage loading (Gaussian)
+    rho_cfg = cfg['dsm_sigma_rho']
+    if isinstance(rho_cfg, str):
+        Zw = W(torch.tensor(np.asarray(train_raw, dtype=np.float32))
+               ).detach().cpu().numpy()
+        mode = rho_cfg.lower()
+        if mode in ('lw', 'ledoit', 'ledoitwolf'):
+            sigma = select_sigma_ledoitwolf(Zw, seed=seed); how = 'ledoit-wolf'
+        else:
+            crit = 'scorematch' if mode.endswith('sm') else 'loglik'
+            sigma = select_sigma_parzen(Zw, seed=seed, criterion=crit)
+            how = f'parzen-{crit}'
+        print(f"    [auto-sigma] DSM {label}: sigma={sigma:.4f} "
+              f"(rho={sigma ** 2:.4g}) [whitened space, {how}]", flush=True)
+    else:
+        sigma = float(np.sqrt(rho_cfg))
     model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                            weight_decay=cfg['weight_decay'])
-    X = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
-    N, bs = len(X), min(cfg['batch_size'], len(X))
-    baseline = D / (sigma ** 2)
-    hist = []
-    pbar = tqdm(range(1, cfg['dsm_epochs'] + 1), desc=f'DSM {label}',
+
+    X_all     = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
+    val_frac  = float(cfg.get('val_fraction', 0.0))
+    use_val   = val_frac > 0.0
+    if use_val:
+        n_val   = max(1, int(len(X_all) * val_frac))
+        n_train = len(X_all) - n_val
+        perm0   = torch.randperm(len(X_all))
+        X_tr    = X_all[perm0[:n_train]]
+        X_val   = X_all[perm0[n_train:]]
+    else:
+        X_tr  = X_all
+        X_val = None
+        n_train = len(X_all)
+
+    N, bs      = n_train, min(cfg['batch_size'], n_train)
+    baseline   = D / (sigma ** 2)
+    total_eps  = cfg['dsm_epochs']
+    val_every  = cfg.get('val_check_every', 100)
+    hist       = []
+    best_score = float('inf')   # lower train/val loss is better
+    best_state = None
+
+    pbar = tqdm(range(1, total_eps + 1), desc=f'DSM {label}',
                 dynamic_ncols=True, leave=False)
-    for _ in pbar:
+    for ep in pbar:
+        model.train()
         perm = torch.randperm(N)
-        tot = 0.0
-        nb = 0
+        tot = 0.0; nb = 0
         for i in range(0, N, bs):
-            b = X[perm[i:i + bs]]
+            b = X_tr[perm[i:i + bs]]
             loss = dsm_loss(model, b, sigma)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            tot += loss.item()
-            nb += 1
-        hist.append(tot / max(nb, 1))
-        pbar.set_postfix(loss=f"{hist[-1]:.2f}",
-                         ratio=f"{hist[-1] / baseline:.3f}")
-    model.cpu().eval()   # move back to CPU so scoring helpers get numpy-compatible model
+            opt.zero_grad(); loss.backward(); opt.step()
+            tot += loss.item(); nb += 1
+        ep_loss = tot / max(nb, 1)
+        hist.append(ep_loss)
+
+        if ep % val_every == 0 or ep == total_eps:
+            if use_val:
+                model.eval()
+                with torch.no_grad():
+                    check_score = dsm_loss(model, X_val, sigma).item()
+                pbar.set_postfix(tr=f"{ep_loss:.2f}", val=f"{check_score:.2f}",
+                                 ratio=f"{ep_loss / baseline:.3f}")
+            else:
+                check_score = ep_loss
+                pbar.set_postfix(loss=f"{ep_loss:.2f}",
+                                 ratio=f"{ep_loss / baseline:.3f}")
+            if check_score < best_score:
+                best_score = check_score
+                best_state = copy.deepcopy(model.state_dict())
+        else:
+            pbar.set_postfix(loss=f"{ep_loss:.2f}",
+                             ratio=f"{ep_loss / baseline:.3f}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.cpu().eval()
     return model, hist
 
 
@@ -214,33 +279,83 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                               weight_decay=cfg['weight_decay'])
-    X     = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
-    N, bs = len(X), min(cfg['batch_size'], len(train_raw))
-    hist  = []
+    X_all    = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
+    val_frac = float(cfg.get('val_fraction', 0.0))
+    use_val  = val_frac > 0.0
+    if use_val:
+        n_val   = max(1, int(len(X_all) * val_frac))
+        n_train = len(X_all) - n_val
+        perm0   = torch.randperm(len(X_all))
+        X_tr    = X_all[perm0[:n_train]]
+        X_val   = X_all[perm0[n_train:]]
+    else:
+        X_tr  = X_all
+        X_val = None
+        n_train = len(X_all)
 
-    pbar = tqdm(range(1, cfg['lrao_epochs'] + 1), desc=f'LRao {label}',
+    N, bs      = n_train, min(cfg['batch_size'], n_train)
+    hist       = []
+    best_score = float('-inf')  # tr(J*), higher is better
+    best_state = None
+    total_eps  = cfg['lrao_epochs']
+    val_every  = cfg.get('val_check_every', 100)
+
+    clip = float(cfg.get('lrao_grad_clip', 1.0))
+    pbar = tqdm(range(1, total_eps + 1), desc=f'LRao {label}',
                 dynamic_ncols=True, leave=False)
     for ep in pbar:
         model.train()
-        perm = torch.randperm(N); tot = 0.0; nb = 0
-        try:
-            for i in range(0, N, bs):
-                b    = X[perm[i:i + bs]]
+        perm = torch.randperm(N); tot = 0.0; nb = 0; skipped = 0
+        for i in range(0, N, bs):
+            b = X_tr[perm[i:i + bs]]
+            try:
                 loss = lfi_loss_mode2(model, b, cfg['lfi_delta_theta'],
                                       cfg['lfi_sigma_cutoff'],
                                       detach_sigma=cfg['lfi_detach_sigma'])
-                if not torch.isfinite(loss):
-                    raise FloatingPointError("non-finite LRao loss")
-                opt.zero_grad(); loss.backward(); opt.step()
-                tot += loss.item(); nb += 1
-        except Exception as exc:
-            print(f"      [warn] LRao {label} aborted at epoch {ep}: {exc}",
-                  flush=True)
+            except Exception:
+                skipped += 1; continue
+            if not torch.isfinite(loss):
+                skipped += 1; continue
+            opt.zero_grad(); loss.backward()
+            finite = all(p.grad is None or torch.isfinite(p.grad).all()
+                         for p in model.parameters())
+            if not finite:
+                skipped += 1; continue
+            if clip and clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            opt.step()
+            tot += loss.item(); nb += 1
+        if nb == 0:
+            print(f"      [warn] LRao {label} stalled at epoch {ep} "
+                  f"(all batches skipped) — returning best-so-far", flush=True)
             break
-        hist.append(-tot / max(nb, 1))   # tr(J*)
-        pbar.set_postfix(trJ=f"{hist[-1]:.2f}")
+        ep_trJ = -tot / nb          # tr(J*), higher is better
+        hist.append(ep_trJ)
 
-    model.cpu().eval()   # back to CPU so scoring helpers receive numpy-compatible model
+        if ep % val_every == 0 or ep == total_eps:
+            if use_val:
+                model.eval()
+                try:
+                    with torch.no_grad():
+                        val_loss = lfi_loss_mode2(model, X_val, cfg['lfi_delta_theta'],
+                                                 cfg['lfi_sigma_cutoff'],
+                                                 detach_sigma=True)
+                    check_score = -val_loss.item()
+                except Exception:
+                    check_score = float('-inf')
+                pbar.set_postfix(trJ=f"{ep_trJ:.2f}", val=f"{check_score:.2f}", skip=skipped)
+            else:
+                check_score = ep_trJ
+                pbar.set_postfix(trJ=f"{ep_trJ:.2f}", skip=skipped)
+            if check_score > best_score:
+                best_score = check_score
+                best_state = copy.deepcopy(model.state_dict())
+        else:
+            pbar.set_postfix(trJ=f"{ep_trJ:.2f}", skip=skipped)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.cpu().eval()
     return model, hist
 
 
@@ -461,7 +576,13 @@ def run_iid(cfg: dict, mode: str):
     n_list   = sorted(set(_ensure_list(cfg['n_train_list'])))
     rho_list = sorted(set(_ensure_list(cfg.get(
         'rho_list', [0.001, 0.003, 0.01, 0.03, 0.1, 0.3]))))
-    rho_fixed = float(cfg['dsm_sigma_rho'])          # ρ used for the vs-n sweep
+    # ρ used by the classical Reg-AMF loading and the ROC-at-fixed-ρ figure.
+    # When dsm_sigma_rho is a STRING (data-driven KDE sigma for DSM), it has no
+    # numeric value, so fall back to the median of rho_list for these purposes;
+    # DSM training still reads the string directly in train_dsm_local.
+    _rho_raw   = cfg['dsm_sigma_rho']
+    auto_sigma = isinstance(_rho_raw, str)
+    rho_fixed  = float(np.median(rho_list)) if auto_sigma else float(_rho_raw)
     n_fixed   = int(cfg.get('n_fixed_for_rho', max(n_list)))   # n for the vs-ρ sweep
     pfa       = float(cfg.get('pfa', 0.1))           # operating Pfa for Pd@Pfa
     pauc_fpr  = float(cfg.get('pauc_fpr', 0.1))      # partial-AUC upper FPR

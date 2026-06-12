@@ -121,10 +121,18 @@ class NeighborMLPDenoiser(nn.Module):
             topk_idx = dists.topk(K_eff, dim=1, largest=False).indices  # (B, K)
 
         topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, self.d_lat)
-        z_topk = z_j.gather(1, topk_idx_exp)                          # (B, K, d_lat)
+        z_topk = z_j.gather(1, topk_idx_exp)                          # (B, K_eff, d_lat)
+
+        # If fewer neighbors exist than self.K (small window: M = k*k-1 < K),
+        # zero-pad the top-K block so `u` always matches the denoiser's input
+        # dim (D + (1+self.K)*d_lat). Without this the first Linear layer of
+        # self.f mismatches and the forward pass crashes.
+        if K_eff < self.K:
+            pad = z_topk.new_zeros(B, self.K - K_eff, self.d_lat)
+            z_topk = torch.cat([z_topk, pad], dim=1)                  # (B, K, d_lat)
 
         # --- 3. Concatenate ---
-        u = torch.cat([y, z_i, z_topk.reshape(B, K_eff * self.d_lat)], dim=-1)
+        u = torch.cat([y, z_i, z_topk.reshape(B, self.K * self.d_lat)], dim=-1)
 
         # --- 4. Denoiser ---
         x_hat = self.f(u)                                              # (B, D)

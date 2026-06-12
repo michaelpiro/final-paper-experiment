@@ -4,6 +4,118 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+# ===========================================================================
+# Data-driven DSM noise-level (sigma) selection — KDE-bandwidth view.
+# Plug-and-play: only used when cfg['dsm_sigma_rho'] is a STRING. Imported by
+# iid_core.train_dsm_local. Self-contained (ported from shir_iid_multi branch).
+# ===========================================================================
+
+def select_sigma_parzen(W: np.ndarray, sigma_lo: float = 0.02,
+                        sigma_hi: float = 5.0, seed: int = 0,
+                        criterion: str = "loglik") -> float:
+    """Choose the DSM noise level sigma from the samples, before training.
+
+    DSM at noise sigma estimates the score of q_sigma = p_w * N(0, sigma^2 I)
+    -- exactly the Gaussian-kernel Parzen (KDE) density with bandwidth sigma.
+    So picking sigma is a KDE-bandwidth problem, solved from the samples alone
+    by leave-one-out cross-validation (no network training):
+
+      criterion="loglik"     : maximize the LOO Parzen log-likelihood.
+      criterion="scorematch" : minimize the LOO implicit-score-matching loss
+                               (the objective DSM itself optimizes).
+
+    NOTE: pass the data in the SAME space the DSM noise is added in. Here the
+    score net whitens internally and DSM noise is isotropic in whitened space,
+    so this must be called on the WHITENED training data; the returned sigma is
+    then the whitened-space sigma used by dsm_loss.
+
+    n is small in this problem, so we just build the full (n, n) pairwise
+    squared-distance matrix once and reuse it across the 1-D golden-section
+    search over log-sigma.
+    """
+    from scipy.special import logsumexp
+    mu, std = W.mean(0), W.std(0) + 1e-8
+    U = ((W - mu) / std).astype(np.float64)
+    n, d = U.shape
+    if n < 3:
+        return 1.0
+
+    # full pairwise squared distances (n, n); self-distance excluded (LOO)
+    sqn = np.einsum("ij,ij->i", U, U)
+    D = np.maximum(sqn[:, None] + sqn[None, :] - 2.0 * (U @ U.T), 0.0)
+    diag = np.arange(n)
+    Dself0 = D.copy()                       # self-distance 0 for weighted sums
+    D[diag, diag] = np.inf                  # exclude self in the LOO kernel
+
+    def negobj(log_sigma):
+        s2 = np.exp(2.0 * log_sigma)
+        logk = -D / (2.0 * s2)              # (n, n), -inf on the diagonal
+        lse = logsumexp(logk, axis=1)       # sum over j != i
+        if criterion == "loglik":
+            ll = lse - np.log(n - 1) - 0.5 * d * np.log(2 * np.pi * s2)
+            return -ll.mean()
+        # score-matching: LOO implicit-score-matching loss of the KDE score
+        r = np.exp(logk - lse[:, None])     # responsibilities (self = 0)
+        m = r @ U - U                       # (n, d) = E_r[u_j] - u_i  = s2 * psi
+        m2 = np.einsum("ij,ij->i", m, m)
+        rD = np.einsum("ij,ij->i", r, Dself0)
+        psi2 = m2 / s2 ** 2
+        div = (-d + (rD - m2) / s2) / s2
+        return (0.5 * psi2 + div).mean()
+
+    gr = (np.sqrt(5) - 1) / 2
+    a, b = np.log(sigma_lo), np.log(sigma_hi)
+    c, dd = b - gr * (b - a), a + gr * (b - a)
+    fc, fd = negobj(c), negobj(dd)
+    for _ in range(40):
+        if fc < fd:
+            b, dd, fd = dd, c, fc
+            c = b - gr * (b - a)
+            fc = negobj(c)
+        else:
+            a, c, fc = c, dd, fd
+            dd = a + gr * (b - a)
+            fd = negobj(dd)
+        if (b - a) < 1e-24:
+            break
+    return float(np.exp((a + b) / 2))
+
+
+def select_sigma_ledoitwolf(W: np.ndarray, seed: int = 0) -> float:
+    """Pick the DSM noise level sigma from a Ledoit-Wolf shrinkage covariance.
+
+    By Proposition 1, Gaussian DSM at noise sigma is the diagonally-loaded
+    covariance (Sigma_hat + sigma^2 I). Ledoit-Wolf gives the optimal linear
+    shrinkage toward a scaled identity:
+
+        Sigma_LW = (1 - rho) Sigma_hat + rho * mu * I,   mu = tr(Sigma_hat)/d.
+
+    The isotropic ("diagonal-loading") variance that the shrinkage injects is
+
+        sigma^2 = rho * mu,
+
+    which we use as the DSM noise level. (We deliberately do NOT use the
+    scale-invariant ratio rho*mu/(1-rho): on whitened data Sigma_hat is already
+    ~= mu*I = the shrinkage target, so Ledoit-Wolf drives rho -> 1 and the ratio
+    diverges; rho*mu stays bounded by mu.) rho is chosen analytically by
+    Ledoit-Wolf -- no search, no training. Pass WHITENED data so sigma is in
+    the space the DSM noise lives in. Unlike the Parzen-LOO selector this is a
+    purely second-order (Gaussian) criterion: cheap and stable, but blind to
+    non-Gaussian structure.
+    """
+    from sklearn.covariance import LedoitWolf
+    X = np.asarray(W, dtype=np.float64)
+    n, d = X.shape
+    if n < 3:
+        return 1.0
+    lw = LedoitWolf().fit(X)
+    rho = float(np.clip(lw.shrinkage_, 0.0, 1.0))
+    Xc = X - X.mean(0)
+    mu_scale = float(np.trace(Xc.T @ Xc) / max(n - 1, 1) / d)   # tr(Sigma)/d
+    sigma2 = rho * mu_scale
+    return float(np.sqrt(max(sigma2, 1e-12)))
+
+
 def _robust_svd_np(A: np.ndarray):
     """
     SVD with fallback chain for ill-conditioned matrices.
@@ -141,70 +253,25 @@ class Whitening(nn.Module):
                   eig_floor: float = 0.0, eps: float = 1e2):
         """Fit a frozen whitener from background pixels X.
 
-        eig_floor : Eigenvalue floor mode.
-            0.0  (default) — Spectral-gap adaptive floor.
-                 Scans the BOTTOM HALF of the positive eigenvalue spectrum
-                 for the first large multiplicative jump (≥ 100×).  If one
-                 is found, the floor is set at the top of the bottom cluster
-                 (i.e. the eigenvalue just below the gap).  If no large gap
-                 exists the floor is ``eps`` — smooth spectra keep all
-                 directions.
-
-                 Examples:
-                   [1e7,…,1e0, 1e-3, 1e-6,1e-6,1e-6]
-                       → gap 1e-6→1e-3 is 1000×  → floor = 1e-6
-                   null-space (n < D):
-                       near-zero eigenvalues excluded from scan,
-                       automatically clipped to eps = 1e-6
-                   smooth spectrum (n >> D):
-                       no gap ≥ 100× in the bottom half → floor = eps
-
-            > 0  — Fixed relative override: floor = eig_floor × λ_max.
-                 Useful for a predictable manual floor (e.g.
-                 lrao_whiten_eig_floor = 0.01 to keep C_Ψ invertible).
-        eps : absolute minimum floor — safety guard against 1/0.
+        eig_floor:
+            0.0 (default) — automatic floor at 1e-5 × λ_max (keeps all
+                directions while guarding against near-zero eigenvalues).
+            > 0 — fixed relative floor: floor = eig_floor × λ_max.
+                  Useful when a tighter cut is needed (e.g. lrao_whiten_eig_floor=0.01).
+        eps: absolute minimum floor — safety net against division by zero.
         """
         X = np.asarray(X, dtype=np.float64)
         n, D = X.shape
         mu = X.mean(0)
         Xc = X - mu
         Sigma = (Xc.T @ Xc) / max(n - 1, 1)
-        Sigma = (Sigma + Sigma.T) / 2
+        Sigma = (Sigma + Sigma.T) / 2          # enforce symmetry
         if mode == "cholesky":
-            W = np.linalg.inv(np.linalg.cholesky(
-                Sigma + eps * np.eye(D)))
+            W = np.linalg.inv(np.linalg.cholesky(Sigma + eps * np.eye(D)))
         else:
             evals, evecs = np.linalg.eigh(Sigma)   # ascending order
-            if eig_floor > 0:
-                # Manual: fixed relative floor × λ_max
-                floor = max(float(evals.max()) * eig_floor, eps)
-            else:
-
-                # # Spectral-gap adaptive floor.
-                # #
-                # # Look for a large multiplicative jump in the BOTTOM HALF of
-                # # the positive eigenvalue sequence (ascending).  A gap ≥ 100×
-                # # indicates a natural noise floor (null-space boundary or a
-                # # genuine low-eigenvalue cluster).  Searching only the bottom
-                # # half avoids being misled by large gaps in the signal part of
-                # # the spectrum.  The floor is set to the eigenvalue just below
-                # # the gap (top of the bottom cluster).
-                # #
-                # # Null-space directions (eigenvalue ≤ 0) are excluded from the
-                # # scan; np.clip raises them to eps automatically.
-                # _GAP = 100.0                          # 2 log10 decades
-                # pos  = evals[evals > 0]               # ascending positive evals
-                # floor = eps
-                floor = max(float(evals[-1]*1e-5),eps)
-                # if len(pos) >= 2:
-                #     # third   = max(len(pos) // 8, 1)
-                #     bottom = pos[2:]            # bottom-half + 1 element
-                #     if len(bottom) >= 2:
-                #         ratios = bottom[1:] / bottom[:-1]
-                #         i_gap  = int(np.argmax(ratios))
-                #         if ratios[i_gap] >= _GAP:
-                #
-                #             floor = max(float(bottom[i_gap]), eps)
+            rel = eig_floor if eig_floor > 0 else 1e-5
+            floor = max(float(evals[-1]) * rel, eps)
             evals = np.clip(evals, floor, None)
             inv_sqrt = np.diag(1.0 / np.sqrt(evals))
             W = (inv_sqrt @ evecs.T) if mode == "pca" else (evecs @ inv_sqrt @ evecs.T)
