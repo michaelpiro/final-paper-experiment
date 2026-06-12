@@ -94,6 +94,7 @@ HIT_MARK    = '#39ff14'   # lime — true detections
 # Fixed display order + colors for the detectors.
 DET_ORDER = [
     'DSM',
+    'DSM-CFAR',
     'NeighborMLP',
     'NeighborMLP-CFAR',
     'AMF',
@@ -102,6 +103,7 @@ DET_ORDER = [
 ]
 DET_COLORS = {
     'DSM':              '#ff7f0e',   # orange
+    'DSM-CFAR':         '#d94801',   # dark orange
     'NeighborMLP':      '#2ca02c',   # green
     'NeighborMLP-CFAR': '#006d2c',   # dark green
     'AMF':              '#9467bd',   # purple
@@ -131,11 +133,18 @@ DEFAULT_CFG = dict(
     k=5,
     local_scm_loading=1e-8,
     baseline_eig_floor=1e-12,
+    # AMF-local window: None → use the shared neighborhood k; int → AMF-local
+    # re-extracts its OWN (amf_local_window×amf_local_window) window, independent
+    # of the NeighborMLP neighborhood. Adjustable straight from the notebook.
+    amf_local_window=None,
     # NeighborMLP — encoder: D→enc_hidden→d_lat ; denoiser: (D+(K+1)*d_lat)→score_hidden→D
     nmlp_d_lat=16, nmlp_K=8, nmlp_enc_hidden=[128, 64], nmlp_score_hidden=[128],
     nmlp_epochs=1000, nmlp_lr=3e-4, nmlp_batch=256,
     # NeighborMLP-CFAR local normalization
     cfar_bg_window=11, cfar_guard=3, cfar_lam=0.0,
+    # DSM-CFAR: global DSM score map standardized by a local window mean/std
+    # (local mean reduce + local Fisher/variance normalization). Own window.
+    dsm_cfar_window=11, dsm_cfar_guard=3,
     # DSM
     dsm_hidden=[64, 64], dsm_epochs=1000, dsm_lr=5e-4,
     # shared
@@ -438,15 +447,20 @@ def _active_set(cfg):
     s = set(act)
     if 'NeighborMLP-CFAR' in s:
         s.add('NeighborMLP')
+    if 'DSM-CFAR' in s:        # CFAR variant is derived from the global DSM map
+        s.add('DSM')
     return s
 
 
 # ---------------------------------------------------------------------------
-def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
+def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device, nbr_amf=None):
     """Score the REQUESTED detectors on (pix, nbr).  Returns {det_name: scores}.
 
     A detector is skipped if it is not in cfg['active_detectors'] (None = all),
     or if its deep model is absent from `models`.
+
+    nbr_amf : optional separate neighbor tensor for AMF-local (its own window).
+              None → fall back to the shared `nbr`.
     """
     pix = pix.astype(np.float32)
     nbr = nbr.astype(np.float32)
@@ -460,8 +474,9 @@ def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device):
     if 'AMF' in act:
         out['AMF'] = amf_global(pix, tr_raw, sig, eig_floor=floor)
     if 'AMF-local' in act:
+        nbr_for_amf = (nbr_amf.astype(np.float32) if nbr_amf is not None else nbr)
         amf_loc, _ = amf_cem_local_scm(
-            pix, nbr, sig, device=device,
+            pix, nbr_for_amf, sig, device=device,
             loading=float(cfg.get('local_scm_loading', 1e-8)))
         out['AMF-local'] = amf_loc
     if 'GMM-Levin' in act:
@@ -498,9 +513,11 @@ def run_detection(sig, sig_label, out_dir, ctx):
           flush=True)
 
     print("Scoring detectors (test) ...", flush=True)
-    test_scores = score_all(planted, te_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
+    test_scores = score_all(planted, te_nbr, models, tr_raw, tr_nbr, sig, cfg, device,
+                            nbr_amf=ctx.get('te_nbr_amf'))
     print("Scoring detectors (train, for CFAR thresholds) ...", flush=True)
-    train_scores = score_all(tr_raw, tr_nbr, models, tr_raw, tr_nbr, sig, cfg, device)
+    train_scores = score_all(tr_raw, tr_nbr, models, tr_raw, tr_nbr, sig, cfg, device,
+                             nbr_amf=ctx.get('tr_nbr_amf'))
 
     # ---- NeighborMLP-CFAR: local kNN-Fisher normalization ----
     k_win = int(cfg['k'])
@@ -515,6 +532,16 @@ def run_detection(sig, sig_label, out_dir, ctx):
         train_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
             train_scores['NeighborMLP'], models['nmlp'], tr_raw, tr_nbr,
             tr_shape, k_win, cfar_lam=lam)
+
+    # ---- DSM-CFAR: global DSM score map with local mean-reduce + local-Fisher
+    # (variance) normalization over an (dsm_cfar_window) k×k window. ----
+    if ('DSM-CFAR' in _active_set(cfg) and 'DSM' in test_scores):
+        dsm_bg    = int(cfg.get('dsm_cfar_window', cfg.get('cfar_bg_window', 11)))
+        dsm_guard = int(cfg.get('dsm_cfar_guard', cfg.get('cfar_guard', 3)))
+        test_scores['DSM-CFAR'] = _cfar_normalize_map(
+            test_scores['DSM'], (H_b, W_b), dsm_bg, dsm_guard, cfar_lam=lam)
+        train_scores['DSM-CFAR'] = _cfar_normalize_map(
+            train_scores['DSM'], tr_shape, dsm_bg, dsm_guard, cfar_lam=lam)
 
     DETS = [d for d in DET_ORDER if d in test_scores]
     print(f"Active detectors: {DETS}", flush=True)
@@ -725,6 +752,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
 # the trained nets or the train/test boxes — only scoring / planting / plots).
 RELOAD_OVERRIDE_KEYS = [
     'cfar_bg_window', 'cfar_guard', 'cfar_lam',
+    'dsm_cfar_window', 'dsm_cfar_guard', 'amf_local_window',
     'pfa_target', 'amplitude', 'target_fraction', 'edge_guard',
     'target_class', 'foreign_class', 'active_detectors', 'run_inpatch', 'run_foreign',
     'gmm_steps', 'gmm_K', 'local_scm_loading', 'baseline_eig_floor',
@@ -847,6 +875,17 @@ def main():
     te_gt = gt[r0:r1, c0:c1].ravel()
     print(f"test={len(te_raw)} px  ({H_b}×{W_b})", flush=True)
 
+    # ---- AMF-local own window (independent of the NeighborMLP neighborhood k) ----
+    amf_k = int(cfg.get('amf_local_window') or k)
+    if amf_k != k:
+        _, tr_nbr_amf = _crop_pca_box(data_norm, tr_box_eff, amf_k)
+        _, te_nbr_amf = _crop_pca_box(data_norm, test_box, amf_k)
+        tr_nbr_amf = tr_nbr_amf.astype(np.float32)
+        te_nbr_amf = te_nbr_amf.astype(np.float32)
+        print(f"AMF-local window={amf_k}×{amf_k} (independent of k={k})", flush=True)
+    else:
+        tr_nbr_amf, te_nbr_amf = tr_nbr, te_nbr
+
     # ---- In-patch signature (dominant class of the test patch) ----
     sig_in, dom_cls, dom_name = _resolve_inpatch_signature(
         cfg, gt, data_norm, te_raw, test_box)
@@ -888,6 +927,7 @@ def main():
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
                tr_raw=tr_raw, tr_nbr=tr_nbr, te_raw=te_raw, te_nbr=te_nbr,
+               tr_nbr_amf=tr_nbr_amf, te_nbr_amf=te_nbr_amf,
                te_gt=te_gt, data_norm=data_norm, gt=gt,
                test_box=test_box, train_box=tr_box_eff, sidx=sidx)
 
@@ -970,6 +1010,17 @@ def run_from_cfg(overrides: dict, dry_run: bool = False):
     te_gt = gt[r0:r1, c0:c1].ravel()
     print(f"test={len(te_raw)} px  ({H_b}×{W_b})", flush=True)
 
+    # ---- AMF-local own window (independent of the NeighborMLP neighborhood k) ----
+    amf_k = int(cfg.get('amf_local_window') or k)
+    if amf_k != k:
+        _, tr_nbr_amf = _crop_pca_box(data_norm, tr_box_eff, amf_k)
+        _, te_nbr_amf = _crop_pca_box(data_norm, test_box, amf_k)
+        tr_nbr_amf = tr_nbr_amf.astype(np.float32)
+        te_nbr_amf = te_nbr_amf.astype(np.float32)
+        print(f"AMF-local window={amf_k}×{amf_k} (independent of k={k})", flush=True)
+    else:
+        tr_nbr_amf, te_nbr_amf = tr_nbr, te_nbr
+
     sig_in, dom_cls, dom_name = _resolve_inpatch_signature(
         cfg, gt, data_norm, te_raw, test_box)
     sig_in = sig_in.astype(np.float32)
@@ -1001,6 +1052,7 @@ def run_from_cfg(overrides: dict, dry_run: bool = False):
 
     ctx = dict(cfg=cfg, device=device, seed=seed, models=models,
                tr_raw=tr_raw, tr_nbr=tr_nbr, te_raw=te_raw, te_nbr=te_nbr,
+               tr_nbr_amf=tr_nbr_amf, te_nbr_amf=te_nbr_amf,
                te_gt=te_gt, data_norm=data_norm, gt=gt,
                test_box=test_box, train_box=tr_box_eff, sidx=sidx)
 

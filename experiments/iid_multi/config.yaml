@@ -67,6 +67,14 @@ dsm_sigma_rho: 0.1            # fixed rho for the vs-n sweep; sigma=sqrt(rho) (w
 lfi_delta_theta: 0.01
 lfi_sigma_cutoff: 0.001
 lfi_detach_sigma: false        # Sigma in graph (matches original LRao code)
+# MLP LRao: a second LRao with the DSM-MLP architecture. Here hidden_dims=[128]
+# is the MLP, so LRao-MLP auto-uses [128] (override with lrao_mlp_hidden).
+run_lrao_mlp: true
+# LRao validation early stopping (it is the slow model). lrao_val_fraction>0 turns
+# it on; training stops after lrao_patience checks with no val tr(J*) improvement.
+lrao_val_fraction: 0.1
+lrao_val_check_every: 50
+lrao_patience: 6
 
 # ----- GMM-family detectors (multiclass uses K=9 — bigger mixed background) -----
 gmm_K: 9

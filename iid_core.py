@@ -279,8 +279,14 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                               weight_decay=cfg['weight_decay'])
+    # LRao is slow → validation-based early stopping (paper-style). LRao-specific
+    # knobs fall back to the shared ones:
+    #   lrao_val_fraction   — held-out fraction for the val tr(J*) (0 = disabled)
+    #   lrao_val_check_every— epochs between val checks
+    #   lrao_patience       — stop after this many checks with no val improvement
+    #                         (0 = never stop early; just keep the best-val weights)
     X_all    = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
-    val_frac = float(cfg.get('val_fraction', 0.0))
+    val_frac = float(cfg.get('lrao_val_fraction', cfg.get('val_fraction', 0.0)))
     use_val  = val_frac > 0.0
     if use_val:
         n_val   = max(1, int(len(X_all) * val_frac))
@@ -297,8 +303,10 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     hist       = []
     best_score = float('-inf')  # tr(J*), higher is better
     best_state = None
+    bad_checks = 0
     total_eps  = cfg['lrao_epochs']
-    val_every  = cfg.get('val_check_every', 100)
+    val_every  = int(cfg.get('lrao_val_check_every', cfg.get('val_check_every', 100)))
+    patience   = int(cfg.get('lrao_patience', 0))
 
     clip = float(cfg.get('lrao_grad_clip', 1.0))
     pbar = tqdm(range(1, total_eps + 1), desc=f'LRao {label}',
@@ -343,13 +351,22 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
                     check_score = -val_loss.item()
                 except Exception:
                     check_score = float('-inf')
-                pbar.set_postfix(trJ=f"{ep_trJ:.2f}", val=f"{check_score:.2f}", skip=skipped)
+                pbar.set_postfix(trJ=f"{ep_trJ:.2f}", val=f"{check_score:.2f}",
+                                 bad=bad_checks, skip=skipped)
             else:
                 check_score = ep_trJ
                 pbar.set_postfix(trJ=f"{ep_trJ:.2f}", skip=skipped)
             if check_score > best_score:
                 best_score = check_score
                 best_state = copy.deepcopy(model.state_dict())
+                bad_checks = 0
+            else:
+                bad_checks += 1
+            # validation early stopping (LRao is expensive; stop once it plateaus)
+            if use_val and patience > 0 and bad_checks >= patience:
+                print(f"      [early-stop] LRao {label} at epoch {ep}/{total_eps} "
+                      f"(no val improvement for {patience} checks)", flush=True)
+                break
         else:
             pbar.set_postfix(trJ=f"{ep_trJ:.2f}", skip=skipped)
 
@@ -442,7 +459,8 @@ DETECTOR_COLORS = {
     'LDSM':      '#9b2226',   # dark red — linear DSM
     'DSM-lin':   '#9b2226',   # dark red  — legacy alias
     'DSM-MLP':   '#e07070',   # light red — legacy alias
-    'LRao':      '#2ca02c',
+    'LRao':      '#2ca02c',   # green — linear LRao
+    'LRao-MLP':  '#17a72c',   # bright green — MLP LRao
 }
 
 
@@ -484,7 +502,7 @@ def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
         if ys is None or all(v != v for v in ys):     # all-NaN
             continue
         ys = np.asarray(ys, dtype=float)
-        style = dict(marker='D', lw=2.2) if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao') \
+        style = dict(marker='D', lw=2.2) if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao', 'LRao-MLP') \
             else dict(marker='o', lw=1.4)
         c = _det_color(det)
         ax.plot(x, ys, color=c, label=det, **style)
@@ -510,7 +528,7 @@ def _plot_roc(det_scores: dict, labels: np.ndarray, title: str, out_pdf: str):
     ax.plot([0, 1], [0, 1], 'k--', lw=0.7, label='_no_legend_')
     for det, sc in det_scores.items():
         fpr, tpr, auc_v = _roc(labels, sc)
-        lw  = 2.2 if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao') else 1.4
+        lw  = 2.2 if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao', 'LRao-MLP') else 1.4
         ax.plot(fpr, tpr, color=_det_color(det), lw=lw,
                 label=f'{det}  (AUC={auc_v:.3f})')
     ax.set_xlabel('False Alarm Rate')
@@ -645,7 +663,28 @@ def run_iid(cfg: dict, mode: str):
         _dsm2_label = cfg.get('dsm2_label', 'DSM-MLP' if _h2 else 'DSM-lin')
         _dsm_names.append(_dsm2_label)
 
-    DETS = _cls + _dsm_names + ['LRao']
+    # LRao: always the linear model; optionally also an MLP LRao that uses the
+    # SAME architecture as the DSM-MLP. The DSM-MLP arch is whichever of the two
+    # DSM configs has non-empty hidden dims (single-class: hidden_dims_2=[64];
+    # multiclass: hidden_dims=[128]). Override with lrao_mlp_hidden if needed.
+    _h1 = list(cfg.get('hidden_dims', []) or [])
+    _h2 = list(cfg.get('hidden_dims_2', []) or [])
+    if cfg.get('lrao_mlp_hidden') is not None:
+        _lrao_mlp_hidden = list(cfg['lrao_mlp_hidden'])
+        _lrao_mlp_act    = cfg.get('lrao_mlp_activation', cfg['activation'])
+    elif len(_h2) > 0:
+        _lrao_mlp_hidden, _lrao_mlp_act = _h2, cfg.get('activation_2', cfg['activation'])
+    elif len(_h1) > 0:
+        _lrao_mlp_hidden, _lrao_mlp_act = _h1, cfg['activation']
+    else:
+        _lrao_mlp_hidden, _lrao_mlp_act = [], cfg['activation']
+
+    _lrao_names = ['LRao']
+    _run_lrao_mlp = bool(cfg.get('run_lrao_mlp', False)) and len(_lrao_mlp_hidden) > 0
+    if _run_lrao_mlp:
+        _lrao_names.append('LRao-MLP')
+
+    DETS = _cls + _dsm_names + _lrao_names
     loss_curves: Dict[str, list] = {}
     metrics = {
         'n_list': n_list, 'rho_list': rho_list, 'n_fixed': n_fixed,
@@ -680,7 +719,7 @@ def run_iid(cfg: dict, mode: str):
                     'hidden_dims': list(cfg['hidden_dims_2']),
                     'activation':  cfg.get('activation_2', cfg_rho['activation'])}
             scores[label2] = _train_dsm_variant(train_raw_n, cfg2, label2, tag)
-        # --- LRao ---
+        # --- LRao (linear) ---
         lrao_net, h_lrao = train_lrao_local(train_raw_n, cfg, seed, tag)
         loss_curves[f'LRao_{tag}'] = h_lrao
         torch.save({'state_dict': lrao_net.state_dict(), 'tag': tag},
@@ -689,6 +728,18 @@ def run_iid(cfg: dict, mode: str):
                                lambda: score_lrao(lrao_net, train_raw_n, test_planted,
                                                   s_raw, cfg),
                                len(labels))
+        # --- LRao-MLP (same arch as the DSM MLP) ---
+        if _run_lrao_mlp:
+            cfg_lm = {**cfg, 'hidden_dims': list(_lrao_mlp_hidden),
+                      'activation': _lrao_mlp_act}
+            lm_net, h_lm = train_lrao_local(train_raw_n, cfg_lm, seed, f'mlp_{tag}')
+            loss_curves[f'LRao-MLP_{tag}'] = h_lm
+            torch.save({'state_dict': lm_net.state_dict(), 'tag': tag},
+                       os.path.join(mdl_dir, f'lrao_mlp_{tag}.pt'))
+            scores['LRao-MLP'] = _safe(
+                f'LRao-MLP {tag}',
+                lambda: score_lrao(lm_net, train_raw_n, test_planted, s_raw, cfg),
+                len(labels))
         return scores
 
     # ------------------------------------------------------------------ vs n
@@ -735,6 +786,15 @@ def run_iid(cfg: dict, mode: str):
                       lambda: score_lrao(lrao_f, tr_f, test_planted, s_raw, cfg),
                       len(labels))
     flat = {**cl_f, 'LRao': sc_lrao_f}            # ρ-independent reference scores
+    if _run_lrao_mlp:
+        cfg_lm = {**cfg, 'hidden_dims': list(_lrao_mlp_hidden),
+                  'activation': _lrao_mlp_act}
+        lm_f, h_lm_f = train_lrao_local(tr_f, cfg_lm, seed, f'mlp_rhofix_n{n_fixed}')
+        loss_curves[f'LRao-MLP_rhofix_n{n_fixed}'] = h_lm_f
+        flat['LRao-MLP'] = _safe(
+            'LRao-MLP vsρ ref',
+            lambda: score_lrao(lm_f, tr_f, test_planted, s_raw, cfg),
+            len(labels))
 
     for rho in rho_list:
         t0 = time.time()
