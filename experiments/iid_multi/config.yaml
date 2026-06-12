@@ -70,12 +70,12 @@ lfi_detach_sigma: true         # detach Sigma → stable (no variance-collapse);
 # MLP LRao: a second LRao with the DSM-MLP architecture. Here hidden_dims=[128]
 # is the MLP, so LRao-MLP auto-uses [128] (override with lrao_mlp_hidden).
 run_lrao_mlp: true
-# LRao validation early stopping (it is the slow model). lrao_val_fraction>0 turns
-# it on; training stops after lrao_patience checks with no val tr(J*) improvement.
+# LRao validation early stopping (Zschetzsche et al.): monitor val tr(J*) every
+# epoch, stop after lrao_patience epochs with no improvement, keep best-val weights.
 lrao_val_fraction: 0.1
-lrao_val_check_every: 50
-lrao_patience: 6
-lrao_min_delta: 0.005        # min RELATIVE val tr(J*) gain to count as improvement (else it never stops)
+lrao_val_check_every: 1      # check val every epoch (paper)
+lrao_patience: 3             # stop after this many checks with no meaningful val gain
+lrao_min_delta: 0.005        # min RELATIVE val tr(J*) gain to count as improvement
 
 # ----- GMM-family detectors (multiclass uses K=9 — bigger mixed background) -----
 gmm_K: 9

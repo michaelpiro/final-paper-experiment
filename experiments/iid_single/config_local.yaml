@@ -77,9 +77,9 @@ run_lrao_mlp: true
 # LRao validation early stopping (it is the slow model). lrao_val_fraction>0 turns
 # it on; training stops after lrao_patience checks with no val tr(J*) improvement.
 lrao_val_fraction: 0.1
-lrao_val_check_every: 5
-lrao_patience: 6
-lrao_min_delta: 0.005        # min RELATIVE val tr(J*) gain to count as improvement (else it never stops)
+lrao_val_check_every: 1       # check val every epoch (paper: Zschetzsche et al.)
+lrao_patience: 3             # stop after this many checks with no meaningful val gain
+lrao_min_delta: 0.005        # min RELATIVE val tr(J*) gain to count as improvement
 
 # ----- GMM-family detectors -----
 gmm_K: 2

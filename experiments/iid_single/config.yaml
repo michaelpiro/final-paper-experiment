@@ -66,12 +66,15 @@ lfi_detach_sigma: true       # detach Sigma → no incentive to collapse its var
 lrao_grad_clip: 1.0          # max grad-norm for LRao (0 = off)
 # MLP LRao: a second LRao using the DSM-MLP architecture (here hidden_dims_2=[128]).
 run_lrao_mlp: true
-# LRao validation early stopping (it is the slow model). lrao_val_fraction>0 turns
-# it on; training stops after lrao_patience checks with no val tr(J*) improvement.
+# LRao validation early stopping (Zschetzsche et al.): monitor val tr(J*) every
+# epoch, stop after lrao_patience epochs with no improvement, keep best-val weights.
+# Paper uses patience=3 epochs checked every epoch. min_delta is our small extra
+# guard (paper uses strict improvement; we require a relative gain to avoid the
+# monotonic-creep case where val never quite plateaus).
 lrao_val_fraction: 0.1
-lrao_val_check_every: 50
-lrao_patience: 6
-lrao_min_delta: 0.005        # min RELATIVE val tr(J*) gain to count as improvement (else it never stops)
+lrao_val_check_every: 1      # check val every epoch (paper); raise to subsample checks
+lrao_patience: 3             # stop after this many checks with no meaningful val gain
+lrao_min_delta: 0.005        # min RELATIVE val tr(J*) gain to count as improvement
 
 # ----- GMM-family detectors -----
 gmm_K: 2
