@@ -307,6 +307,10 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     total_eps  = cfg['lrao_epochs']
     val_every  = int(cfg.get('lrao_val_check_every', cfg.get('val_check_every', 100)))
     patience   = int(cfg.get('lrao_patience', 0))
+    # Minimum RELATIVE improvement to count as "better" for the patience counter.
+    # Without this, tiny noise-level gains in val tr(J*) keep resetting the counter
+    # and LRao never early-stops. e.g. 0.005 = require a 0.5% improvement.
+    min_delta  = float(cfg.get('lrao_min_delta', 0.005))
 
     clip = float(cfg.get('lrao_grad_clip', 1.0))
     pbar = tqdm(range(1, total_eps + 1), desc=f'LRao {label}',
@@ -356,16 +360,22 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
             else:
                 check_score = ep_trJ
                 pbar.set_postfix(trJ=f"{ep_trJ:.2f}", skip=skipped)
+            prev_best = best_score
+            # always keep the genuinely-best weights (even sub-threshold gains)
             if check_score > best_score:
                 best_score = check_score
                 best_state = copy.deepcopy(model.state_dict())
+            # but the patience counter only resets on a MEANINGFUL (>min_delta) gain
+            margin = min_delta * abs(prev_best) if np.isfinite(prev_best) else 0.0
+            if (not np.isfinite(prev_best)) or (check_score > prev_best + margin):
                 bad_checks = 0
             else:
                 bad_checks += 1
             # validation early stopping (LRao is expensive; stop once it plateaus)
             if use_val and patience > 0 and bad_checks >= patience:
                 print(f"      [early-stop] LRao {label} at epoch {ep}/{total_eps} "
-                      f"(no val improvement for {patience} checks)", flush=True)
+                      f"(no >{min_delta:.1%} val gain for {patience} checks; "
+                      f"best tr(J*)={best_score:.3f})", flush=True)
                 break
         else:
             pbar.set_postfix(trJ=f"{ep_trJ:.2f}", skip=skipped)
