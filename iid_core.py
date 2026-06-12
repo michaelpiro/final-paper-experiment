@@ -461,15 +461,15 @@ def run_classical_additive(train_raw, test_planted, s_raw, reg_sigma, cfg, mode)
 # ---------------------------------------------------------------------------
 
 # One distinct hue per detector. The set that can co-occur in a single figure is
-# {AMF, GMM-Levin, DSM, LDSM, LRao, LRao-MLP}, so these six must all differ
-# (e.g. LDSM is orange — not a 2nd red — and LRao-MLP is pink — not a 2nd green).
+# {AMF, GMM-Levin, DSM, LDSM, LLRao, LRao}, so these six must all differ
+# (LLRao = linear LRao, green; LRao = MLP LRao, pink; LDSM = orange, not a 2nd red).
 DETECTOR_COLORS = {
     'AMF':       '#1f77b4',   # blue
     'GMM-Levin': '#9467bd',   # purple
     'DSM':       '#d62728',   # red    — nonlinear DSM
     'LDSM':      '#ff7f0e',   # orange — linear DSM
-    'LRao':      '#2ca02c',   # green  — linear LRao
-    'LRao-MLP':  '#e377c2',   # pink   — MLP LRao
+    'LLRao':     '#2ca02c',   # green  — linear LRao
+    'LRao':      '#e377c2',   # pink   — MLP LRao (headline)
     'DLTD':      '#8c564b',   # brown
     'SMGLRT':    '#7f7f7f',   # grey
     'DSM-lin':   '#ff7f0e',   # orange — legacy alias of LDSM
@@ -482,8 +482,8 @@ DETECTOR_MARKERS = {
     'GMM-Levin': '^',
     'DSM':       'D',
     'LDSM':      's',
-    'LRao':      'v',
-    'LRao-MLP':  'P',
+    'LLRao':     'v',
+    'LRao':      'P',
     'DLTD':      'X',
     'SMGLRT':    '*',
     'DSM-lin':   's',
@@ -533,7 +533,7 @@ def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
         if ys is None or all(v != v for v in ys):     # all-NaN
             continue
         ys = np.asarray(ys, dtype=float)
-        lw = 2.2 if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao', 'LRao-MLP') else 1.4
+        lw = 2.2 if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao', 'LLRao') else 1.4
         style = dict(marker=_det_marker(det), lw=lw)
         c = _det_color(det)
         ax.plot(x, ys, color=c, label=det, **style)
@@ -559,7 +559,7 @@ def _plot_roc(det_scores: dict, labels: np.ndarray, title: str, out_pdf: str):
     ax.plot([0, 1], [0, 1], 'k--', lw=0.7, label='_no_legend_')
     for det, sc in det_scores.items():
         fpr, tpr, auc_v = _roc(labels, sc)
-        lw  = 2.2 if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao', 'LRao-MLP') else 1.4
+        lw  = 2.2 if det in ('DSM', 'LDSM', 'DSM-lin', 'DSM-MLP', 'LRao', 'LLRao') else 1.4
         ax.plot(fpr, tpr, color=_det_color(det), lw=lw,
                 label=f'{det}  (AUC={auc_v:.3f})')
     ax.set_xlabel('False Alarm Rate')
@@ -710,10 +710,11 @@ def run_iid(cfg: dict, mode: str):
     else:
         _lrao_mlp_hidden, _lrao_mlp_act = [], cfg['activation']
 
-    _lrao_names = ['LRao']
+    # Naming: linear LRao -> 'LLRao'; the MLP LRao is the headline 'LRao'.
+    _lrao_names = ['LLRao']
     _run_lrao_mlp = bool(cfg.get('run_lrao_mlp', False)) and len(_lrao_mlp_hidden) > 0
     if _run_lrao_mlp:
-        _lrao_names.append('LRao-MLP')
+        _lrao_names.append('LRao')
 
     DETS = _cls + _dsm_names + _lrao_names
     loss_curves: Dict[str, list] = {}
@@ -750,25 +751,25 @@ def run_iid(cfg: dict, mode: str):
                     'hidden_dims': list(cfg['hidden_dims_2']),
                     'activation':  cfg.get('activation_2', cfg_rho['activation'])}
             scores[label2] = _train_dsm_variant(train_raw_n, cfg2, label2, tag)
-        # --- LRao (linear) ---
+        # --- LLRao (linear LRao) ---
         lrao_net, h_lrao = train_lrao_local(train_raw_n, cfg, seed, tag)
-        loss_curves[f'LRao_{tag}'] = h_lrao
+        loss_curves[f'LLRao_{tag}'] = h_lrao
         torch.save({'state_dict': lrao_net.state_dict(), 'tag': tag},
                    os.path.join(mdl_dir, f'lrao_{tag}.pt'))
-        scores['LRao'] = _safe(f'LRao {tag}',
-                               lambda: score_lrao(lrao_net, train_raw_n, test_planted,
-                                                  s_raw, cfg),
-                               len(labels))
-        # --- LRao-MLP (same arch as the DSM MLP) ---
+        scores['LLRao'] = _safe(f'LLRao {tag}',
+                                lambda: score_lrao(lrao_net, train_raw_n, test_planted,
+                                                   s_raw, cfg),
+                                len(labels))
+        # --- LRao (MLP, same arch as the DSM MLP; headline LRao) ---
         if _run_lrao_mlp:
             cfg_lm = {**cfg, 'hidden_dims': list(_lrao_mlp_hidden),
                       'activation': _lrao_mlp_act}
             lm_net, h_lm = train_lrao_local(train_raw_n, cfg_lm, seed, f'mlp_{tag}')
-            loss_curves[f'LRao-MLP_{tag}'] = h_lm
+            loss_curves[f'LRao_{tag}'] = h_lm
             torch.save({'state_dict': lm_net.state_dict(), 'tag': tag},
                        os.path.join(mdl_dir, f'lrao_mlp_{tag}.pt'))
-            scores['LRao-MLP'] = _safe(
-                f'LRao-MLP {tag}',
+            scores['LRao'] = _safe(
+                f'LRao {tag}',
                 lambda: score_lrao(lm_net, train_raw_n, test_planted, s_raw, cfg),
                 len(labels))
         return scores
@@ -812,18 +813,18 @@ def run_iid(cfg: dict, mode: str):
     reg_sigma_f = compute_sigma_from_data(tr_f, rho_fixed)
     cl_f = run_classical_additive(tr_f, test_planted, s_raw, reg_sigma_f, cfg, mode)
     lrao_f, h_lrao_f = train_lrao_local(tr_f, cfg, seed, f'rhofix_n{n_fixed}')
-    loss_curves[f'LRao_rhofix_n{n_fixed}'] = h_lrao_f
-    sc_lrao_f = _safe('LRao vsρ ref',
+    loss_curves[f'LLRao_rhofix_n{n_fixed}'] = h_lrao_f
+    sc_lrao_f = _safe('LLRao vsρ ref',
                       lambda: score_lrao(lrao_f, tr_f, test_planted, s_raw, cfg),
                       len(labels))
-    flat = {**cl_f, 'LRao': sc_lrao_f}            # ρ-independent reference scores
+    flat = {**cl_f, 'LLRao': sc_lrao_f}           # ρ-independent reference scores
     if _run_lrao_mlp:
         cfg_lm = {**cfg, 'hidden_dims': list(_lrao_mlp_hidden),
                   'activation': _lrao_mlp_act}
         lm_f, h_lm_f = train_lrao_local(tr_f, cfg_lm, seed, f'mlp_rhofix_n{n_fixed}')
-        loss_curves[f'LRao-MLP_rhofix_n{n_fixed}'] = h_lm_f
-        flat['LRao-MLP'] = _safe(
-            'LRao-MLP vsρ ref',
+        loss_curves[f'LRao_rhofix_n{n_fixed}'] = h_lm_f
+        flat['LRao'] = _safe(
+            'LRao vsρ ref',
             lambda: score_lrao(lm_f, tr_f, test_planted, s_raw, cfg),
             len(labels))
 
