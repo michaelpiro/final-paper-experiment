@@ -142,6 +142,9 @@ DEFAULT_CFG = dict(
     nmlp_epochs=1000, nmlp_lr=3e-4, nmlp_batch=256,
     # NeighborMLP-CFAR local normalization
     cfar_bg_window=11, cfar_guard=3, cfar_lam=0.0,
+    # local mean/Fisher set: False = ALL k×k window neighbors (default),
+    # True = restrict to the model's top-K latent-selected neighbors.
+    cfar_fisher_use_topk=False,
     # DSM-CFAR: global DSM score map standardized by a local window mean/std
     # (local mean reduce + local Fisher/variance normalization). Own window.
     dsm_cfar_window=11, dsm_cfar_guard=3,
@@ -300,19 +303,25 @@ def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6, cfar_lam=0.0):
     return ((q - mean_local) / std_eff).reshape(-1).astype(np.float32)
 
 
-def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_lam=0.0):
-    """Local-Fisher CFAR for NeighborMLP using the model's OWN top-K selected
-    neighbors (not a spatial window).
+def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_lam=0.0,
+                          use_topk=False):
+    """Local-Fisher CFAR for NeighborMLP.
 
-    Always subtracts the local kNN mean. cfar_lam regularizes ONLY the Fisher
-    (std) toward the global std:
+    The local mean/Fisher are estimated over a neighbor set A_i, selected one of
+    two ways (use_topk):
+      use_topk=False (default) → ALL M = k*k-1 spatial neighbors in the window.
+      use_topk=True            → the model's OWN top-K latent-selected neighbors
+                                 (the same set the score forward pass uses).
 
-        mean_eff = mean_{kNN}(q)                               # always local
-        std_eff  = (1-lam) * std_{kNN}(q) + lam * std_global(q)
-        T_i = (q_i - mean_eff) / (std_eff + eps)
+    Always subtracts the local mean. cfar_lam regularizes ONLY the Fisher
+    (variance) toward the global variance:
 
-    cfar_lam=0  → pure kNN local std (default)
-    cfar_lam=1  → kNN mean, global std
+        mean_eff = mean_{A_i}(q)                                # always local
+        var_eff  = (1-lam) * var_{A_i}(q) + lam * var_global(q)
+        T_i = (q_i - mean_eff) / (sqrt(var_eff) + eps)
+
+    cfar_lam=0  → pure local Fisher (default)
+    cfar_lam=1  → local mean, global Fisher
 
     q at neighbor positions is read straight off the score map via unfold
     (no extra forward passes). The k×k window order matches extract_neighborhoods
@@ -329,17 +338,17 @@ def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_
     cidx = (k * k) // 2
     keep = [m for m in range(k * k) if m != cidx]
     q_neigh = patches[:, keep]                                               # (HW, M)
-    # the model's top-K selected neighbor indices
-    idx = model.topk_indices(
-        torch.tensor(np.asarray(pix, np.float32), device=dev),
-        torch.tensor(np.asarray(nbr, np.float32), device=dev))               # (HW, K)
-    q_topk = torch.gather(q_neigh, 1, idx)                                    # (HW, K)
-    mu_local  = q_topk.mean(dim=1)
-    std_local = q_topk.var(dim=1, unbiased=False).sqrt()
-
-    # Global stats (over the whole score map)
-    mu_global  = q_i.mean()
-    std_global = q_i.std() + eps
+    if use_topk:
+        # restrict A_i to the model's top-K latent-selected neighbors
+        idx = model.topk_indices(
+            torch.tensor(np.asarray(pix, np.float32), device=dev),
+            torch.tensor(np.asarray(nbr, np.float32), device=dev))           # (HW, K)
+        q_set = torch.gather(q_neigh, 1, idx)                                 # (HW, K)
+    else:
+        # default: ALL spatial neighbors in the k×k window (center excluded)
+        q_set = q_neigh                                                       # (HW, M)
+    mu_local  = q_set.mean(dim=1)
+    std_local = q_set.var(dim=1, unbiased=False).sqrt()
 
     lam = float(cfar_lam)
     # Matches paper: sqrt(s'*[(1-lam)*Psi_i + lam*Psi]*s)
@@ -529,16 +538,19 @@ def run_detection(sig, sig_label, out_dir, ctx):
     # ---- NeighborMLP-CFAR: local kNN-Fisher normalization ----
     k_win = int(cfg['k'])
     lam   = float(cfg.get('cfar_lam', 0.0))
+    # default: estimate the local mean/Fisher from ALL k×k window neighbors;
+    # set cfar_fisher_use_topk=True to restrict to the model's top-K selection.
+    use_topk = bool(cfg.get('cfar_fisher_use_topk', False))
     tr0, tr1, tc0, tc1 = ctx['train_box']
     tr_shape = (tr1 - tr0, tc1 - tc0)
     if ('NeighborMLP-CFAR' in _active_set(cfg)
             and 'NeighborMLP' in test_scores and models.get('nmlp') is not None):
         test_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
             test_scores['NeighborMLP'], models['nmlp'], planted, te_nbr,
-            (H_b, W_b), k_win, cfar_lam=lam)
+            (H_b, W_b), k_win, cfar_lam=lam, use_topk=use_topk)
         train_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
             train_scores['NeighborMLP'], models['nmlp'], tr_raw, tr_nbr,
-            tr_shape, k_win, cfar_lam=lam)
+            tr_shape, k_win, cfar_lam=lam, use_topk=use_topk)
 
     # ---- DSM-CFAR: global DSM score map with local mean-reduce + local-Fisher
     # (variance) normalization over an (dsm_cfar_window) k×k window. ----
@@ -758,7 +770,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
 # Keys safe to override when re-extracting from saved models (they don't change
 # the trained nets or the train/test boxes — only scoring / planting / plots).
 RELOAD_OVERRIDE_KEYS = [
-    'cfar_bg_window', 'cfar_guard', 'cfar_lam',
+    'cfar_bg_window', 'cfar_guard', 'cfar_lam', 'cfar_fisher_use_topk',
     'dsm_cfar_window', 'dsm_cfar_guard', 'amf_local_window',
     'pfa_target', 'amplitude', 'target_fraction', 'edge_guard',
     'target_class', 'foreign_class', 'active_detectors', 'run_inpatch', 'run_foreign',
