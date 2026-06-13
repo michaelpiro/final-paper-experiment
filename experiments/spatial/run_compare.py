@@ -142,9 +142,11 @@ DEFAULT_CFG = dict(
     nmlp_epochs=1000, nmlp_lr=3e-4, nmlp_batch=256,
     # NeighborMLP-CFAR local normalization
     cfar_bg_window=11, cfar_guard=3, cfar_lam=0.0,
-    # local mean/Fisher set: False = ALL k×k window neighbors (default),
+    # local mean/Fisher set: False = ALL window neighbors (default),
     # True = restrict to the model's top-K latent-selected neighbors.
     cfar_fisher_use_topk=False,
+    # SDSM-CFAR Fisher window (None → use model's k) + guard block side length.
+    sdsm_cfar_window=None, sdsm_cfar_guard=1,
     # DSM-CFAR: global DSM score map standardized by a local window mean/std
     # (local mean reduce + local Fisher/variance normalization). Own window.
     dsm_cfar_window=11, dsm_cfar_guard=3,
@@ -304,14 +306,17 @@ def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6, cfar_lam=0.0):
 
 
 def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_lam=0.0,
-                          use_topk=False):
+                          use_topk=False, win=None, guard=1):
     """Local-Fisher CFAR for NeighborMLP.
 
     The local mean/Fisher are estimated over a neighbor set A_i, selected one of
     two ways (use_topk):
-      use_topk=False (default) → ALL M = k*k-1 spatial neighbors in the window.
+      use_topk=False (default) → ALL neighbors in a `win`×`win` window, minus a
+                                 `guard`×`guard` center block. Window/guard are
+                                 INDEPENDENT of the score model's k.
       use_topk=True            → the model's OWN top-K latent-selected neighbors
-                                 (the same set the score forward pass uses).
+                                 (the same set the score forward pass uses); this
+                                 mode is tied to the model's k×k window.
 
     Always subtracts the local mean. cfar_lam regularizes ONLY the Fisher
     (variance) toward the global variance:
@@ -323,30 +328,41 @@ def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_
     cfar_lam=0  → pure local Fisher (default)
     cfar_lam=1  → local mean, global Fisher
 
+    Parameters
+    ----------
+    win   : window side length for the all-neighbors set. None → use k.
+            (Ignored when use_topk=True, which must use the model's k.)
+    guard : side length of the excluded center block (guard=1 → only the center
+            pixel; guard=3 → 3×3 center block, classical CFAR guard ring).
+
     q at neighbor positions is read straight off the score map via unfold
-    (no extra forward passes). The k×k window order matches extract_neighborhoods
-    so model selection indices line up correctly.
+    (no extra forward passes). For use_topk the k×k window order matches
+    extract_neighborhoods so model selection indices line up correctly.
     """
     H, W = shape
     dev = next(model.parameters()).device
     q_i = torch.tensor(np.asarray(score_flat, np.float32), device=dev)        # (HW,)
-    # neighbor q-values via unfold of the score map (circular-padded k×k window)
-    p = k // 2
+    # window size: top-K is tied to the model's k; all-neighbors uses `win`.
+    wsize = int(k) if use_topk else int(win or k)
+    p = wsize // 2
     qmap = q_i.reshape(1, 1, H, W)
-    patches = F.unfold(F.pad(qmap, (p, p, p, p), mode='circular'), kernel_size=k)  # (1, k*k, HW)
-    patches = patches.reshape(k * k, H * W).t()                               # (HW, k*k)
-    cidx = (k * k) // 2
-    keep = [m for m in range(k * k) if m != cidx]
-    q_neigh = patches[:, keep]                                               # (HW, M)
+    patches = F.unfold(F.pad(qmap, (p, p, p, p), mode='circular'), kernel_size=wsize)
+    patches = patches.reshape(wsize * wsize, H * W).t()                       # (HW, wsize^2)
+    cc = wsize // 2
     if use_topk:
-        # restrict A_i to the model's top-K latent-selected neighbors
+        # restrict A_i to the model's top-K latent-selected neighbors (center excluded)
+        keep = [m for m in range(wsize * wsize) if m != (wsize * wsize) // 2]
+        q_neigh = patches[:, keep]                                           # (HW, M)
         idx = model.topk_indices(
             torch.tensor(np.asarray(pix, np.float32), device=dev),
             torch.tensor(np.asarray(nbr, np.float32), device=dev))           # (HW, K)
         q_set = torch.gather(q_neigh, 1, idx)                                 # (HW, K)
     else:
-        # default: ALL spatial neighbors in the k×k window (center excluded)
-        q_set = q_neigh                                                       # (HW, M)
+        # all neighbors in the win×win window minus a guard×guard center block
+        gr = max(int(guard), 1) // 2                                          # guard radius
+        keep = [r * wsize + c for r in range(wsize) for c in range(wsize)
+                if not (abs(r - cc) <= gr and abs(c - cc) <= gr)]
+        q_set = patches[:, keep]                                             # (HW, M')
     mu_local  = q_set.mean(dim=1)
     std_local = q_set.var(dim=1, unbiased=False).sqrt()
 
@@ -538,19 +554,26 @@ def run_detection(sig, sig_label, out_dir, ctx):
     # ---- NeighborMLP-CFAR: local kNN-Fisher normalization ----
     k_win = int(cfg['k'])
     lam   = float(cfg.get('cfar_lam', 0.0))
-    # default: estimate the local mean/Fisher from ALL k×k window neighbors;
+    # default: estimate the local mean/Fisher from ALL window neighbors;
     # set cfar_fisher_use_topk=True to restrict to the model's top-K selection.
     use_topk = bool(cfg.get('cfar_fisher_use_topk', False))
+    # SDSM-CFAR Fisher window/guard, INDEPENDENT of the model's k.
+    #   sdsm_cfar_window: window side length (None → use k)
+    #   sdsm_cfar_guard : excluded center block side (1 → only center pixel)
+    nmlp_win   = cfg.get('sdsm_cfar_window') or None
+    nmlp_guard = int(cfg.get('sdsm_cfar_guard', 1))
     tr0, tr1, tc0, tc1 = ctx['train_box']
     tr_shape = (tr1 - tr0, tc1 - tc0)
     if ('NeighborMLP-CFAR' in _active_set(cfg)
             and 'NeighborMLP' in test_scores and models.get('nmlp') is not None):
         test_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
             test_scores['NeighborMLP'], models['nmlp'], planted, te_nbr,
-            (H_b, W_b), k_win, cfar_lam=lam, use_topk=use_topk)
+            (H_b, W_b), k_win, cfar_lam=lam, use_topk=use_topk,
+            win=nmlp_win, guard=nmlp_guard)
         train_scores['NeighborMLP-CFAR'] = _knn_fisher_normalize(
             train_scores['NeighborMLP'], models['nmlp'], tr_raw, tr_nbr,
-            tr_shape, k_win, cfar_lam=lam, use_topk=use_topk)
+            tr_shape, k_win, cfar_lam=lam, use_topk=use_topk,
+            win=nmlp_win, guard=nmlp_guard)
 
     # ---- DSM-CFAR: global DSM score map with local mean-reduce + local-Fisher
     # (variance) normalization over an (dsm_cfar_window) k×k window. ----
@@ -771,6 +794,7 @@ def run_detection(sig, sig_label, out_dir, ctx):
 # the trained nets or the train/test boxes — only scoring / planting / plots).
 RELOAD_OVERRIDE_KEYS = [
     'cfar_bg_window', 'cfar_guard', 'cfar_lam', 'cfar_fisher_use_topk',
+    'sdsm_cfar_window', 'sdsm_cfar_guard',
     'dsm_cfar_window', 'dsm_cfar_guard', 'amf_local_window',
     'pfa_target', 'amplitude', 'target_fraction', 'edge_guard',
     'target_class', 'foreign_class', 'active_detectors', 'run_inpatch', 'run_foreign',
