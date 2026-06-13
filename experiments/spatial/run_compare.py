@@ -258,17 +258,18 @@ def _resolve_foreign_class(cfg, gt, te_gt):
 
 
 def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6, cfar_lam=0.0):
-    """Local-CFAR normalization of a projected-score MAP (paper Eq 70/80).
+    """Local-CFAR normalization of a projected-score MAP.
 
-    Standardize each pixel by a BLENDED mean/std:
+    Always subtracts the local annulus mean (pure CFAR mean reduction).
+    cfar_lam regularizes ONLY the Fisher (std) toward the global std:
 
-        mean_eff = (1 - lam) * mean_annulus(q)  +  lam * mean_global(q)
-        std_eff  = (1 - lam) * std_annulus(q)   +  lam * std_global(q)
+        mean_eff = mean_annulus(q)                             # always local
+        std_eff  = (1 - lam) * std_annulus(q) + lam * std_global(q)
         T_i      = (q_i - mean_eff) / (std_eff + eps)
 
-    cfar_lam=0  → pure local annulus (standard CFAR; default)
-    cfar_lam=1  → pure global mean/std (same as original LMP normalization)
-    cfar_lam∈(0,1) → smoothly interpolates (robust near boundaries)
+    cfar_lam=0  → pure local annulus std (standard CFAR; default)
+    cfar_lam=1  → local mean, global std
+    cfar_lam∈(0,1) → local mean, blended std (robust near boundaries)
 
     The local component is a 1-D scalar variance of the already-projected score
     (NO matrix inverse, NO rank issue). Cheap windowed stats via uniform_filter.
@@ -288,27 +289,30 @@ def _cfar_normalize_map(flat_scores, shape, bg, guard, eps=1e-6, cfar_lam=0.0):
     e2_local   = (nb * s2_bg - ng * s2_g) / denom         # annulus E[q^2]
     std_local  = np.sqrt(np.maximum(e2_local - mean_local ** 2, 0.0))
 
-    # Global stats (over the whole map)
-    mean_global = float(q.mean())
-    std_global  = float(q.std()) + eps
+    # Global variance (mean is always local; shrink variance, not std)
+    var_global = float(q.var()) + eps
 
     lam = float(cfar_lam)
-    mean_eff = (1.0 - lam) * mean_local + lam * mean_global
-    std_eff  = (1.0 - lam) * std_local  + lam * std_global + eps
-    return ((q - mean_eff) / std_eff).reshape(-1).astype(np.float32)
+    # Matches paper: sqrt(s'*[(1-lam)*Psi_i + lam*Psi]*s)
+    #              = sqrt((1-lam)*var_local + lam*var_global)
+    var_eff = (1.0 - lam) * (std_local ** 2) + lam * var_global
+    std_eff = np.sqrt(np.maximum(var_eff, 0.0)) + eps
+    return ((q - mean_local) / std_eff).reshape(-1).astype(np.float32)
 
 
 def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_lam=0.0):
     """Local-Fisher CFAR for NeighborMLP using the model's OWN top-K selected
-    neighbors (not a spatial window). For each pixel, standardize its projected
-    score q_i by a BLENDED mean/std:
+    neighbors (not a spatial window).
 
-        mean_eff = (1-lam) * mean_{kNN}(q)  +  lam * mean_global(q)
-        std_eff  = (1-lam) * std_{kNN}(q)   +  lam * std_global(q)
+    Always subtracts the local kNN mean. cfar_lam regularizes ONLY the Fisher
+    (std) toward the global std:
+
+        mean_eff = mean_{kNN}(q)                               # always local
+        std_eff  = (1-lam) * std_{kNN}(q) + lam * std_global(q)
         T_i = (q_i - mean_eff) / (std_eff + eps)
 
-    cfar_lam=0  → pure kNN local (default)
-    cfar_lam=1  → pure global mean/std
+    cfar_lam=0  → pure kNN local std (default)
+    cfar_lam=1  → kNN mean, global std
 
     q at neighbor positions is read straight off the score map via unfold
     (no extra forward passes). The k×k window order matches extract_neighborhoods
@@ -338,9 +342,12 @@ def _knn_fisher_normalize(score_flat, model, pix, nbr, shape, k, eps=1e-6, cfar_
     std_global = q_i.std() + eps
 
     lam = float(cfar_lam)
-    mu_eff  = (1.0 - lam) * mu_local  + lam * mu_global
-    std_eff = (1.0 - lam) * std_local + lam * std_global + eps
-    return ((q_i - mu_eff) / std_eff).cpu().numpy().astype(np.float32)
+    # Matches paper: sqrt(s'*[(1-lam)*Psi_i + lam*Psi]*s)
+    #              = sqrt((1-lam)*var_local + lam*var_global)
+    var_global = (q_i.var() + eps)
+    var_eff = (1.0 - lam) * (std_local ** 2) + lam * var_global
+    std_eff = torch.sqrt(torch.clamp(var_eff, min=0.0)) + eps
+    return ((q_i - mu_local) / std_eff).cpu().numpy().astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
