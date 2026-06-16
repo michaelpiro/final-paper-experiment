@@ -50,7 +50,7 @@ def amf(test_data: np.ndarray, train_data: np.ndarray, s: np.ndarray,
 
 @torch.no_grad()
 def amf_local(test_pix: np.ndarray, test_nbr: np.ndarray, s: np.ndarray,
-              device: str = 'cpu', loading: float = 1e-8,
+              device: str = 'cpu', loading: float = 1e-16,
               chunk: int = 1024) -> np.ndarray:
     """AMF on a per-pixel local SCM drawn from each pixel's k x k window.
 
