@@ -25,11 +25,11 @@ active_detectors: null            # null = all of DET_ORDER (all 7 detectors)
 amplitude: 0.15
 target_fraction: 0.10
 edge_guard: 3                     # exclude planting within this many px of the box edge
-n_budget: 2000                    # PAPER VALUE: contiguous side-crop of the train box
-                                  # (None = full box). This sets the secondary-data size.
+n_budget: 4000                    # PAPER VALUE (Table 1 run): contiguous side-crop of the
+                                  # train box (None = full box). Sets the secondary-data size.
 
 # ----- neighbourhood (DARTS score model) -----
-k: 5                              # k x k spatial window
+k: 7                              # k x k spatial window (PAPER Table 1 run)
 nmlp_K: 7                         # latent-nearest neighbours pooled
 nmlp_d_lat: 16                    # encoder latent dimension
 nmlp_enc_hidden: [64, 32]         # encoder widths  (D -> 64 -> 32 -> d_lat)
@@ -40,20 +40,20 @@ nmlp_batch: 512
 
 # ----- global DART score model -----
 dsm_hidden: [128]                 # MLP score net (DART)
-dsm_epochs: 3000
+dsm_epochs: 1000                  # PAPER Table 1 run
 dsm_lr: 0.0005
 
 # ----- shared score-net settings -----
 activation: relu
 dsm_sigma_rho: 0.1                # numeric only; sigma = sqrt(rho) in whitened space
 whiten_eig_floor: 0.00001         # ZCA eigenvalue floor (x lambda_max)
-batch_size: 512
+batch_size: 256                   # PAPER Table 1 run
 weight_decay: 0.00001
 
 # ----- classical baselines -----
-baseline_eig_floor: 1.0e-18       # AMF covariance eigenvalue floor (numerical only)
+baseline_eig_floor: 0             # AMF covariance eigenvalue floor (PAPER run: 0; SCM full rank)
 amf_local_window: 15              # AMF-local SCM window (15x15-1=224 >= D=103 -> full rank)
-local_scm_loading: 1.0e-18        # AMF-local diagonal loading (numerical only)
+local_scm_loading: 0.0            # AMF-local diagonal loading (PAPER run: 0)
 gmm_K: 9                          # GMM-Levin components
 gmm_steps: 50                     # GMM-Levin fill-factor grid steps
 
@@ -61,10 +61,10 @@ gmm_steps: 50                     # GMM-Levin fill-factor grid steps
 pfa_target: 0.05                  # CFAR threshold target false-alarm rate
 cfar_lam: 0.1                     # local -> global Fisher shrinkage (headline value)
 cfar_fisher_use_topk: false       # DARTS-CFAR Fisher set: false = all window nbrs
-sdsm_cfar_window: null            # DARTS-CFAR Fisher window (null = use model's k)
+sdsm_cfar_window: null            # DARTS-CFAR Fisher window (null = use model's k=7)
 sdsm_cfar_guard: 1                # DARTS-CFAR guard block side (centre only)
-dsm_cfar_window: 11               # DART-CFAR local window
-dsm_cfar_guard: 3                 # DART-CFAR guard block side
+dsm_cfar_window: 5                # DART-CFAR local window (PAPER Table 1 run)
+dsm_cfar_guard: 1                 # DART-CFAR guard block side (PAPER Table 1 run)
 
 # ----- reproducibility (run_multiseed averages over these) -----
 seed: 42
