@@ -7,8 +7,7 @@ Detectors
   DART-CFAR    — global DART map with local mean-reduce + local-Fisher normalisation
   DARTS        — spatially adapted DART (neighbour-conditioned score net)
   DARTS-CFAR   — DARTS with local kNN-Fisher normalisation
-  AMF          — adaptive matched filter (global sample covariance)
-  AMF-local    — AMF on a per-pixel k x k window sample covariance
+  AMF          — adaptive matched filter on a per-pixel k x k window sample covariance
   GMM-Levin    — Levin product-GMM GLRT
 
 Deep nets train on GPU (cuda) when available.
@@ -55,7 +54,7 @@ from src.data import (
     placeholder_whitening as _placeholder_whitening,
 )
 from src.detectors import (
-    amf as amf_global, amf_local, dsm_additive, gmm_glrt_levin_additive,
+    amf_local, dsm_additive, gmm_glrt_levin_additive,
 )
 from src.metrics import (
     partial_auc, dr_at_fpr, auc_safe, roc_safe, cfar_threshold, per_class_fpr,
@@ -88,7 +87,6 @@ DET_ORDER = [
     'DARTS',
     'DARTS-CFAR',
     'AMF',
-    'AMF-local',
     'GMM-Levin',
 ]
 DET_COLORS = {
@@ -97,7 +95,6 @@ DET_COLORS = {
     'DARTS':      '#2ca02c',   # green
     'DARTS-CFAR': '#006d2c',   # dark green
     'AMF':              '#9467bd',   # purple
-    'AMF-local':        '#c5b0d5',   # light purple
     'GMM-Levin':        '#e377c2',   # pink
 }
 
@@ -122,9 +119,9 @@ DEFAULT_CFG = dict(
     k=5,
     local_scm_loading=1e-8,
     baseline_eig_floor=1e-12,
-    # AMF-local window: None → use the shared neighborhood k; int → AMF-local
-    # re-extracts its OWN (amf_local_window×amf_local_window) window, independent
-    # of the NeighborMLP neighborhood. Adjustable straight from the notebook.
+    # AMF window: None → use the shared neighborhood k; int → AMF re-extracts its
+    # OWN (amf_local_window×amf_local_window) local-SCM window, independent of the
+    # NeighborMLP neighborhood. Adjustable straight from the notebook.
     amf_local_window=None,
     # NeighborMLP — encoder: D→enc_hidden→d_lat ; denoiser: (D+(K+1)*d_lat)→score_hidden→D
     nmlp_d_lat=16, nmlp_K=8, nmlp_enc_hidden=[128, 64], nmlp_score_hidden=[128],
@@ -480,7 +477,7 @@ def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device, nbr_amf=None):
     A detector is skipped if it is not in cfg['active_detectors'] (None = all),
     or if its deep model is absent from `models`.
 
-    nbr_amf : optional separate neighbor tensor for AMF-local (its own window).
+    nbr_amf : optional separate neighbor tensor for AMF (its own local-SCM window).
               None → fall back to the shared `nbr`.
     """
     pix = pix.astype(np.float32)
@@ -493,10 +490,8 @@ def score_all(pix, nbr, models, tr_raw, tr_nbr, sig, cfg, device, nbr_amf=None):
     if 'DARTS' in act and models.get('nmlp') is not None:
         out['DARTS'] = score_nmlp_additive(models['nmlp'], pix, nbr, tr_raw, tr_nbr, sig)
     if 'AMF' in act:
-        out['AMF'] = amf_global(pix, tr_raw, sig, eig_floor=floor)
-    if 'AMF-local' in act:
         nbr_for_amf = (nbr_amf.astype(np.float32) if nbr_amf is not None else nbr)
-        out['AMF-local'] = amf_local(
+        out['AMF'] = amf_local(
             pix, nbr_for_amf, sig, device=device,
             loading=float(cfg.get('local_scm_loading', 1e-8)))
     if 'GMM-Levin' in act:
@@ -906,14 +901,14 @@ def main():
     te_gt = gt[r0:r1, c0:c1].ravel()
     print(f"test={len(te_raw)} px  ({H_b}×{W_b})", flush=True)
 
-    # ---- AMF-local own window (independent of the NeighborMLP neighborhood k) ----
+    # ---- AMF own window (independent of the NeighborMLP neighborhood k) ----
     amf_k = int(cfg.get('amf_local_window') or k)
     if amf_k != k:
         _, tr_nbr_amf = _crop_pca_box(data_norm, tr_box_eff, amf_k)
         _, te_nbr_amf = _crop_pca_box(data_norm, test_box, amf_k)
         tr_nbr_amf = tr_nbr_amf.astype(np.float32)
         te_nbr_amf = te_nbr_amf.astype(np.float32)
-        print(f"AMF-local window={amf_k}×{amf_k} (independent of k={k})", flush=True)
+        print(f"AMF window={amf_k}×{amf_k} (independent of k={k})", flush=True)
     else:
         tr_nbr_amf, te_nbr_amf = tr_nbr, te_nbr
 
@@ -1041,14 +1036,14 @@ def run_from_cfg(overrides: dict, dry_run: bool = False):
     te_gt = gt[r0:r1, c0:c1].ravel()
     print(f"test={len(te_raw)} px  ({H_b}×{W_b})", flush=True)
 
-    # ---- AMF-local own window (independent of the NeighborMLP neighborhood k) ----
+    # ---- AMF own window (independent of the NeighborMLP neighborhood k) ----
     amf_k = int(cfg.get('amf_local_window') or k)
     if amf_k != k:
         _, tr_nbr_amf = _crop_pca_box(data_norm, tr_box_eff, amf_k)
         _, te_nbr_amf = _crop_pca_box(data_norm, test_box, amf_k)
         tr_nbr_amf = tr_nbr_amf.astype(np.float32)
         te_nbr_amf = te_nbr_amf.astype(np.float32)
-        print(f"AMF-local window={amf_k}×{amf_k} (independent of k={k})", flush=True)
+        print(f"AMF window={amf_k}×{amf_k} (independent of k={k})", flush=True)
     else:
         tr_nbr_amf, te_nbr_amf = tr_nbr, te_nbr
 

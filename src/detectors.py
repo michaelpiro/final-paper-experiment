@@ -45,7 +45,7 @@ def amf(test_data: np.ndarray, train_data: np.ndarray, s: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# AMF-local (per-pixel local sample covariance)
+# AMF on a per-pixel local sample covariance (k×k window)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()

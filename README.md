@@ -54,8 +54,7 @@ Results (figures, metrics, scores) are written under `results/`.
 
 | Name | What it is |
 |---|---|
-| **AMF** | Adaptive matched filter (global Gaussian) |
-| **AMF-local** | AMF on a per-pixel local sample covariance (k×k window) |
+| **AMF** | Adaptive matched filter — global covariance in the IID experiment; a per-pixel local k×k sample covariance in the spatial experiment |
 | **GMM-Levin** | Gaussian-mixture GLRT (Levin 2019), fill factor by grid search |
 | **L-LRao** / **LRao** | Learned Rao detector (linear / one-hidden-layer MLP) |
 | **L-DART** / **DART** | Our denoising-score Rao detector (linear / MLP) |
@@ -63,7 +62,8 @@ Results (figures, metrics, scores) are written under `results/`.
 | **DART-CFAR** / **DARTS-CFAR** | CFAR-normalised forms (local mean reduce + local-Fisher normalisation) |
 
 IID figures show {AMF, GMM-Levin, L-DART, DART, L-LRao, LRao}; the spatial table
-adds {AMF-local, DART-CFAR, DARTS, DARTS-CFAR}.
+shows {AMF, GMM-Levin, DART, DART-CFAR, DARTS, DARTS-CFAR} (there, AMF uses a
+local k×k sample covariance).
 
 ---
 
@@ -82,8 +82,8 @@ selection. Architecture via `hidden_dims` (MLP → DART) vs `hidden_dims_2` (lin
 early stopping `lrao_val_fraction`, `lrao_val_check_every`, `lrao_patience`,
 `lrao_min_delta`.
 
-**Classical.** AMF `baseline_eig_floor`; AMF-local `amf_local_window`,
-`local_scm_loading`; GMM-Levin `gmm_K`, `gmm_steps`.
+**Classical.** AMF `baseline_eig_floor` (IID, global) / `amf_local_window`,
+`local_scm_loading` (spatial, local k×k SCM); GMM-Levin `gmm_K`, `gmm_steps`.
 
 **DARTS (spatial score net).** `k` (neighbourhood), `nmlp_K` (top-K neighbours),
 `nmlp_d_lat`, `nmlp_enc_hidden`, `nmlp_score_hidden`, `nmlp_epochs`, `nmlp_lr`,
@@ -119,7 +119,7 @@ data/                pavia-u.mat (committed)
 src/
   data.py            loading, planting, ZCA whitening, neighbourhoods, boxes, signatures
   models.py          ScoreNet (DART/L-DART, learned Rao), NeighborMLPDenoiser (DARTS)
-  detectors.py       AMF, AMF-local, GMM-Levin, DART/L-DART scoring
+  detectors.py       AMF (global + local k×k SCM), GMM-Levin, DART/L-DART scoring
   metrics.py         AUC, pAUC, Pd@Pfa, CFAR threshold, per-class FPR
   iid.py             run_iid(cfg, mode)  — IID single/multi
   spatial.py         spatial comparison + CFAR + multi-seed

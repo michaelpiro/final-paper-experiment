@@ -3,7 +3,7 @@
 # =========================================================================
 # Exactly the paper's spatial config (Table 1). Disjoint train/test boxes are
 # cropped from the scene; a foreign target (a class absent from the box) is
-# planted additively. Detectors: AMF, AMF-local, GMM-Levin, DART, DART-CFAR,
+# planted additively. Detectors: AMF (local k×k SCM), GMM-Levin, DART, DART-CFAR,
 # DARTS, DARTS-CFAR. Averaged over seeds via run_multiseed.
 
 dataset: data/pavia-u.mat
@@ -52,8 +52,8 @@ weight_decay: 0.00001
 
 # ----- classical baselines -----
 baseline_eig_floor: 0             # AMF covariance eigenvalue floor (PAPER run: 0; SCM full rank)
-amf_local_window: 15              # AMF-local SCM window (15x15-1=224 >= D=103 -> full rank)
-local_scm_loading: 0.0            # AMF-local diagonal loading (PAPER run: 0)
+amf_local_window: 15              # AMF local-SCM window (15x15-1=224 >= D=103 -> full rank)
+local_scm_loading: 0.0            # AMF local-SCM diagonal loading (PAPER run: 0)
 gmm_K: 9                          # GMM-Levin components
 gmm_steps: 50                     # GMM-Levin fill-factor grid steps
 
