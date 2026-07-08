@@ -36,7 +36,7 @@ def get_pavia(data_dir="data_dl"):
     """Return (data HxWxD float64 raw radiances, gt HxW int). Uses a local
     pavia-u.mat (fields data/map) when available, else downloads the public
     EHU PaviaU (with a browser User-Agent; EHU 403s the urllib default)."""
-    for local in ("data/pavia-u.mat", "SDSM/data/pavia-u.mat", "pavia-u.mat"):
+    for local in ("colab_deep/data/pavia-u.mat", "data/pavia-u.mat", "SDSM/data/pavia-u.mat", "pavia-u.mat"):
         if os.path.exists(local):
             m = sio.loadmat(local)
             if "data" in m and "map" in m:
