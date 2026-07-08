@@ -33,15 +33,23 @@ PAVIA_URLS = [f"{EHU}/e/ee/PaviaU.mat", f"{EHU}/5/50/PaviaU_gt.mat"]
 
 # --------------------------------------------------------------------------- #
 def get_pavia(data_dir="data_dl"):
-    """Return (data HxWxD float64 raw radiances, gt HxW int). Downloads the
-    public EHU PaviaU if not present."""
+    """Return (data HxWxD float64 raw radiances, gt HxW int). Uses a local
+    pavia-u.mat (fields data/map) when available, else downloads the public
+    EHU PaviaU (with a browser User-Agent; EHU 403s the urllib default)."""
+    for local in ("data/pavia-u.mat", "SDSM/data/pavia-u.mat", "pavia-u.mat"):
+        if os.path.exists(local):
+            m = sio.loadmat(local)
+            if "data" in m and "map" in m:
+                return m["data"].astype(np.float64), m["map"].astype(int)
     os.makedirs(data_dir, exist_ok=True)
     paths = []
     for url in PAVIA_URLS:
         p = os.path.join(data_dir, os.path.basename(url))
         if not os.path.exists(p):
             print("downloading", url, flush=True)
-            urllib.request.urlretrieve(url, p)
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as r, open(p, "wb") as f:
+                f.write(r.read())
         paths.append(p)
     data = sio.loadmat(paths[0])["paviaU"].astype(np.float64)
     gt = sio.loadmat(paths[1])["paviaU_gt"].astype(int)
