@@ -47,7 +47,7 @@ HP = dict(
     activation="relu", whiten_eig_floor=1e-5,
     nmlp_d_lat=16, nmlp_K=7, nmlp_enc_hidden=[64, 32], nmlp_score_hidden=[128],
     nmlp_lr=3e-4, nmlp_batch=512, k=7,
-    amf_local_window=15, gmm_K=9, gmm_steps=50,
+    gmm_K=9, gmm_steps=50,
     cfar_lam=0.1, dart_cfar_window=5, dart_cfar_guard=1, darts_cfar_guard=1,
     lrao_lr=3e-4, lrao_hidden=[128], lrao_delta_theta=0.01,
 )
@@ -219,8 +219,19 @@ def score_amf(state, scene, planted, device):
     return amf(planted, scene["tr"], scene["_sig"], eig_floor=0.0)
 
 
+def amf_local_window(D):
+    """Dimension-aware local-SCM window: smallest odd k with k^2-1 >= 2D, so
+    the window supplies at least twice as many samples as bands (n/D >= 2).
+    Reproduces the paper's 15x15 on Pavia (D=103) and gives 21x21 on San
+    Diego (D=189), where the fixed 15x15 window left the unloaded local SCM
+    sample-starved (n/D=1.2, AUC 0.59 -> 0.99 at n/D=2.3)."""
+    k = int(np.ceil(np.sqrt(2 * D + 1)))
+    return k + 1 if k % 2 == 0 else k
+
+
 def score_amf_local(state, scene, planted, device):
-    pix, nbr = _test_windows(scene, planted, HP["amf_local_window"], device)
+    win = amf_local_window(planted.shape[1])
+    pix, nbr = _test_windows(scene, planted, win, device)
     return amf_local(pix, nbr, scene["_sig"], device=device, loading=0.0)
 
 

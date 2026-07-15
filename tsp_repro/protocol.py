@@ -101,10 +101,22 @@ def _load_sandiego(path):
     return m["data"].astype(np.float64), (m["map"] > 0).astype(int)
 
 
+def _load_pavia():
+    """Absolute-path Pavia loader (get_pavia's cwd-relative candidates are
+    fragile outside the repo root); falls back to get_pavia's download."""
+    for p in (os.path.join(_REPO, "colab_deep", "data", "pavia-u.mat"),
+              os.path.join(_HERE, "data", "pavia-u.mat")):
+        if os.path.exists(p):
+            m = sio.loadmat(p)
+            if "data" in m and "map" in m:
+                return m["data"].astype(np.float64), m["map"].astype(int)
+    return PP.get_pavia()
+
+
 def build_scene(name: str) -> dict:
     """Returns dict(tr, te, te_shape, sigs {label: vec}, data, gt, boxes)."""
     if name == "pavia4":
-        data, gt = PP.get_pavia()
+        data, gt = _load_pavia()
         tb = PP.side_crop(PAVIA_TRAIN_BOX, PAVIA_N_BUDGET)
         tr = PP.crop(data, tb)
         te = PP.crop(data, PAVIA_TEST_BOX)
