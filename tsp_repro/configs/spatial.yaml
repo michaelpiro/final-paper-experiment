@@ -1,0 +1,73 @@
+# =========================================================================
+# Spatial (correlated-background) experiment (Pavia-University)
+# =========================================================================
+# Exactly the paper's spatial config (Table 1). Disjoint train/test boxes are
+# cropped from the scene; a foreign target (a class absent from the box) is
+# planted additively. Detectors: AMF (local k×k SCM), GMM-Levin, DART, DART-CFAR,
+# DARTS, DARTS-CFAR. Averaged over seeds via run_multiseed.
+
+dataset: data/pavia-u.mat
+manual_boxes_path: configs/manual_boxes.json
+
+# ----- scene / scenario -----
+scenario_index: 4                 # 0-3 = manual boxes; 4+ = random boxes
+min_pixels: 3000
+random_scenario_seeds: [42, 123, 456, 789]
+target_class: null                # null = dominant labeled class; 1..9 = manual
+foreign_class: 7                  # absent class planted as the foreign target (bitumen)
+sig_dom_weight: 0.8               # signature = 0.8*class_mean + 0.2*patch_mean
+sig_mean_weight: 0.2
+run_inpatch: false
+run_foreign: true
+active_detectors: null            # null = all of DET_ORDER (all 7 detectors)
+
+# ----- planted target -----
+amplitude: 0.15
+target_fraction: 0.10
+edge_guard: 3                     # exclude planting within this many px of the box edge
+n_budget: 4000                    # PAPER VALUE (Table 1 run): contiguous side-crop of the
+                                  # train box (None = full box). Sets the secondary-data size.
+
+# ----- neighbourhood (DARTS score model) -----
+k: 7                              # k x k spatial window (PAPER Table 1 run)
+nmlp_K: 7                         # latent-nearest neighbours pooled
+nmlp_d_lat: 16                    # encoder latent dimension
+nmlp_enc_hidden: [64, 32]         # encoder widths  (D -> 64 -> 32 -> d_lat)
+nmlp_score_hidden: [128]          # denoiser widths
+nmlp_epochs: 1000
+nmlp_lr: 0.0003
+nmlp_batch: 512
+
+# ----- global DART score model -----
+dsm_hidden: [128]                 # MLP score net (DART)
+dsm_epochs: 1000                  # PAPER Table 1 run
+dsm_lr: 0.0005
+
+# ----- shared score-net settings -----
+activation: relu
+dsm_sigma_rho: 0.1                # numeric only; sigma = sqrt(rho) in whitened space
+whiten_eig_floor: 0.00001         # ZCA eigenvalue floor (x lambda_max)
+batch_size: 256                   # PAPER Table 1 run
+weight_decay: 0.00001
+
+# ----- classical baselines -----
+baseline_eig_floor: 0             # AMF covariance eigenvalue floor (PAPER run: 0; SCM full rank)
+amf_local_window: 15              # AMF local-SCM window (15x15-1=224 >= D=103 -> full rank)
+local_scm_loading: 0.0            # AMF local-SCM diagonal loading (PAPER run: 0)
+gmm_K: 9                          # GMM-Levin components
+gmm_steps: 50                     # GMM-Levin fill-factor grid steps
+
+# ----- CFAR normalisation (DART-CFAR, DARTS-CFAR) -----
+pfa_target: 0.05                  # CFAR threshold target false-alarm rate
+cfar_lam: 0.1                     # local -> global Fisher shrinkage (headline value)
+cfar_fisher_use_topk: false       # DARTS-CFAR Fisher set: false = all window nbrs
+sdsm_cfar_window: null            # DARTS-CFAR Fisher window (null = use model's k=7)
+sdsm_cfar_guard: 1                # DARTS-CFAR guard block side (centre only)
+dsm_cfar_window: 5                # DART-CFAR local window (PAPER Table 1 run)
+dsm_cfar_guard: 1                 # DART-CFAR guard block side (PAPER Table 1 run)
+
+# ----- reproducibility (run_multiseed averages over these) -----
+seed: 42
+
+# ----- output -----
+results_dir: results/spatial
