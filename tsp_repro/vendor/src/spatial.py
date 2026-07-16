@@ -32,7 +32,10 @@ _PKG = os.path.dirname(os.path.abspath(__file__))      # .../SDSM/src
 _ROOT = os.path.dirname(_PKG)                           # .../SDSM
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-os.chdir(_ROOT)                                        # so 'data/...' resolves
+# os.chdir(_ROOT)  # DISABLED in the tsp_repro vendored copy: an import-time
+# chdir silently redirects every relative output path of the caller (results
+# were landing under tsp_repro/vendor/). tsp_repro loads data by absolute
+# path, so the chdir is not needed here.
 
 import numpy as np
 import torch
