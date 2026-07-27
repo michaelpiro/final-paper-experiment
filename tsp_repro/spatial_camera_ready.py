@@ -9,7 +9,8 @@ Division of labor:
         aircraft signature via colab_deep.sd_protocol),
       * the amplitude sweep (same THETAS as the IID sweep),
       * the fixed LRao row (robust normalization, trained once per scene),
-      * a global (non-local) AMF row,
+      * a global (non-local) AMF row, labeled 'AMF-global' (Table 1's row
+        called 'AMF' is the LOCAL one - labels here are unambiguous),
       * the four deep baselines (same secondary pixels + signature),
     all scored with the ORIGINAL src.spatial scoring/normalization functions
     (dsm_additive, score_nmlp_additive, _cfar_normalize_map,
@@ -57,7 +58,7 @@ PAVIA_TEST_BOX = [419, 508, 250, 334]
 SEEDS = [42, 43, 44, 45, 46]
 
 OUR_DETS = ['DART', 'DART-CFAR', 'DARTS', 'DARTS-CFAR',
-            'AMF', 'AMF-local', 'GMM-Levin', 'LRao']
+            'AMF-global', 'AMF-local', 'GMM-Levin', 'LRao']
 
 
 def spatial_cfg(device='cpu', **overrides):
@@ -194,8 +195,10 @@ def score_all(scene, models, lrao, planted, cfg, device, deep_states=()):
         cfar_lam=lam, use_topk=bool(cfg.get('cfar_fisher_use_topk', False)),
         win=cfg.get('sdsm_cfar_window') or None,
         guard=int(cfg.get('sdsm_cfar_guard', 1)))
-    out['AMF'] = amf(planted, tr, sig,
-                     eig_floor=float(cfg.get('baseline_eig_floor', 0.0)))
+    # NOTE naming: Table 1's row called 'AMF' is the LOCAL one (run_multiseed's
+    # only AMF). The sweep labels are unambiguous: AMF-global vs AMF-local.
+    out['AMF-global'] = amf(planted, tr, sig,
+                            eig_floor=float(cfg.get('baseline_eig_floor', 0.0)))
     out['AMF-local'] = amf_local(planted, scene['_te_nbr_amf'], sig,
                                  device=device,
                                  loading=float(cfg.get('local_scm_loading', 0.0)))
