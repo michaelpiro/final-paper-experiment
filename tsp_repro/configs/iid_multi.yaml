@@ -1,0 +1,76 @@
+# =========================================================================
+# IID multi-class experiment (Pavia-University)
+# =========================================================================
+# Background = proportional mixture of ALL labeled classes except the target and
+# any excluded classes (a genuinely non-Gaussian background). The target
+# signature is the mean spectrum of the target class, planted additively.
+# Detectors shown: AMF, GMM-Levin, DART, LRao.
+
+dataset: data/pavia-u.mat
+
+# ----- whitening (ZCA only) -----
+whiten_eig_floor:      0.0
+lrao_whiten_eig_floor: 0.00001
+
+# ----- classes (multi-class: bkg = union of all non-target/non-excluded) -----
+bkg_cls: null                         # ignored in multi mode
+target_cls: 6                         # bare_soil target
+exclude_classes: [2, 0, 9]            # drop meadows, unlabeled, shadows (exact paper order)
+
+# ----- planted target (additive) -----
+amplitude: 0.15
+target_fraction: 0.10
+test_size: 2000
+
+# ----- sweep axes -----
+n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000]
+rho_list: [0.00001, 0.001, 0.005, 0.01, 0.3, 0.5, 0.07, 0.1, 0.5, 1.0, 3.0, 10.0]  # exact paper sweep
+n_fixed_for_rho: 1000
+
+# ----- metric operating points -----
+pfa: 0.1
+pauc_fpr: 0.1
+
+# ----- score-net architectures (paper names via the *_label keys) -----
+hidden_dims:    [128]                 # primary  = MLP    -> DART
+activation:     relu
+dsm_label:      "DART"
+hidden_dims_2:  []                    # secondary = linear -> L-DART
+activation_2:   relu                  # (no-op for linear net; matches paper config)
+dsm2_label:     "L-DART"
+
+# ----- training budgets -----
+dsm_epochs:  2000
+lrao_epochs: 2000
+
+# ----- best-epoch selection -----
+val_fraction:    0.0
+val_check_every: 100
+
+# ----- optimizer -----
+lr: 0.0005
+weight_decay: 5.0e-07                  # paper multi value (single uses 5e-5)
+batch_size: 512
+
+# ----- DSM noise level (numeric rho only) -----
+dsm_sigma_rho: 0.1
+
+# ----- learned-Rao (LRao / L-LRao) specifics -----
+lfi_delta_theta: 0.01
+lfi_sigma_cutoff: 0.001                # paper multi value (single uses 1e-6)
+lfi_detach_sigma: true
+lrao_grad_clip: 1.0
+run_lrao_mlp: true
+lrao_val_fraction: 0.1
+lrao_val_check_every: 1
+lrao_patience: 3
+lrao_min_delta: 0.005
+
+# ----- GMM-Levin (more components for the mixed background) -----
+gmm_K: 9
+
+# ----- reproducibility -----
+seed: [42, 43, 44, 45, 46]
+
+# ----- output -----
+results_dir: results/iid_multi
