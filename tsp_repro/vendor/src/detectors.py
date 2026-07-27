@@ -37,6 +37,15 @@ def amf(test_data: np.ndarray, train_data: np.ndarray, s: np.ndarray,
     Sigma = np.cov(train_data, rowvar=False)
     Sigma = (Sigma + Sigma.T) / 2
     eigv, eigvec = np.linalg.eigh(Sigma)
+    # NOTE on this clip: it is the same knob as diagonal loading, kept at a
+    # value (1e-18 x lambda_max, below eigh's own precision) where it does NOT
+    # regularize. Its only job is to make the division defined when the SCM is
+    # rank-deficient (n <= D): the numerically-zero eigenvalues (reported as
+    # ~+-1e-13, sometimes negative, though a covariance is PSD) are inverted
+    # with enormous ~1e18 weight, so the small-n AMF instability that the
+    # vs-n experiment is designed to show is fully expressed, not masked.
+    # Do NOT raise this default: any larger floor IS diagonal loading and
+    # hides exactly the collapse being measured.
     eigv = np.clip(eigv, eigv.max() * float(eig_floor), None)
     Si   = eigvec @ np.diag(1.0 / eigv) @ eigvec.T
     Si_s = Si @ s
