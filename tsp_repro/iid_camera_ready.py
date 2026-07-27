@@ -60,6 +60,13 @@ _ORIG_MAKE_WHITENING = iid._make_whitening
 
 
 def _train_lrao_robust(train_raw, cfg, seed, label):
+    # L-LRao must be LINEAR. run_iid trains it with cfg['hidden_dims'], which
+    # in the MULTI config is [128] (the DSM-MLP arch) — making "L-LRao" a
+    # bit-identical duplicate of the MLP LRao (same arch, same seed). The MLP
+    # LRao labels always carry an 'mlp' prefix, so force hidden_dims=[] for
+    # every non-mlp label (a no-op in single mode, where it is already []).
+    if not str(label).startswith('mlp'):
+        cfg = {**cfg, 'hidden_dims': []}
     iid._make_whitening = _robust_whitening
     try:
         return _ORIG_TRAIN_LRAO(train_raw, cfg, seed, label)
@@ -71,7 +78,9 @@ def apply_robust_lrao():
     """Activate the fixed LRao for every subsequent run_iid / theta_sweep."""
     iid.train_lrao_local = _train_lrao_robust
     print("[iid_camera_ready] FIXED LRao active: robust (median/IQR) input "
-          "normalization for LRao nets; DART keeps ZCA whitening.", flush=True)
+          "normalization for LRao nets; L-LRao forced LINEAR (multi config "
+          "would otherwise duplicate the MLP LRao); DART keeps ZCA whitening.",
+          flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +136,16 @@ def _arch_table(cfg):
 
 
 def _load_net(path, D, hidden, activation, device):
-    net = ScoreNet(D, list(hidden), activation,
-                   whitening=placeholder_whitening(D))
     blob = torch.load(path, map_location='cpu')
-    net.load_state_dict(blob['state_dict'])
+    sd = blob['state_dict']
+    # infer the architecture from the checkpoint itself (robust to the
+    # L-LRao linear fix and to config/label mismatches)
+    w = [v for k, v in sd.items()
+         if k.endswith('.weight') and v.ndim == 2 and 'whiten' not in k]
+    hidden_ck = [int(x.shape[0]) for x in w[:-1]]
+    net = ScoreNet(D, hidden_ck, activation,
+                   whitening=placeholder_whitening(D))
+    net.load_state_dict(sd)
     net.to(torch.device(device)).eval()
     return net
 
