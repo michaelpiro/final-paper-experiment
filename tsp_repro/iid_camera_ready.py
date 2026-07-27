@@ -41,6 +41,12 @@ from src.models import ScoreNet
 
 THETAS = [0.03, 0.075, 0.15, 0.225, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
 
+DEEP_BASELINES = ('THANTD', 'HTDNet', 'TSTTD', 'OSVAE')
+# paper-recipe budgets; smoke tests may shrink these
+DEEP_BUDGET = dict(thantd_epochs=300, uae_epochs=150, sdcnn_epochs=30,
+                   sdcnn_pairs=100_000, tsttd_epochs=20, osvae_epochs=200)
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 # ---------------------------------------------------------------------------
 # 1. Fixed LRao (robust normalization front layer)
@@ -160,14 +166,22 @@ def _seed_model_dir(agg_dir, mode, seed):
 
 
 def theta_sweep(agg_dir, cfg, mode, thetas=None, out_dir=None, device=None,
-                plant_model='additive'):
+                plant_model='additive', deep=()):
     """Score every detector on planted test sets at each theta, reusing the
-    n=max(n_list) checkpoints of the multi-seed run at `agg_dir`."""
+    n=max(n_list) checkpoints of the multi-seed run at `agg_dir`.
+
+    deep : iterable of names from DEEP_BASELINES. Each is trained per seed on
+           the SAME n=max(n_list) pixels + signature (its own paper recipe,
+           checkpoint-resumable under <out_dir>/ckpt_deep) and scored on the
+           same planted sets."""
     thetas = list(thetas or THETAS)
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     out_dir = out_dir or os.path.join(agg_dir, 'theta_sweep')
     fig_dir = os.path.join(out_dir, 'figures')
     os.makedirs(fig_dir, exist_ok=True)
+    deep = [d for d in deep if d in _DEEP]
+    if deep:
+        os.makedirs(os.path.join(out_dir, 'ckpt_deep'), exist_ok=True)
     seeds = list(cfg['seed']) if isinstance(cfg['seed'], (list, tuple)) \
         else [cfg['seed']]
     cfg = {**cfg, 'device': device}
@@ -198,6 +212,18 @@ def theta_sweep(agg_dir, cfg, mode, thetas=None, out_dir=None, device=None,
             if not isinstance(cfg['dsm_sigma_rho'], str) else 0.1
         reg_sigma = compute_sigma_from_data(tr, rho_fixed)
 
+        # ---- deep baselines: fit once per seed on the SAME tr + signature ----
+        dstag = os.path.splitext(os.path.basename(cfg['dataset']))[0]
+        deep_states = {}
+        for name in deep:
+            fit_fn, _ = _DEEP[name]
+            ck = os.path.join(out_dir, 'ckpt_deep',
+                              f'{name}__{dstag}__{mode}__seed{seed}.pt')
+            print(f'[{mode}] seed{seed} fitting {name} on {len(tr)} px ...',
+                  flush=True)
+            deep_states[name] = fit_fn(tr.astype(np.float64), s_raw, int(seed),
+                                       ck, device)
+
         for th in thetas:
             planted, labels, _ = plant_targets(
                 test_bkg, s_raw, float(th), cfg['target_fraction'],
@@ -210,6 +236,11 @@ def theta_sweep(agg_dir, cfg, mode, thetas=None, out_dir=None, device=None,
                     det_scores[det] = score_lrao(net, tr, planted, s_raw, cfg)
                 else:
                     det_scores[det] = score_dsm_add(net, tr, planted, s_raw)
+            for name, state in deep_states.items():
+                _, score_fn = _DEEP[name]
+                det_scores[name] = score_fn(state,
+                                            planted.astype(np.float64),
+                                            s_raw, device)
             key = f'{plant_model}|{th}'
             np.savez_compressed(
                 os.path.join(out_dir,
@@ -248,6 +279,173 @@ def theta_sweep(agg_dir, cfg, mode, thetas=None, out_dir=None, device=None,
                  series_std=pd_sd)
     print(f'\ntheta sweep done -> {out_dir}', flush=True)
     return results
+
+
+# ---------------------------------------------------------------------------
+# 2b. Deep baselines in the amplitude sweep (paper recipes, same 2000 pixels)
+# ---------------------------------------------------------------------------
+def _fit_thantd(tr, sig, seed, ck, device):
+    from thantd_model import THANTD, build_thantd_samples, train_thantd
+    m = THANTD(b=tr.shape[1])
+    if os.path.exists(ck):
+        m.load_state_dict(torch.load(ck, map_location='cpu'))
+        m.to(device).eval(); print('  resumed', ck, flush=True); return m
+    rng = np.random.default_rng(seed); torch.manual_seed(seed)
+    a, p, n = build_thantd_samples(tr, sig, alpha=0.5, n_samples=1024,
+                                   rng=rng, bkg_pool=tr)
+    m.to(device)
+    train_thantd(m, a, p, n, epochs=DEEP_BUDGET['thantd_epochs'],
+                 batch_size=64, lr=1e-4, margin=0.3, device=device)
+    torch.save(m.state_dict(), ck)
+    return m
+
+
+def _score_thantd(m, planted, sig, device):
+    from thantd_model import score_thantd
+    return score_thantd(m, sig, planted, device=device)
+
+
+def _fit_htdnet(tr, sig, seed, ck, device):
+    from colab_deep import htdnet_model as H
+    if os.path.exists(ck):
+        blob = torch.load(ck, map_location='cpu')
+        sd = H.SDCNN(); sd.load_state_dict(blob['sdcnn'])
+        sd._scale = blob['scale']; sd.to(device).eval()
+        print('  resumed', ck, flush=True)
+        return dict(sd=sd, gen_t=blob['gen_t'], bkg=blob['bkg'])
+    torch.manual_seed(seed); rng = np.random.default_rng(seed)
+    uae, sc = H.train_uae(tr, epochs=DEEP_BUDGET['uae_epochs'],
+                          device=device, seed=seed)
+    gen_t = H.generate_targets(uae, sc, sig, tr, n_samples=1000,
+                               device=device, rng=rng)
+    bkg = H.lp_background_selection(tr, sig, n_direct=60, n_total=500)
+    sd = H.train_sdcnn(gen_t, bkg, H.ACELabeler(tr),
+                       epochs=DEEP_BUDGET['sdcnn_epochs'],
+                       pairs_per_epoch=DEEP_BUDGET['sdcnn_pairs'],
+                       device=device, seed=seed, log_every=10)
+    torch.save(dict(sdcnn=sd.state_dict(), scale=sd._scale,
+                    gen_t=gen_t, bkg=bkg), ck)
+    return dict(sd=sd, gen_t=gen_t, bkg=bkg)
+
+
+def _score_htdnet(state, planted, sig, device):
+    from colab_deep import htdnet_model as H
+    return H.htdnet_detect(state['sd'], planted, state['gen_t'],
+                           state['bkg'], device=device)
+
+
+def _tsttd_modules():
+    vend = os.path.join(_REPO, 'colab_deep', 'vendor_tsttd')
+    if vend not in os.sys.path:
+        os.sys.path.insert(0, vend)
+    cwd = os.getcwd(); os.chdir(vend)
+    try:
+        import Train_eval as TE
+        from Model import SpectralGroupAttention
+    finally:
+        os.chdir(cwd)
+    # vendor hardcodes num_workers=4; worker processes can't pickle our
+    # closure-defined Dataset (and hang on macOS spawn). 0 workers is also
+    # faster for these small in-memory datasets.
+    if not getattr(TE, '_dl_patched', False):
+        _DL = TE.DataLoader
+        TE.DataLoader = lambda *a, **k: _DL(*a, **{**k, 'num_workers': 0})
+        TE._dl_patched = True
+    return TE, SpectralGroupAttention, vend
+
+
+def _fit_tsttd(tr, sig, seed, ck, device):
+    TE, SGA, vend = _tsttd_modules()
+    BAND = tr.shape[1]
+    dev = 'cuda:0' if str(device).startswith('cuda') else 'cpu'
+    model = SGA(band=BAND, m=20, d=128, depth=4, heads=4, dim_head=64,
+                mlp_dim=64, adjust=False).to(dev)
+    mn, mx = float(tr.min()), float(tr.max())      # frozen normalization
+    model._norm = (mn, mx); model._band = BAND; model._dev = dev
+    if os.path.exists(ck):
+        blob = torch.load(ck, map_location='cpu')
+        model.load_state_dict(blob['model']); model.to(dev).eval()
+        model._norm = tuple(blob['norm'])
+        print('  resumed', ck, flush=True); return model
+    S = lambda x: ((np.asarray(x) - mn) / (mx - mn + 1e-12)).astype(np.float32)
+
+    class OurData(torch.utils.data.Dataset):       # vendor recipe; bkg = tr
+        def __init__(self, path=None):
+            bkg = S(tr); ts = S(sig)[None, :]
+            al = np.random.uniform(0, 0.1, (len(bkg), 1)).astype(np.float32)
+            self.target_samples = al * bkg + (1 - al) * ts
+            self.background_samples = bkg
+            self.target_spectrum, self.nums = ts, len(bkg)
+        def __getitem__(self, i):
+            return self.target_samples[i], self.background_samples[i]
+        def __len__(self):
+            return self.nums
+
+    cfg = {"state": "train", "epoch": DEEP_BUDGET['tsttd_epochs'],
+           "band": BAND, "multiplier": 2, "seed": int(seed),
+           "batch_size": min(64, len(tr)),
+           "group_length": 20, "depth": 4, "heads": 4, "dim_head": 64,
+           "mlp_dim": 64, "adjust": False, "channel": 128, "lr": 1e-4,
+           "epision": 5, "grad_clip": 1., "device": dev,
+           "training_load_weight": None,
+           "save_dir": f"./Ckpt_iid_s{seed}_{os.path.basename(ck)}/",
+           "test_load_weight": None, "path": "ours"}
+    np.random.seed(seed); TE.Data = OurData
+    cwd = os.getcwd(); os.chdir(vend)
+    try:
+        os.makedirs(cfg['save_dir'] + '/ours/', exist_ok=True)
+        TE.train(cfg)
+        ckdir = cfg['save_dir'] + '/ours/'
+        last = max(os.listdir(ckdir),
+                   key=lambda s: int(''.join(filter(str.isdigit, s)) or -1))
+        model.load_state_dict(torch.load(ckdir + last, map_location=dev))
+    finally:
+        os.chdir(cwd)
+    model.eval()
+    torch.save(dict(model=model.state_dict(), norm=[mn, mx]), ck)
+    return model
+
+
+def _score_tsttd(model, planted, sig, device):
+    TE, _, _ = _tsttd_modules()
+    mn, mx = model._norm
+    S = lambda x: ((np.asarray(x) - mn) / (mx - mn + 1e-12)).astype(np.float32)
+    dev = model._dev
+    tf = model(TE.spectral_group(S(sig)[None, :], model._band, 20).to(dev)).detach()
+    out = []
+    X = S(planted)
+    for i in range(0, len(X), 512):
+        f = model(TE.spectral_group(X[i:i + 512], model._band, 20).to(dev)).detach()
+        out.append(torch.nn.functional.cosine_similarity(
+            f, tf.expand_as(f), -1).cpu().numpy())
+    return np.concatenate(out)
+
+
+def _fit_osvae(tr, sig, seed, ck, device):
+    from colab_deep.osvae_model import CVAE, fit_osvae
+    if os.path.exists(ck):
+        m = CVAE(tr.shape[1])
+        m.load_state_dict(torch.load(ck, map_location='cpu'))
+        m.to(device).eval(); m._device = str(device)
+        print('  resumed', ck, flush=True); return m
+    m = fit_osvae(tr, sig, seed=seed, epochs=DEEP_BUDGET['osvae_epochs'],
+                  device=str(device))
+    torch.save(m.state_dict(), ck)
+    return m
+
+
+def _score_osvae(m, planted, sig, device):
+    from colab_deep.osvae_model import score_osvae
+    return score_osvae(m, planted, sig)
+
+
+_DEEP = {'THANTD': (_fit_thantd, _score_thantd),
+         'HTDNet': (_fit_htdnet, _score_htdnet),
+         'TSTTD': (_fit_tsttd, _score_tsttd),
+         'OSVAE': (_fit_osvae, _score_osvae)}
+
+iid.DETECTOR_COLORS.update({'THANTD': '#8c564b', 'HTDNet': '#e377c2',
+                            'TSTTD': '#17becf', 'OSVAE': '#bcbd22'})
 
 
 # ---------------------------------------------------------------------------
