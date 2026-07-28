@@ -93,7 +93,7 @@ def _train_loop(net, params, data_tensors, loss_fn, epochs, lr, batch,
 def _resume(build_fn, ckpt, device):
     if ckpt and os.path.exists(ckpt):
         state = build_fn()
-        blob = torch.load(ckpt, map_location="cpu")
+        blob = torch.load(ckpt, map_location="cpu", weights_only=False)
         state.load_state_dict(blob["model"])
         state.to(device).eval()
         state.sigma = blob.get("sigma", getattr(state, "sigma", None))
@@ -323,7 +323,7 @@ def fit_htdnet(scene, seed, ckpt, device):
     from colab_deep import htdnet_model as H
     tr, sig = np.asarray(scene["tr"]), scene["_sig"]
     if ckpt and os.path.exists(ckpt):
-        blob = torch.load(ckpt, map_location="cpu")
+        blob = torch.load(ckpt, map_location="cpu", weights_only=False)
         sd = H.SDCNN(); sd.load_state_dict(blob["sdcnn"])
         sd._scale = blob["scale"]; sd.to(device).eval()
         print(f"    resumed {ckpt}", flush=True)

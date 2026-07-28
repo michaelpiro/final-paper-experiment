@@ -131,14 +131,14 @@ def fit_scene_models(scene, cfg, seed, ckpt_dir, device, reuse_dir=None):
     ck = os.path.join(ckpt_dir, f"ours_{scene['name']}_seed{seed}.pt")
     D = scene['tr'].shape[1]
     if os.path.exists(ck):
-        blob = torch.load(ck, map_location='cpu')
+        blob = torch.load(ck, map_location='cpu', weights_only=False)
         models = SP._build_models_from_ckpt(blob, D, cfg, device)
         print(f'  resumed {ck}', flush=True)
         return models
     if reuse_dir:
         mp = _find_multiseed_ckpt(reuse_dir, seed)
         if mp:
-            blob = torch.load(mp, map_location='cpu')
+            blob = torch.load(mp, map_location='cpu', weights_only=False)
             models = SP._build_models_from_ckpt(blob, D, blob.get('cfg', cfg),
                                                 device)
             torch.save({k: models[k].state_dict() for k in models}, ck)

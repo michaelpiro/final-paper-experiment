@@ -142,7 +142,7 @@ def _arch_table(cfg):
 
 
 def _load_net(path, D, hidden, activation, device):
-    blob = torch.load(path, map_location='cpu')
+    blob = torch.load(path, map_location='cpu', weights_only=False)
     sd = blob['state_dict']
     # infer the architecture from the checkpoint itself (robust to the
     # L-LRao linear fix and to config/label mismatches)
@@ -288,7 +288,7 @@ def _fit_thantd(tr, sig, seed, ck, device):
     from thantd_model import THANTD, build_thantd_samples, train_thantd
     m = THANTD(b=tr.shape[1])
     if os.path.exists(ck):
-        m.load_state_dict(torch.load(ck, map_location='cpu'))
+        m.load_state_dict(torch.load(ck, map_location='cpu', weights_only=False))
         m.to(device).eval(); print('  resumed', ck, flush=True); return m
     rng = np.random.default_rng(seed); torch.manual_seed(seed)
     a, p, n = build_thantd_samples(tr, sig, alpha=0.5, n_samples=1024,
@@ -308,7 +308,7 @@ def _score_thantd(m, planted, sig, device):
 def _fit_htdnet(tr, sig, seed, ck, device):
     from colab_deep import htdnet_model as H
     if os.path.exists(ck):
-        blob = torch.load(ck, map_location='cpu')
+        blob = torch.load(ck, map_location='cpu', weights_only=False)
         sd = H.SDCNN(); sd.load_state_dict(blob['sdcnn'])
         sd._scale = blob['scale']; sd.to(device).eval()
         print('  resumed', ck, flush=True)
@@ -363,7 +363,7 @@ def _fit_tsttd(tr, sig, seed, ck, device):
     mn, mx = float(tr.min()), float(tr.max())      # frozen normalization
     model._norm = (mn, mx); model._band = BAND; model._dev = dev
     if os.path.exists(ck):
-        blob = torch.load(ck, map_location='cpu')
+        blob = torch.load(ck, map_location='cpu', weights_only=False)
         model.load_state_dict(blob['model']); model.to(dev).eval()
         model._norm = tuple(blob['norm'])
         print('  resumed', ck, flush=True); return model
@@ -398,7 +398,7 @@ def _fit_tsttd(tr, sig, seed, ck, device):
         ckdir = cfg['save_dir'] + '/ours/'
         last = max(os.listdir(ckdir),
                    key=lambda s: int(''.join(filter(str.isdigit, s)) or -1))
-        model.load_state_dict(torch.load(ckdir + last, map_location=dev))
+        model.load_state_dict(torch.load(ckdir + last, map_location=dev, weights_only=False))
     finally:
         os.chdir(cwd)
     model.eval()
@@ -425,7 +425,7 @@ def _fit_osvae(tr, sig, seed, ck, device):
     from colab_deep.osvae_model import CVAE, fit_osvae
     if os.path.exists(ck):
         m = CVAE(tr.shape[1])
-        m.load_state_dict(torch.load(ck, map_location='cpu'))
+        m.load_state_dict(torch.load(ck, map_location='cpu', weights_only=False))
         m.to(device).eval(); m._device = str(device)
         print('  resumed', ck, flush=True); return m
     m = fit_osvae(tr, sig, seed=seed, epochs=DEEP_BUDGET['osvae_epochs'],
