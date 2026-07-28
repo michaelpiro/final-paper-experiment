@@ -99,13 +99,34 @@ def _row(te_sc, labels, tr_sc, te_gt=None):
     return r
 
 
+def _resolve_art(art):
+    """Accept either the bare layout or the release zip's spatial/ prefix."""
+    if not os.path.isdir(os.path.join(art, 'ckpt_spatial')) \
+            and os.path.isdir(os.path.join(art, 'spatial', 'ckpt_spatial')):
+        return os.path.join(art, 'spatial')
+    return art
+
+
+def _require(paths):
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            'this module NEVER trains — missing checkpoints:\n  '
+            + '\n  '.join(missing))
+
+
 def compute_scene(art, scn, dets, te_gt=None, device=None):
     import torch
+    art = _resolve_art(art)
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     cfg = SC.spatial_cfg(device)
     scene = SC.build_scene(scn)
     ck_dir = os.path.join(art, 'ckpt_spatial')
     sweep = os.path.join(art, f'spatial_sweep_{scn}')
+    _require([os.path.join(ck_dir, f'lrao_{scn}.pt')]
+             + [os.path.join(ck_dir, f'ours_{scn}_seed{s}.pt') for s in SEEDS]
+             + [os.path.join(sweep, 'ckpt_deep', f'{n}__{scn}__seed{s}.pt')
+                for n in DEEP if n in dets for s in SEEDS])
     lrao = SC.fit_scene_lrao(scene, ck_dir, device)
     acc = {d: [] for d in dets}
     for seed in SEEDS:
@@ -172,6 +193,7 @@ def _emit(rows, dets, cols, heads, caption, label, path):
 
 
 def make_all(art_dir, out_dir='tables_out', device=None):
+    art_dir = _resolve_art(art_dir)
     os.makedirs(out_dir, exist_ok=True)
     from tsp_repro.protocol import _load_pavia
     _, gt = _load_pavia()
