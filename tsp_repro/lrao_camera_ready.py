@@ -5,16 +5,22 @@ each, and scores the full amplitude sweep. Everything is archived: a model
 checkpoint every 10 epochs, best/final weights, loss histories, raw train/test
 scores per (scene, seed, theta), and per-seed metrics.
 
-Training recipe = the archived July-7 generality run (the one that reached
-Pavia AUC 0.744), recovered from its session transcript:
+Training = the LRao paper's PRESCRIBED usage: a validation split with early
+stopping on the VALIDATION LFI cost (the camera-ready decision after the SD2
+diagnosis, where the training cost decreases monotonically while detection
+oscillates and collapses — no train-cost-based rule can select a good model):
 
-    fit_lrao(tr_raw, hidden_dims=[64,64], activation='relu',
-        input_norm='robust', delta_theta=0.01, sigma_cutoff=1e-22,
-        detach_sigma=True, lr=5e-4, weight_decay=5e-5, batch_size=2048,
-        n_epochs=1000, grad_clip=1.0, patience=10, min_delta=0.001)
+  - 20% of the train-box pixels held out by a seeded permutation (the SDSM
+    convention: val = first nv indices of default_rng(seed).permutation);
+  - the model, its robust whitening, its scoring reference set and its CFAR
+    thresholds use ONLY the remaining 80% (the sample-budget tradeoff to note
+    in the paper);
+  - stop after RECIPE['patience'] epochs without a new validation-cost
+    minimum; keep the best-validation model.
 
-with ONE deliberate change: hidden_dims=[128] — the SAME architecture as DART
-(one hidden layer), per the camera-ready decision. As in the archive, the
+Everything else follows the recovered July-7 recipe (lr 5e-4, wd 5e-5, batch
+2048, sigma_cutoff 1e-22 in the loss, grad_clip 1.0) with hidden_dims=[128] —
+the SAME architecture as DART (one hidden layer). As in the archive, the
 robust normalization (mu=median, W=diag(1/(1.4826*MAD))) is a frozen whitening
 layer INSIDE the ScoreNet (exactly how DART embeds its ZCA front-end), so the
 LFI Jacobian runs through it and checkpoints are self-contained. Scoring uses
@@ -64,7 +70,8 @@ RECIPE = dict(
     detach_sigma=True,
     lr=5e-4, weight_decay=5e-5, batch_size=2048,
     max_epochs=1000, grad_clip=1.0,
-    patience=10, min_delta=1e-3,  # abs, on epoch-mean train loss
+    val_fraction=0.2,             # held-out split for stopping (paper usage)
+    patience=20,                  # epochs without a new val-cost minimum
     ckpt_every=10,
 )
 
@@ -85,34 +92,47 @@ def build_lrao(D, tr, device):
     return net.to(device)
 
 
+def _val_split(n, seed):
+    """SDSM convention: val = first nv indices of the seeded permutation."""
+    idx = np.random.default_rng(seed).permutation(n)
+    nv = max(1, int(n * RECIPE['val_fraction']))
+    return idx[nv:], idx[:nv]                    # fit_idx, val_idx
+
+
 def fit_lrao_cr(tr, seed, run_dir, device):
-    """Train one LRao (or resume from run_dir/best.pt). Saves a checkpoint
-    every RECIPE['ckpt_every'] epochs plus best/final/history."""
+    """Train one LRao with validation early stopping (or resume from
+    run_dir/best.pt). The returned net carries net._fit_idx — the 80% train
+    subset that the model (whitening, scoring reference, thresholds) uses.
+    Saves a checkpoint every RECIPE['ckpt_every'] epochs plus
+    best/final/history (with both loss curves)."""
     os.makedirs(run_dir, exist_ok=True)
     tr = np.asarray(tr, np.float32)
-    net = build_lrao(tr.shape[1], tr, device)
+    fit_idx, val_idx = _val_split(len(tr), seed)
+    net = build_lrao(tr.shape[1], tr[fit_idx], device)
     best_p = os.path.join(run_dir, 'best.pt')
     if os.path.exists(best_p):
         blob = torch.load(best_p, map_location='cpu', weights_only=False)
         net.load_state_dict(blob['model'])
         net.to(device).eval()
+        net._fit_idx = np.asarray(blob['fit_idx'])
         print(f'  resumed {best_p} (epoch {blob["epoch"]}, '
-              f'loss {blob["train_loss"]:.4f})', flush=True)
+              f'val loss {blob["val_loss"]:.4f})', flush=True)
         return net
 
     torch.manual_seed(seed); np.random.seed(seed)
     opt = torch.optim.Adam(net.parameters(), lr=RECIPE['lr'],
                            weight_decay=RECIPE['weight_decay'])
-    X = torch.tensor(tr, device=device)
-    P, B = len(X), RECIPE['batch_size']
-    losses, best_loss, best_state, best_epoch = [], float('inf'), None, 0
-    best_for_patience, bad = float('inf'), 0
+    Xf = torch.tensor(tr[fit_idx], device=device)
+    Xv = torch.tensor(tr[val_idx], device=device)
+    P, B = len(Xf), RECIPE['batch_size']
+    tr_losses, val_losses = [], []
+    best_val, best_state, best_epoch, bad = float('inf'), None, 0, 0
     stopped = RECIPE['max_epochs']
     for ep in range(1, RECIPE['max_epochs'] + 1):
         perm = torch.randperm(P, device=device)
         run, nb = 0.0, 0
         for i in range(0, P, B):
-            batch = X[perm[i:i + B]]
+            batch = Xf[perm[i:i + B]]
             loss = lfi_loss_mode2(net, batch, RECIPE['delta_theta'],
                                   RECIPE['train_sigma_cutoff'],
                                   RECIPE['detach_sigma'])
@@ -122,44 +142,51 @@ def fit_lrao_cr(tr, seed, run_dir, device):
             opt.step()
             run += float(loss.detach()); nb += 1
         tl = run / max(nb, 1)
-        losses.append(tl)
-        if tl < best_loss:
-            best_loss, best_epoch = tl, ep
+        vl = float(lfi_loss_mode2(net, Xv, RECIPE['delta_theta'],
+                                  RECIPE['train_sigma_cutoff'],
+                                  RECIPE['detach_sigma']).detach())
+        tr_losses.append(tl); val_losses.append(vl)
+        if vl < best_val:
+            best_val, best_epoch, bad = vl, ep, 0
             best_state = {k: v.detach().cpu().clone()
                           for k, v in net.state_dict().items()}
+        else:
+            bad += 1
         if ep % RECIPE['ckpt_every'] == 0:
             torch.save({'model': {k: v.detach().cpu()
                                   for k, v in net.state_dict().items()},
-                        'epoch': ep, 'train_loss': tl},
+                        'epoch': ep, 'train_loss': tl, 'val_loss': vl},
                        os.path.join(run_dir, f'epoch_{ep:04d}.pt'))
         if ep == 1 or ep % 50 == 0:
-            print(f'    epoch {ep}/{RECIPE["max_epochs"]} loss={tl:.4f} '
-                  f'best={best_loss:.4f}@{best_epoch}', flush=True)
-        # early stopping — the archive trainer's semantics (abs min_delta)
-        if (best_for_patience - tl) > RECIPE['min_delta']:
-            best_for_patience, bad = tl, 0
-        else:
-            bad += 1
+            print(f'    epoch {ep}/{RECIPE["max_epochs"]} train={tl:.4f} '
+                  f'val={vl:.4f} best_val={best_val:.4f}@{best_epoch}',
+                  flush=True)
         if bad >= RECIPE['patience']:
             stopped = ep
-            print(f'    early stop at epoch {ep} (no >{RECIPE["min_delta"]} '
-                  f'gain for {RECIPE["patience"]} epochs)', flush=True)
+            print(f'    early stop at epoch {ep} (no new val minimum for '
+                  f'{RECIPE["patience"]} epochs)', flush=True)
             break
 
     torch.save({'model': {k: v.detach().cpu()
                           for k, v in net.state_dict().items()},
-                'epoch': stopped, 'train_loss': losses[-1]},
-               os.path.join(run_dir, 'final.pt'))
+                'epoch': stopped, 'train_loss': tr_losses[-1],
+                'val_loss': val_losses[-1], 'fit_idx': fit_idx,
+                'val_idx': val_idx}, os.path.join(run_dir, 'final.pt'))
     torch.save({'model': best_state, 'epoch': best_epoch,
-                'train_loss': best_loss}, best_p)
+                'train_loss': tr_losses[best_epoch - 1], 'val_loss': best_val,
+                'fit_idx': fit_idx, 'val_idx': val_idx}, best_p)
     with open(os.path.join(run_dir, 'history.json'), 'w') as f:
         json.dump(dict(recipe={k: v for k, v in RECIPE.items()}, seed=seed,
-                       train_loss=losses, best_epoch=best_epoch,
-                       best_loss=best_loss, stopped_epoch=stopped), f)
+                       n_fit=int(len(fit_idx)), n_val=int(len(val_idx)),
+                       train_loss=tr_losses, val_loss=val_losses,
+                       best_epoch=best_epoch, best_val_loss=best_val,
+                       stopped_epoch=stopped), f)
     net.load_state_dict(best_state)
     net.eval()
-    print(f'  trained: best epoch {best_epoch} loss {best_loss:.4f} '
-          f'(stopped {stopped})', flush=True)
+    net._fit_idx = fit_idx
+    print(f'  trained: best val epoch {best_epoch} (val {best_val:.4f}, '
+          f'stopped {stopped}, fit {len(fit_idx)} px / val {len(val_idx)} px)',
+          flush=True)
     return net
 
 
@@ -212,11 +239,13 @@ def run_scene(scene_name, seeds=SEEDS, thetas=None,
         print(f'[{scene_name}] seed {seed}', flush=True)
         run_dir = os.path.join(out_root, 'ckpt', f'{scene_name}_seed{seed}')
         net = fit_lrao_cr(scene['tr'], seed, run_dir, device)
+        tr_fit = scene['tr'][net._fit_idx]     # the model's own 80% subset
 
-        tr_sc = score_lrao_cr(net, scene['tr'], scene['tr'], scene['sig'])
+        tr_sc = score_lrao_cr(net, tr_fit, tr_fit, scene['sig'])
         np.savez_compressed(
             os.path.join(sc_dir, f'lrao_train__{scene_name}__seed{seed}.npz'),
-            train_scores=np.asarray(tr_sc, np.float32))
+            train_scores=np.asarray(tr_sc, np.float32),
+            fit_idx=np.asarray(net._fit_idx, np.int32))
         thr = cfar_threshold(np.asarray(tr_sc, float), target_fpr=ALPHA)
 
         for th in thetas:
@@ -224,7 +253,7 @@ def run_scene(scene_name, seeds=SEEDS, thetas=None,
                 scene['te'], scene['sig'], float(th), frac, model='additive',
                 seed=int(seed), spatial_shape=scene['te_shape'],
                 edge_guard=guard)
-            sc = score_lrao_cr(net, scene['tr'], planted.astype(np.float32),
+            sc = score_lrao_cr(net, tr_fit, planted.astype(np.float32),
                                scene['sig'])
             np.savez_compressed(
                 os.path.join(
