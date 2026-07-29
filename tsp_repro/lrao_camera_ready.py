@@ -108,6 +108,9 @@ def fit_lrao_cr(tr, seed, run_dir, device):
     os.makedirs(run_dir, exist_ok=True)
     tr = np.asarray(tr, np.float32)
     fit_idx, val_idx = _val_split(len(tr), seed)
+    # seed BEFORE construction: the weight init must be governed by `seed`,
+    # not by whatever the session trained previously (July-7 code order)
+    torch.manual_seed(seed); np.random.seed(seed)
     net = build_lrao(tr.shape[1], tr[fit_idx], device)
     best_p = os.path.join(run_dir, 'best.pt')
     if os.path.exists(best_p):
@@ -119,7 +122,6 @@ def fit_lrao_cr(tr, seed, run_dir, device):
               f'val loss {blob["val_loss"]:.4f})', flush=True)
         return net
 
-    torch.manual_seed(seed); np.random.seed(seed)
     opt = torch.optim.Adam(net.parameters(), lr=RECIPE['lr'],
                            weight_decay=RECIPE['weight_decay'])
     Xf = torch.tensor(tr[fit_idx], device=device)
