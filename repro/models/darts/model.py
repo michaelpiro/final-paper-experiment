@@ -71,10 +71,16 @@ class DARTS:
         self.cfg = dict(cfg)
         self.net = None
 
-    def fit(self, tr_raw, tr_nbr, seed, device, ckpt=None):
+    def fit(self, tr_raw, tr_nbr, seed, device, ckpt=None, reseed=True):
+        """reseed=False replicates the PUBLISHED RNG protocol: the paper's
+        pipeline seeded once per run and trained DART first, so DARTS's init
+        drew from the post-DART stream. The spatial protocol passes
+        reseed=False (with DART trained in-session) to reproduce the published
+        models exactly; standalone use keeps the fresh per-model seed."""
         cfg = self.cfg
         D = tr_raw.shape[1]
-        seed_all(seed)                                   # BEFORE construction
+        if reseed:
+            seed_all(seed)                               # BEFORE construction
         Wh = Whitening.from_data(np.asarray(tr_raw, np.float32),
                                  eig_floor=float(cfg['whiten_eig_floor'])
                                  ).to(device)

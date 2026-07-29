@@ -57,9 +57,16 @@ def _fit_all(scene, cfg, seed, ckpt_dir, device):
     if '_tr_nbr' not in scene:
         _, scene['_tr_nbr'] = _windows(scene['tr'], scene['tr_shape'],
                                        int(cfg['k']), device)
+    darts_ck = os.path.join(ckpt_dir, f'darts_{name}_seed{seed}.pt')
+    if getattr(models['DART'], 'resumed', False) and not os.path.exists(darts_ck):
+        print('    [warn] DARTS will train but DART was resumed: the RNG '
+              'stream cannot match the published run (clear dart_* ckpts '
+              'to retrain both in the published order).', flush=True)
+    # reseed=False: published RNG protocol (DARTS inherits the post-DART
+    # stream; window extraction in between consumes no RNG)
     models['DARTS'] = DARTS(cfg['darts']).fit(
-        scene['tr'], scene['_tr_nbr'], seed, device,
-        ckpt=os.path.join(ckpt_dir, f'darts_{name}_seed{seed}.pt'))
+        scene['tr'], scene['_tr_nbr'], seed, device, ckpt=darts_ck,
+        reseed=False)
     models['LRao'] = LRao(cfg['lrao']).fit(
         scene['tr'], seed, device,
         run_dir=os.path.join(ckpt_dir, f'lrao_{name}_seed{seed}'))

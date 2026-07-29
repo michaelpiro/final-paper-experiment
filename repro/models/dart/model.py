@@ -63,7 +63,9 @@ class DART:
             self.net.load_state_dict(blob['net'])
             self.net.to(device).eval()
             print(f'    [DART] resumed {ckpt}', flush=True)
+            self.resumed = True
             return self
+        self.resumed = False
         opt = torch.optim.Adam(self.net.parameters(), lr=float(cfg['lr']),
                                weight_decay=float(cfg['weight_decay']))
         X = torch.tensor(np.asarray(tr_raw, np.float32), device=device)
