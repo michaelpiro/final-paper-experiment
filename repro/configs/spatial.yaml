@@ -28,7 +28,7 @@ dart:
   hidden: [128]
   activation: relu
   lr: 5.0e-4
-  batch_size: 256
+  batch_size: 512
   weight_decay: 1.0e-5
   epochs: 1000
   whiten_eig_floor: 1.0e-5
@@ -57,7 +57,7 @@ lrao:
   detach_sigma: true
   lr: 5.0e-4
   weight_decay: 5.0e-5
-  batch_size: 2048
+  batch_size: 512
   max_epochs: 1000
   grad_clip: 1.0
   val_fraction: 0.2         # held-out split; fit subset is everything else
