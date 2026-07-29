@@ -1,0 +1,50 @@
+{
+  "_comment": "Published camera-ready numbers (mean over 5 seeds) for verification. Spatial: theta=0.15, thresholds = train-quantile @0.05. Sources: paper Table 1 (tab:spatial), San Diego table (tab:sandiego), lrao_val2 run.",
+  "spatial": {
+    "pavia4": {
+      "DARTS":      {"pauc": 0.483, "auc": 0.921, "pd05": 0.657, "pd_cfar": 0.493, "pfa_avg": 0.029, "pfa_max": 0.045},
+      "AMF-local":  {"pauc": 0.320, "auc": 0.839, "pd05": 0.450, "pd_cfar": 0.435, "pfa_avg": 0.041, "pfa_max": 0.046},
+      "AMF-global": {"pauc": 0.092, "auc": 0.770, "pd05": 0.199, "pd_cfar": 0.274, "pfa_avg": 0.177, "pfa_max": 0.265},
+      "GMM-Levin":  {"pauc": 0.148, "auc": 0.800, "pd05": 0.312, "pd_cfar": 0.393, "pfa_avg": 0.140, "pfa_max": 0.205},
+      "DART":       {"pauc": 0.166, "auc": 0.793, "pd05": 0.291, "pd_cfar": 0.302, "pfa_avg": 0.144, "pfa_max": 0.292},
+      "LRao":       {"pauc": 0.074, "auc": 0.715, "pd05": 0.152, "pd_cfar": 0.161, "pfa_avg": 0.155, "pfa_max": 0.389},
+      "THANTD":     {"pauc": 0.042, "auc": 0.503, "pd05": 0.074, "pd_cfar": 0.130},
+      "HTDNet":     {"pauc": 0.101, "auc": 0.587, "pd05": 0.172, "pd_cfar": 0.320},
+      "TSTTD":      {"pauc": 0.119, "auc": 0.571, "pd05": 0.236, "pd_cfar": 0.367},
+      "OSVAE":      {"pauc": 0.014, "auc": 0.509, "pd05": 0.035, "pd_cfar": 0.044}
+    },
+    "sandiego": {
+      "DART":       {"pauc": 0.953, "auc": 0.997, "pd05": 0.988, "pd_cfar": 0.978, "pfa": 0.028},
+      "DART-CFAR":  {"pauc": 0.831, "auc": 0.989, "pd05": 0.953, "pd_cfar": 0.815, "pfa": 0.015},
+      "DARTS":      {"pauc": 1.000, "auc": 1.000, "pd05": 1.000, "pd_cfar": 1.000, "pfa": 0.027},
+      "DARTS-CFAR": {"pauc": 0.998, "auc": 1.000, "pd05": 1.000, "pd_cfar": 0.996, "pfa": 0.002},
+      "AMF-global": {"pauc": 0.999, "auc": 1.000, "pd05": 1.000, "pd_cfar": 1.000, "pfa": 0.017},
+      "AMF-local":  {"pauc": 0.962, "auc": 0.997, "pd05": 0.999, "pd_cfar": 0.999, "pfa": 0.053},
+      "GMM-Levin":  {"pauc": 0.997, "auc": 1.000, "pd05": 1.000, "pd_cfar": 1.000, "pfa": 0.025},
+      "LRao":       {"pauc": 0.466, "auc": 0.907, "pd05": 0.594, "pd_cfar": 0.301, "pfa": 0.008},
+      "THANTD":     {"pauc": 0.247, "auc": 0.589, "pd05": 0.281, "pd_cfar": 0.007, "pfa": 0.005},
+      "HTDNet":     {"pauc": 0.040, "auc": 0.650, "pd05": 0.064, "pd_cfar": 0.053, "pfa": 0.043},
+      "TSTTD":      {"pauc": 0.045, "auc": 0.702, "pd05": 0.089, "pd_cfar": 0.000, "pfa": 0.001},
+      "OSVAE":      {"pauc": 0.919, "auc": 0.995, "pd05": 0.978, "pd_cfar": 0.970, "pfa": 0.023}
+    },
+    "sandiego2": {
+      "DART":       {"pauc": 0.273, "auc": 0.863, "pd05": 0.434, "pd_cfar": 0.311, "pfa": 0.029},
+      "DART-CFAR":  {"pauc": 0.350, "auc": 0.874, "pd05": 0.517, "pd_cfar": 0.408, "pfa": 0.029},
+      "DARTS":      {"pauc": 0.905, "auc": 0.994, "pd05": 0.983, "pd_cfar": 0.986, "pfa": 0.063},
+      "DARTS-CFAR": {"pauc": 0.920, "auc": 0.995, "pd05": 0.987, "pd_cfar": 0.898, "pfa": 0.010},
+      "AMF-global": {"pauc": 0.677, "auc": 0.968, "pd05": 0.860, "pd_cfar": 0.870, "pfa": 0.056},
+      "AMF-local":  {"pauc": 0.716, "auc": 0.979, "pd05": 0.953, "pd_cfar": 0.942, "pfa": 0.038},
+      "GMM-Levin":  {"pauc": 0.571, "auc": 0.921, "pd05": 0.658, "pd_cfar": 0.873, "pfa": 0.243},
+      "LRao":       {"pauc": 0.033, "auc": 0.585, "pd05": 0.071, "pd_cfar": 0.044, "pfa": 0.032},
+      "THANTD":     {"pauc": 0.034, "auc": 0.535, "pd05": 0.063, "pd_cfar": 0.065, "pfa": 0.055},
+      "HTDNet":     {"pauc": 0.227, "auc": 0.739, "pd05": 0.382, "pd_cfar": 0.321, "pfa": 0.038},
+      "TSTTD":      {"pauc": 0.079, "auc": 0.530, "pd05": 0.133, "pd_cfar": 0.142, "pfa": 0.063},
+      "OSVAE":      {"pauc": 0.254, "auc": 0.870, "pd05": 0.405, "pd_cfar": 0.291, "pfa": 0.028}
+    }
+  },
+  "notes": {
+    "pavia4_row_names": "Table 1 'AMF-local' is the row the paper prints as the local AMF; DART-CFAR/DARTS ablation rows omitted here",
+    "lrao": "LRao rows are the lrao_val2 protocol (val split 20%, patience 20, [128], robust MAD norm); expect exact match only when retrained on the same device class",
+    "tolerance": "training-free detectors (AMF, GMM-Levin) should match to ~1e-3; trained detectors to within seed-level std (see paper table stds)"
+  }
+}

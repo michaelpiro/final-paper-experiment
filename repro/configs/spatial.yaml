@@ -1,0 +1,76 @@
+# Spatial protocol — ALL knobs live here (nothing hardcoded in code).
+# Values = the published camera-ready configuration (paper Table 1 + sweep).
+
+# ---- protocol ----
+scenes: [pavia4, sandiego, sandiego2]
+seeds: [42, 43, 44, 45, 46]
+thetas: [0.03, 0.075, 0.15, 0.225, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+alpha: 0.05                 # nominal false-alarm rate (thresholds + pAUC + Pd)
+target_fraction: 0.10
+edge_guard: 3
+k: 7                        # neighbor window for DARTS / windows extraction
+n_budget: 4000              # pavia train-box side-crop budget
+
+# ---- CFAR normalizations ----
+cfar_lam: 0.1
+dart_cfar_window: 5
+dart_cfar_guard: 1
+darts_cfar_window: null     # null -> use k
+darts_cfar_guard: 1
+
+# ---- classical ----
+baseline_eig_floor: 0.0     # pure AMF-global (numerical guard only)
+local_scm_loading: 0.0
+amf_local_window: null      # null -> dimension-aware (15 on 103 bands, 21 on 189)
+gmm_steps: 50
+
+dart:
+  hidden: [128]
+  activation: relu
+  lr: 5.0e-4
+  batch_size: 256
+  weight_decay: 1.0e-5
+  epochs: 1000
+  whiten_eig_floor: 1.0e-5
+  dsm_sigma_rho: 0.1        # sigma = sqrt(rho) in whitened space
+
+darts:
+  d_lat: 16
+  K: 7
+  enc_hidden: [64, 32]
+  score_hidden: [128]
+  activation: relu
+  lr: 3.0e-4
+  batch_size: 512
+  weight_decay: 1.0e-5
+  epochs: 1000
+  whiten_eig_floor: 1.0e-5
+  dsm_sigma_rho: 0.1
+
+# ---- LRao: the published lrao_val2 protocol (its paper's prescribed usage) ----
+lrao:
+  hidden: [128]             # DART's architecture
+  activation: relu
+  delta_theta: 0.01
+  train_sigma_cutoff: 1.0e-22
+  score_sigma_cutoff: 1.0e-3
+  detach_sigma: true
+  lr: 5.0e-4
+  weight_decay: 5.0e-5
+  batch_size: 2048
+  max_epochs: 1000
+  grad_clip: 1.0
+  val_fraction: 0.2         # held-out split; fit subset is everything else
+  patience: 20              # epochs without a new val-cost minimum
+  ckpt_every: 10
+
+# ---- deep baselines (paper recipes; budgets only — architectures are theirs) ----
+deep_detectors: [THANTD, HTDNet, TSTTD, OSVAE]
+deep:
+  thantd_epochs: 300
+  thantd_samples: 1024
+  uae_epochs: 150
+  sdcnn_epochs: 30
+  sdcnn_pairs: 100000
+  tsttd_epochs: 20
+  osvae_epochs: 200
