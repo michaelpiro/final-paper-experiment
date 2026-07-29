@@ -62,11 +62,14 @@ def _fit_all(scene, cfg, seed, ckpt_dir, device):
         print('    [warn] DARTS will train but DART was resumed: the RNG '
               'stream cannot match the published run (clear dart_* ckpts '
               'to retrain both in the published order).', flush=True)
-    # reseed=False: published RNG protocol (DARTS inherits the post-DART
-    # stream; window extraction in between consumes no RNG)
+    # Published RNG protocols differ by scene: the Pavia Table-1 pipeline
+    # seeded ONCE per run (DARTS inherits the post-DART stream), while the
+    # San Diego/sweep pipeline re-seeded before DARTS (fresh-seed draw).
+    # darts_inherit_stream lists the scenes using the single-stream order.
+    inherit = name in (cfg.get('darts_inherit_stream') or ['pavia4'])
     models['DARTS'] = DARTS(cfg['darts']).fit(
         scene['tr'], scene['_tr_nbr'], seed, device, ckpt=darts_ck,
-        reseed=False)
+        reseed=not inherit)
     models['LRao'] = LRao(cfg['lrao']).fit(
         scene['tr'], seed, device,
         run_dir=os.path.join(ckpt_dir, f'lrao_{name}_seed{seed}'))

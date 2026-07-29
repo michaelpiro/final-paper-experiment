@@ -9,6 +9,9 @@ alpha: 0.05                 # nominal false-alarm rate (thresholds + pAUC + Pd)
 target_fraction: 0.10
 edge_guard: 3
 k: 7                        # neighbor window for DARTS / windows extraction
+darts_inherit_stream: [pavia4]   # scenes whose published run seeded once (DARTS
+                                 # init inherits the post-DART RNG stream); the
+                                 # published SD pipeline re-seeded before DARTS
 n_budget: 4000              # pavia train-box side-crop budget
 
 # ---- CFAR normalizations ----
