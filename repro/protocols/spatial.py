@@ -64,9 +64,17 @@ def _fit_all(scene, cfg, seed, ckpt_dir, device):
         scene['tr'], seed, device,
         run_dir=os.path.join(ckpt_dir, f'lrao_{name}_seed{seed}'))
     for dname in cfg.get('deep_detectors', []):
+        # deep baselines: load the bundled published checkpoints unless
+        # retrain_deep is set (training them takes hours)
+        ck = os.path.join(ckpt_dir, f'{dname}_{name}_seed{seed}.pt')
+        pre = cfg.get('deep_pretrained')
+        if pre and not bool(cfg.get('retrain_deep', False)):
+            cand = os.path.join(pre, f'{dname}_{name}_seed{seed}.pt')
+            if os.path.exists(cand):
+                ck = cand
         models[dname] = DEEP[dname](cfg['deep']).fit(
             scene['tr'].astype(np.float64), scene['sig'], seed, device,
-            ckpt=os.path.join(ckpt_dir, f'{dname}_{name}_seed{seed}.pt'))
+            ckpt=ck)
     return models
 
 

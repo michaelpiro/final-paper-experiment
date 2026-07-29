@@ -66,6 +66,8 @@ lrao:
 
 # ---- deep baselines (paper recipes; budgets only — architectures are theirs) ----
 deep_detectors: [THANTD, HTDNet, TSTTD, OSVAE]
+deep_pretrained: repro/checkpoints/deep   # bundled published checkpoints
+retrain_deep: false                        # true -> retrain from scratch (hours)
 deep:
   thantd_epochs: 300
   thantd_samples: 1024
