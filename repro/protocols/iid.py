@@ -175,13 +175,14 @@ def train_dsm_local(train_raw: np.ndarray, cfg: dict,
     for ep in pbar:
         model.train()
         perm = torch.randperm(N)
-        tot = 0.0; nb = 0
+        tot = None; nb = 0
         for i in range(0, N, bs):
             b = X_tr[perm[i:i + bs]]
             loss = dsm_loss(model, b, sigma)
             opt.zero_grad(); loss.backward(); opt.step()
-            tot += loss.item(); nb += 1
-        ep_loss = tot / max(nb, 1)
+            tot = loss.detach() if tot is None else tot + loss.detach()
+            nb += 1
+        ep_loss = float(tot.item()) / max(nb, 1)   # ONE sync per epoch
         hist.append(ep_loss)
 
         if ep % val_every == 0 or ep == total_eps:
@@ -284,14 +285,14 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
             if not torch.isfinite(loss):
                 skipped += 1; continue
             opt.zero_grad(); loss.backward()
-            finite = all(p.grad is None or torch.isfinite(p.grad).all()
-                         for p in model.parameters())
-            if not finite:
+            checks = [torch.isfinite(p.grad).all()
+                      for p in model.parameters() if p.grad is not None]
+            if checks and not bool(torch.stack(checks).all()):   # one sync
                 skipped += 1; continue
             if clip and clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             opt.step()
-            tot += loss.item(); nb += 1
+            tot += float(loss.detach()); nb += 1
         if nb == 0:
             print(f"      [warn] LRao {label} stalled at epoch {ep} "
                   f"(all batches skipped) — returning best-so-far", flush=True)
