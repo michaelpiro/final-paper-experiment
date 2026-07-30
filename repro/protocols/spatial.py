@@ -50,8 +50,14 @@ def _windows(flat, shape, k, device):
 def _fit_all(scene, cfg, seed, ckpt_dir, device):
     """Train or resume every trainable detector for one (scene, seed)."""
     name = scene['name']
+    # dimension-matched width for the global score nets (paper protocol)
+    w = (cfg.get('net_width') or {}).get(name)
+    dart_cfg = dict(cfg['dart']); lrao_cfg = dict(cfg['lrao'])
+    if w:
+        dart_cfg['hidden'] = [int(w)]
+        lrao_cfg['hidden'] = [int(w)]
     models = {}
-    models['DART'] = DART(cfg['dart']).fit(
+    models['DART'] = DART(dart_cfg).fit(
         scene['tr'], seed, device,
         ckpt=os.path.join(ckpt_dir, f'dart_{name}_seed{seed}.pt'))
     if '_tr_nbr' not in scene:
@@ -70,7 +76,7 @@ def _fit_all(scene, cfg, seed, ckpt_dir, device):
     models['DARTS'] = DARTS(cfg['darts']).fit(
         scene['tr'], scene['_tr_nbr'], seed, device, ckpt=darts_ck,
         reseed=not inherit)
-    models['LRao'] = LRao(cfg['lrao']).fit(
+    models['LRao'] = LRao(lrao_cfg).fit(
         scene['tr'], seed, device,
         run_dir=os.path.join(ckpt_dir, f'lrao_{name}_seed{seed}'))
     for dname in cfg.get('deep_detectors', []):

@@ -27,8 +27,12 @@ local_scm_loading: 0.0
 amf_local_window: null      # null -> dimension-aware (15 on 103 bands, 21 on 189)
 gmm_steps: 50
 
+# Global score nets (DART, LRao): hidden width matched to the band count —
+# 128 on Pavia (103 bands), 200 on the San Diego scenes (189 bands).
+net_width: {pavia4: 128, sandiego: 200, sandiego2: 200}
+
 dart:
-  hidden: [128]
+  hidden: [128]             # overridden per scene by net_width
   activation: relu
   lr: 5.0e-4
   batch_size: 256           # PAPER Table 1 value
@@ -52,7 +56,7 @@ darts:
 
 # ---- LRao: the published lrao_val2 protocol (its paper's prescribed usage) ----
 lrao:
-  hidden: [128]             # DART's architecture
+  hidden: [128]             # DART's architecture; overridden per scene by net_width
   activation: relu
   delta_theta: 0.01
   train_sigma_cutoff: 1.0e-22
