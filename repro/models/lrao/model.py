@@ -6,7 +6,8 @@ the normalization is DIAGONAL (no decorrelation, unlike DART's ZCA) and is kept
 as two vectors rather than a matrix — trained signal-agnostically by maximizing
 the linear Fisher information:
     cost = -tr(J*) = -tr( G^T Sigma^-1 G ),  G = E[d psi/d x],
-    Sigma = cov(psi) (SVD pseudo-inverse, relative cutoff train_sigma_cutoff)
+    Sigma = cov(psi) (SVD pseudo-inverse, relative cutoff sigma_cutoff — the
+    same knob is used at training and at detection)
 with the LRao paper's prescribed usage: a val_fraction held-out split, early
 stopping on the VALIDATION cost (patience epochs without a new minimum), the
 best-validation model kept. The model, its normalization, and its scoring
@@ -77,7 +78,7 @@ class LRao:
             c = psi0 - mu
             Sigma = (c.T @ c) / max(len(batch) - 1, 1)
             U, S, Vh = torch.linalg.svd(Sigma)
-            cut = float(cfg['train_sigma_cutoff']) * S[0]
+            cut = float(cfg['sigma_cutoff']) * S[0]
             S_inv = torch.where(S > cut, 1.0 / S, torch.zeros_like(S))
             Sigma_inv = Vh.T @ torch.diag(S_inv) @ U.T
         from torch.func import jacrev, vmap
@@ -178,7 +179,7 @@ class LRao:
         mu = psi_tr.mean(axis=0)
         Sigma = (psi_tr - mu).T @ (psi_tr - mu) / max(len(ref_pixels) - 1, 1)
         U, S, Vh = _robust_svd_np(Sigma)
-        cut = float(cfg['score_sigma_cutoff']) * S[0]
+        cut = float(cfg['sigma_cutoff']) * S[0]
         S_inv = np.where(S > cut, 1.0 / S, 0.0)
         Sigma_inv = Vh.T @ np.diag(S_inv) @ U.T
         dth = float(cfg['delta_theta'])

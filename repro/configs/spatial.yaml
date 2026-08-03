@@ -59,8 +59,12 @@ lrao:
   hidden: [128]             # DART's architecture; overridden per scene by net_width
   activation: relu
   delta_theta: 0.01
-  train_sigma_cutoff: 1.0e-22
-  score_sigma_cutoff: 1.0e-3
+  sigma_cutoff: 1.0e-3      # relative SVD cutoff on cov(psi), training AND
+                            # detection. NOTE: the published lrao_val2 run used
+                            # 1e-22 in training (~ no truncation) and 1e-3 at
+                            # detection; resumed checkpoints + this value still
+                            # reproduce the published table, but a from-scratch
+                            # retrain now truncates during training too.
   detach_sigma: true
   lr: 5.0e-4
   weight_decay: 5.0e-5
