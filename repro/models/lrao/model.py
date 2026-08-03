@@ -1,9 +1,10 @@
 """class LRao — everything the learned-Rao detector is, in one file.
 
 The model (LRao paper, our published configuration): an MLP score net psi with
-a frozen ROBUST normalization first layer (mu = per-band median, W =
-diag(1/(1.4826*MAD))), trained signal-agnostically by maximizing the linear
-Fisher information:
+a frozen ROBUST normalization first layer — per-band median and 1.4826*MAD, so
+the normalization is DIAGONAL (no decorrelation, unlike DART's ZCA) and is kept
+as two vectors rather than a matrix — trained signal-agnostically by maximizing
+the linear Fisher information:
     cost = -tr(J*) = -tr( G^T Sigma^-1 G ),  G = E[d psi/d x],
     Sigma = cov(psi) (SVD pseudo-inverse, relative cutoff train_sigma_cutoff)
 with the LRao paper's prescribed usage: a val_fraction held-out split, early
@@ -25,7 +26,6 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from repro.core.data import Whitening
 from repro.core.models import _robust_svd_np
 from repro.core.seeding import seed_all
 
@@ -33,7 +33,8 @@ from repro.core.seeding import seed_all
 class LRao:
     def __init__(self, cfg):
         self.cfg = dict(cfg)
-        self.whitening = None
+        self.med = None          # per-band median      (D,)
+        self.inv_scale = None    # 1 / (1.4826 * MAD)   (D,)
         self.net = None
         self.fit_idx = None
 
@@ -50,17 +51,21 @@ class LRao:
         return nn.Sequential(*layers)
 
     @staticmethod
-    def _robust_whitening(pixels):
+    def _robust_norm(pixels):
+        """Per-band robust location/scale: median and 1/(1.4826*MAD)."""
         X = np.asarray(pixels, np.float64)
         med = np.median(X, axis=0)
         mad = np.median(np.abs(X - med), axis=0) * 1.4826
         scale = np.sqrt(np.maximum(mad ** 2, 1e-22))
-        return Whitening(med.astype(np.float32),
-                         np.diag(1.0 / scale).astype(np.float32))
+        return med.astype(np.float32), (1.0 / scale).astype(np.float32)
+
+    def normalize(self, x):
+        return (x - self.med) * self.inv_scale
 
     def psi(self, x):
-        """Score in DATA space: psi(x) = W^T net(normalize(x))."""
-        return self.net(self.whitening(x)) @ self.whitening.W
+        """Score in DATA space. The normalization is diagonal, so the chain
+        rule back to data space is the same per-band scaling."""
+        return self.net(self.normalize(x)) * self.inv_scale
 
     def _lfi_cost(self, batch):
         """-tr(G^T Sigma^-1 G) on a RAW batch (Jacobian through the frozen
@@ -89,7 +94,9 @@ class LRao:
         nv = max(1, int(len(tr) * float(cfg['val_fraction'])))
         self.fit_idx, val_idx = idx[nv:], idx[:nv]
         seed_all(seed)                                   # BEFORE construction
-        self.whitening = self._robust_whitening(tr[self.fit_idx]).to(device)
+        med, inv_scale = self._robust_norm(tr[self.fit_idx])
+        self.med = torch.tensor(med, device=device)
+        self.inv_scale = torch.tensor(inv_scale, device=device)
         self.net = self._build_net(tr.shape[1]).to(device)
         best_p = os.path.join(run_dir, 'best.pt')
         if os.path.exists(best_p):
