@@ -128,11 +128,10 @@ def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma,
 
 def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
                    delta_theta: float = 0.01,
-                   sigma_cutoff: float = 1e-3,
                    detach_sigma: bool = False) -> torch.Tensor:
     """Signal-agnostic LFI loss: maximize tr(J*) = tr(G^T Sigma^{-1} G), where
     G = E[d psi / d x] is the full Jacobian of the mean score and Sigma the score
-    covariance. Any signal H projects as J = H^T J* H at inference (no retraining).
+    covariance (full SVD pseudo-inverse — no eigenvalue truncation).
     `detach_sigma=True` stops the gradient through Sigma (stabilises training)."""
     n, d = batch.shape
     if detach_sigma:
@@ -146,8 +145,7 @@ def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
         centered = psi_0 - mu_psi
         Sigma    = (centered.T @ centered) / max(n - 1, 1)
         U, S, Vh = torch.linalg.svd(Sigma)
-        cutoff   = sigma_cutoff * S[0]
-        S_inv    = torch.where(S > cutoff, 1.0 / S, torch.zeros_like(S))
+        S_inv    = torch.where(S > 0, 1.0 / S, torch.zeros_like(S))
         Sigma_inv = Vh.T @ torch.diag(S_inv) @ U.T
 
     from torch.func import jacrev, vmap
@@ -164,8 +162,7 @@ def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
 @torch.no_grad()
 def compute_lfi_detector_scores_mode2(model: ScoreNet, train_data: np.ndarray,
                                        test_data: np.ndarray, s: np.ndarray,
-                                       delta_theta: float = 0.01,
-                                       sigma_cutoff: float = 1e-3) -> np.ndarray:
+                                       delta_theta: float = 0.01) -> np.ndarray:
     """Learned-Rao (LRao / L-LRao) one-sided LLMP statistic. The signal s enters
     only here (not during training):
         g_s = G s,   J_s = g_s^T Sigma^{-1} g_s,
@@ -187,8 +184,7 @@ def compute_lfi_detector_scores_mode2(model: ScoreNet, train_data: np.ndarray,
     n        = len(train_data)
     Sigma    = centered.T @ centered / max(n - 1, 1)
     U, S, Vh = _robust_svd_np(Sigma)
-    cutoff   = sigma_cutoff * S[0]
-    S_inv    = np.where(S > cutoff, 1.0 / S, 0.0)
+    S_inv    = np.where(S > 0, 1.0 / S, 0.0)
     Sigma_inv = Vh.T @ np.diag(S_inv) @ U.T
 
     G = np.zeros((d_out, d))

@@ -278,7 +278,6 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
             b = X_tr[perm[i:i + bs]]
             try:
                 loss = lfi_loss_mode2(model, b, cfg['lfi_delta_theta'],
-                                      cfg['lfi_sigma_cutoff'],
                                       detach_sigma=cfg['lfi_detach_sigma'])
             except Exception:
                 skipped += 1; continue
@@ -306,7 +305,6 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
                 try:
                     with torch.no_grad():
                         val_loss = lfi_loss_mode2(model, X_val, cfg['lfi_delta_theta'],
-                                                 cfg['lfi_sigma_cutoff'],
                                                  detach_sigma=True)
                     check_score = -val_loss.item()
                 except Exception:
@@ -372,8 +370,7 @@ def score_dsm_add(model, train_lat, test_lat, s_lat):
 def score_lrao(model, train_lat, test_lat, s_lat, cfg):
     return compute_lfi_detector_scores_mode2(
         model, train_lat, test_lat, s_lat,
-        delta_theta=cfg['lfi_delta_theta'],
-        sigma_cutoff=cfg['lfi_sigma_cutoff'])
+        delta_theta=cfg['lfi_delta_theta'])
 
 
 # ---------------------------------------------------------------------------
