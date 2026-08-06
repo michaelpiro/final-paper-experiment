@@ -69,8 +69,11 @@ class LRao:
         return self.net(self.normalize(x)) * self.inv_scale
 
     def _lfi_cost(self, batch):
-        """-tr(G^T Sigma^-1 G) on a RAW batch (Jacobian through the frozen
-        normalization; Sigma under no-grad when detach_sigma)."""
+        """-tr(G^T Sigma^-1 G) on a RAW batch. G by CENTRAL FINITE DIFFERENCES
+        with step cfg['delta_theta'] — the original LRao formulation (same
+        delta as the detection statistic). Sigma under no-grad when
+        detach_sigma. NOTE: the published lrao_val2 models were trained with
+        the exact-Jacobian (jacrev) variant — see git history."""
         cfg = self.cfg
         with torch.no_grad() if bool(cfg['detach_sigma']) else torch.enable_grad():
             psi0 = self.psi(batch)
@@ -80,9 +83,14 @@ class LRao:
             U, S, Vh = torch.linalg.svd(Sigma)
             S_inv = torch.where(S > 0, 1.0 / S, torch.zeros_like(S))
             Sigma_inv = Vh.T @ torch.diag(S_inv) @ U.T
-        from torch.func import jacrev, vmap
-        J_all = vmap(jacrev(lambda x: self.psi(x.unsqueeze(0)).squeeze(0)))(batch)
-        G = J_all.mean(dim=0)
+        n, d = batch.shape
+        dt = float(cfg['delta_theta'])
+        I_d = torch.eye(d, device=batch.device)
+        Xp = (batch.unsqueeze(0) + dt * I_d.unsqueeze(1)).reshape(-1, d)
+        Xm = (batch.unsqueeze(0) - dt * I_d.unsqueeze(1)).reshape(-1, d)
+        Pp = self.psi(Xp).reshape(d, n, -1).mean(dim=1)
+        Pm = self.psi(Xm).reshape(d, n, -1).mean(dim=1)
+        G = ((Pp - Pm) / (2.0 * dt)).T
         return -(G.T @ Sigma_inv @ G).trace()
 
     # ---- training (validation early stopping) ----------------------------

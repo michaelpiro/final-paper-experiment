@@ -129,10 +129,14 @@ def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma,
 def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
                    delta_theta: float = 0.01,
                    detach_sigma: bool = False) -> torch.Tensor:
-    """Signal-agnostic LFI loss: maximize tr(J*) = tr(G^T Sigma^{-1} G), where
-    G = E[d psi / d x] is the full Jacobian of the mean score and Sigma the score
-    covariance (full SVD pseudo-inverse — no eigenvalue truncation).
-    `detach_sigma=True` stops the gradient through Sigma (stabilises training)."""
+    """Signal-agnostic LFI loss: maximize tr(J*) = tr(G^T Sigma^{-1} G), with
+        G[:, j] = E[(psi(w + delta*e_j) - psi(w - delta*e_j)) / (2*delta)]
+    — CENTRAL FINITE DIFFERENCES with step delta_theta, the original LRao
+    formulation (delta_theta is a real training hyperparameter). Sigma is the
+    score covariance (full SVD pseudo-inverse — no eigenvalue truncation).
+    `detach_sigma=True` stops the gradient through Sigma (stabilises training).
+    NOTE: the published camera-ready models were trained with the exact-Jacobian
+    (jacrev) variant of this loss — see git history before this commit."""
     n, d = batch.shape
     if detach_sigma:
         ctx = torch.no_grad()
@@ -148,13 +152,16 @@ def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
         S_inv    = torch.where(S > 0, 1.0 / S, torch.zeros_like(S))
         Sigma_inv = Vh.T @ torch.diag(S_inv) @ U.T
 
-    from torch.func import jacrev, vmap
-    def _model_1d(x1d):
-        return model(x1d.unsqueeze(0)).squeeze(0)
-    def _single_jac(x):
-        return jacrev(_model_1d)(x)
-    J_all = vmap(_single_jac)(batch)        # (n, d_out, d)
-    G     = J_all.mean(dim=0)               # (d_out, d)
+    # G by central differences, vectorised over the d basis directions:
+    # perturbed inputs (d, n, d) -> one forward per sign. Gradients flow
+    # through both evaluations.
+    I_d = torch.eye(d, device=batch.device)
+    dt = float(delta_theta)
+    Xp = (batch.unsqueeze(0) + dt * I_d.unsqueeze(1)).reshape(-1, d)
+    Xm = (batch.unsqueeze(0) - dt * I_d.unsqueeze(1)).reshape(-1, d)
+    Pp = model(Xp).reshape(d, n, -1).mean(dim=1)          # (d, d_out)
+    Pm = model(Xm).reshape(d, n, -1).mean(dim=1)
+    G = ((Pp - Pm) / (2.0 * dt)).T                        # (d_out, d)
     J_star = G.T @ Sigma_inv @ G            # (d, d)
     return -J_star.trace()
 
