@@ -1,16 +1,14 @@
-# TODO: adapt to the repro run output layout before use (copied from camera_ready)
-"""camera_ready/scripts/make_figures.py — paper-ready combined figures.
+"""repro.analysis.figures — the two paper figures, from repro run outputs.
 
-One palette for every plot (extends the IID palette; deep baselines get their
-own stable colors), shared legends, print-sized fonts, no per-panel legends.
+  iid_grid(iid_root)              -> figures/iid_grid.pdf
+     reads  <iid_root>/iid_<mode>/iid_<mode>_agg_*/metrics_aggregate.json
+     (written by repro.protocols.iid.run_iid_multi_seed)
+  amp_sweep_spatial(spatial_root) -> figures/amp_sweep_spatial.pdf
+     reads  <spatial_root>/<scene>/metrics.json
+     (written by repro.protocols.spatial.run_scene)
 
-Outputs (camera_ready/figures/):
-    iid_grid.pdf         1x4: [single Pd@Pfa vs n | single vs rho |
-                               multi Pd@Pfa vs n  | multi vs rho], one legend.
-    amp_sweep_spatial.pdf 1x3: AUC vs theta (pavia4 | SD1 | SD2), 12 detectors,
-                               one two-row legend.
-
-Run: cd pythonProject && .venv/bin/python ../camera_ready/scripts/make_figures.py
+One palette for every plot, shared legends, print-sized fonts. The published
+size/style knobs are unchanged from the camera-ready figures.
 """
 
 import glob
@@ -22,23 +20,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-CR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FIG = os.path.join(CR, 'figures')
-os.makedirs(FIG, exist_ok=True)
-
-# ---- definitive LRao (lrao_val2): identical config on all scenes, 5 seeded
-# models, validation early stopping (the LRao paper's prescribed usage).
-# Overrides the sweep-run LRao (old registry recipe, single seed-42 model).
-LRAO_RUN = os.path.join(CR, 'spatial', 'lrao_val2')
-
-
-def _lrao_override(r, scn):
-    p = os.path.join(LRAO_RUN, f'metrics__{scn}.json')
-    if os.path.exists(p):
-        rows = json.load(open(p))['rows']
-        r['auc']['LRao'] = {t: [rows[t][s]['auc'] for s in sorted(rows[t])]
-                            for t in rows}
-    return r
+FIG = 'figures'
 
 
 # ---- the ONE palette (IID palette + spatial + deep; grayscale-separable) ----
@@ -109,12 +91,17 @@ def _shared_legend(fig, handles, labels, ncol, y=1.02):
 
 
 # ---------------------------------------------------------------------------
-def iid_grid():
+def iid_grid(iid_root='results', out_dir=None):
+    global FIG
+    FIG = out_dir or FIG
+    os.makedirs(FIG, exist_ok=True)
     panels = []
     for mode in ('single', 'multi'):
-        p = glob.glob(os.path.join(CR, 'iid', f'iid_{mode}',
-                                   f'iid_{mode}_agg_*', 'metrics_aggregate.json'))[0]
-        m = json.load(open(p))
+        hits = sorted(glob.glob(os.path.join(
+            iid_root, f'iid_{mode}', f'iid_{mode}_agg_*',
+            'metrics_aggregate.json')))
+        assert hits, f'no aggregate metrics for iid_{mode} under {iid_root}'
+        m = json.load(open(hits[-1]))
         panels.append((mode, m))
     order = ['AMF', 'GMM-Levin', 'L-DART', 'DART', 'L-LRao', 'LRao']
     fig, axes = plt.subplots(1, 4, figsize=IID_GRID_SIZE)
@@ -142,7 +129,10 @@ def iid_grid():
 
 
 # ---------------------------------------------------------------------------
-def amp_sweep_spatial():
+def amp_sweep_spatial(spatial_root='results/spatial', out_dir=None):
+    global FIG
+    FIG = out_dir or FIG
+    os.makedirs(FIG, exist_ok=True)
     order = ['DART', 'DART-CFAR', 'DARTS', 'DARTS-CFAR',
              'AMF-global', 'AMF-local', 'GMM-Levin', 'LRao',
              'THANTD', 'HTDNet', 'TSTTD', 'OSVAE']
@@ -150,13 +140,16 @@ def amp_sweep_spatial():
               'sandiego2': 'San Diego II'}
     fig, axes = plt.subplots(1, 3, figsize=AMP_SWEEP_SIZE, sharey=True)
     for ax, scn in zip(axes, ('pavia4', 'sandiego', 'sandiego2')):
-        r = json.load(open(os.path.join(CR, 'spatial',
-                                        f'spatial_sweep_{scn}',
-                                        'theta_results.json')))
-        r = _lrao_override(r, scn)
-        ths = [float(t) for t in r['thetas']]
-        mu = {d: [np.mean(r['auc'][d][str(t)]) for t in ths] for d in r['auc']}
-        sd = {d: [np.std(r['auc'][d][str(t)]) for t in ths] for d in r['auc']}
+        m = json.load(open(os.path.join(spatial_root, scn, 'metrics.json')))
+        ths = [float(t) for t in m['thetas']]
+        dets = sorted({d for sr in m['rows'].values()
+                       for r_ in sr.values() for d in r_})
+        au = {d: {t: [m['rows'][str(t)][sd_][d]['auc']
+                      for sd_ in m['rows'][str(t)]
+                      if d in m['rows'][str(t)][sd_]]
+                  for t in ths} for d in dets}
+        mu = {d: [np.mean(au[d][t]) for t in ths] for d in dets}
+        sd = {d: [np.std(au[d][t]) for t in ths] for d in dets}
         _plot(ax, np.array(ths), mu, sd, order)
         _style(ax, r'target amplitude $\theta$', 'AUC' if scn == 'pavia4' else '',
                title=titles[scn], xticks_at=ths)
@@ -171,183 +164,6 @@ def amp_sweep_spatial():
     print('wrote figures/amp_sweep_spatial.pdf')
 
 
-def iid_grid_v2():
-    """Variant: [vs-n single | vs-n multi | vs-rho single | vs-rho multi],
-    shared y (Pd@Pfa) across all panels -> y numbers only on the leftmost;
-    narrower figure."""
-    ms = {}
-    for mode in ('single', 'multi'):
-        p = glob.glob(os.path.join(CR, 'iid', f'iid_{mode}',
-                                   f'iid_{mode}_agg_*', 'metrics_aggregate.json'))[0]
-        ms[mode] = json.load(open(p))
-    order = ['AMF', 'GMM-Levin', 'L-DART', 'DART', 'L-LRao', 'LRao']
-    fig, axes = plt.subplots(1, 4, figsize=IID_GRID_SIZE, sharey=True,
-                             gridspec_kw=dict(wspace=0.08))
-    specs = [('single', 'vs_n', 'n_list', 'training samples $n$', 'single'),
-             ('multi',  'vs_n', 'n_list', 'training samples $n$', 'multi'),
-             ('single', 'vs_rho', 'rho_list', r'DSM noise level $\rho$', None),
-             ('multi',  'vs_rho', 'rho_list', r'DSM noise level $\rho$', None)]
-    for ax, (mode, blk, xkey, xlab, ttl) in zip(axes, specs):
-        m = ms[mode]
-        if ttl is None:                       # rho panels: show the fixed n
-            ttl = f"{mode} ($n={m['n_fixed']}$)"
-        x = np.array(m[xkey], float)
-        _plot(ax, x, {d: m[blk][d]['pd'] for d in m[blk]},
-              {d: m[blk][d].get('pd_std') for d in m[blk]}, order)
-        _style(ax, xlab, '', title=ttl, xticks_at=x)
-        if blk == 'vs_rho':                   # plain-number labels, no 10^k
-            ticks = [1e-5, 1e-3, 0.1, 1, 10]
-            ax.set_xticks(ticks)
-            ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(
-                lambda v, _: '1e-5' if v == 1e-5 else f'{v:g}'))
-            ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-    axes[0].set_ylabel(f"$P_d$ @ $P_{{fa}}$={ms['single']['pfa']}",
-                       fontsize=FS['label'])
-    h, l = axes[1].get_legend_handles_labels()
-    _shared_legend(fig, h, l, ncol=6, y=1.16)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
-    for ext in ('pdf', 'png'):
-        fig.savefig(os.path.join(FIG, f'iid_grid_v2.{ext}'), dpi=200,
-                    bbox_inches='tight')
-    plt.close(fig)
-    print('wrote figures/iid_grid_v2.pdf')
-
-
-def _amp_sweep_variant(tag, xmode):
-    """Axis variants for the spatial amplitude sweep.
-    xmode: 'linear' | 'logticks' (log + labeled ticks at a subset of tested
-    thetas) | 'sqrt' (power-0.5 scale, ticks at tested subset)."""
-    order = ['DART', 'DART-CFAR', 'DARTS', 'DARTS-CFAR',
-             'AMF-global', 'AMF-local', 'GMM-Levin', 'LRao',
-             'THANTD', 'HTDNet', 'TSTTD', 'OSVAE']
-    titles = {'pavia4': 'Pavia University', 'sandiego': 'San Diego I',
-              'sandiego2': 'San Diego II'}
-    LBL = [0.03, 0.075, 0.15, 0.3, 0.5, 0.7, 0.95]
-    fig, axes = plt.subplots(1, 3, figsize=AMP_SWEEP_SIZE, sharey=True)
-    for ax, scn in zip(axes, ('pavia4', 'sandiego', 'sandiego2')):
-        r = json.load(open(os.path.join(CR, 'spatial',
-                                        f'spatial_sweep_{scn}',
-                                        'theta_results.json')))
-        r = _lrao_override(r, scn)
-        ths = [float(t) for t in r['thetas']]
-        mu = {d: [np.mean(r['auc'][d][str(t)]) for t in ths] for d in r['auc']}
-        sd = {d: [np.std(r['auc'][d][str(t)]) for t in ths] for d in r['auc']}
-        _plot(ax, np.array(ths), mu, sd, order)
-        for v in ths:
-            ax.axvline(v, color='0.85', lw=0.7, ls='-', zorder=0)
-        if xmode == 'linear':
-            ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
-        elif xmode == 'logticks':
-            ax.set_xscale('log')
-            ax.set_xticks(LBL)
-            ax.xaxis.set_major_formatter(
-                matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:g}'))
-            ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-        elif xmode == 'sqrt':
-            ax.set_xscale('function',
-                          functions=(lambda x: np.sqrt(np.maximum(x, 0)),
-                                     lambda x: x ** 2))
-            ax.set_xticks(LBL)
-            ax.xaxis.set_major_formatter(
-                matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:g}'))
-        ax.grid(True, which='major', axis='y', alpha=0.3)
-        ax.set_xlabel(r'target amplitude $\theta$', fontsize=FS['label'])
-        ax.set_title(titles[scn], fontsize=FS['title'])
-        ax.tick_params(labelsize=FS['tick'])
-        ax.set_ylim(0.28, 1.02)
-    axes[0].set_ylabel('AUC', fontsize=FS['label'])
-    h, l = axes[0].get_legend_handles_labels()
-    _shared_legend(fig, h, l, ncol=6, y=1.07)
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
-    for ext in ('pdf', 'png'):
-        fig.savefig(os.path.join(FIG, f'amp_sweep_spatial_{tag}.{ext}'),
-                    dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f'wrote figures/amp_sweep_spatial_{tag}.pdf')
-
-
-def iid_grid_v3():
-    """Like v2 but the legend sits BELOW the panels (IEEE-ish)."""
-    ms = {}
-    for mode in ('single', 'multi'):
-        p = glob.glob(os.path.join(CR, 'iid', f'iid_{mode}',
-                                   f'iid_{mode}_agg_*', 'metrics_aggregate.json'))[0]
-        ms[mode] = json.load(open(p))
-    order = ['AMF', 'GMM-Levin', 'L-DART', 'DART', 'L-LRao', 'LRao']
-    fig, axes = plt.subplots(1, 4, figsize=IID_GRID_SIZE, sharey=True,
-                             gridspec_kw=dict(wspace=0.08))
-    specs = [('single', 'vs_n', 'n_list', 'training samples $n$', 'single'),
-             ('multi',  'vs_n', 'n_list', 'training samples $n$', 'multi'),
-             ('single', 'vs_rho', 'rho_list', r'DSM noise level $\rho$', None),
-             ('multi',  'vs_rho', 'rho_list', r'DSM noise level $\rho$', None)]
-    for ax, (mode, blk, xkey, xlab, ttl) in zip(axes, specs):
-        m = ms[mode]
-        if ttl is None:                       # rho panels: show the fixed n
-            ttl = f"{mode} ($n={m['n_fixed']}$)"
-        x = np.array(m[xkey], float)
-        _plot(ax, x, {d: m[blk][d]['pd'] for d in m[blk]},
-              {d: m[blk][d].get('pd_std') for d in m[blk]}, order)
-        _style(ax, xlab, '', title=ttl, xticks_at=x)
-        if blk == 'vs_rho':                   # plain-number labels, no 10^k
-            ticks = [1e-5, 1e-3, 0.1, 1, 10]
-            ax.set_xticks(ticks)
-            ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(
-                lambda v, _: '1e-5' if v == 1e-5 else f'{v:g}'))
-            ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-    axes[0].set_ylabel(f"$P_d$ @ $P_{{fa}}$={ms['single']['pfa']}",
-                       fontsize=FS['label'])
-    h, l = axes[1].get_legend_handles_labels()
-    fig.legend(h, l, loc='lower center', ncol=6, fontsize=FS['legend'],
-               frameon=False, bbox_to_anchor=(0.5, -0.12),
-               handletextpad=0.4, columnspacing=1.1)
-    fig.tight_layout(rect=(0, 0.04, 1, 1))
-    for ext in ('pdf', 'png'):
-        fig.savefig(os.path.join(FIG, f'iid_grid_v3.{ext}'), dpi=200,
-                    bbox_inches='tight')
-    plt.close(fig)
-    print('wrote figures/iid_grid_v3.pdf')
-
-
-def iid_grid_v4():
-    """2x2: rows = {single, multi}, cols = {vs n, vs rho}; shared axes."""
-    ms = {}
-    for mode in ('single', 'multi'):
-        p = glob.glob(os.path.join(CR, 'iid', f'iid_{mode}',
-                                   f'iid_{mode}_agg_*', 'metrics_aggregate.json'))[0]
-        ms[mode] = json.load(open(p))
-    order = ['AMF', 'GMM-Levin', 'L-DART', 'DART', 'L-LRao', 'LRao']
-    fig, axes = plt.subplots(2, 2, figsize=(6.0, 3.9), sharey=True,
-                             gridspec_kw=dict(wspace=0.06, hspace=0.42))
-    for r, mode in enumerate(('single', 'multi')):
-        m = ms[mode]
-        for c, (blk, xkey, xlab) in enumerate(
-                [('vs_n', 'n_list', 'training samples $n$'),
-                 ('vs_rho', 'rho_list', r'DSM noise level $\rho$')]):
-            ax = axes[r, c]
-            x = np.array(m[xkey], float)
-            _plot(ax, x, {d: m[blk][d]['pd'] for d in m[blk]},
-                  {d: m[blk][d].get('pd_std') for d in m[blk]}, order)
-            _style(ax, xlab if r == 1 else '', '', xticks_at=x)
-            if r == 0:
-                ax.set_title(['vs $n$', 'vs $\\rho$'][c], fontsize=FS['title'])
-        axes[r, 0].set_ylabel(f"{mode}\n$P_d$ @ $P_{{fa}}$={m['pfa']}",
-                              fontsize=FS['label'])
-    h, l = axes[1, 0].get_legend_handles_labels()
-    _shared_legend(fig, h, l, ncol=6, y=1.02)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    for ext in ('pdf', 'png'):
-        fig.savefig(os.path.join(FIG, f'iid_grid_v4.{ext}'), dpi=200,
-                    bbox_inches='tight')
-    plt.close(fig)
-    print('wrote figures/iid_grid_v4.pdf')
-
-
 if __name__ == '__main__':
     iid_grid()
-    iid_grid_v2()
-    iid_grid_v3()
-    iid_grid_v4()
     amp_sweep_spatial()
-    for tag, xm in (('linear', 'linear'), ('logticks', 'logticks'),
-                    ('sqrt', 'sqrt')):
-        _amp_sweep_variant(tag, xm)
