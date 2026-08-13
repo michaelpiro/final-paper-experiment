@@ -56,8 +56,127 @@ def _robust_svd_np(A: np.ndarray):
 
 
 # ---------------------------------------------------------------------------
+# Regularized inverse of the score covariance cov(psi), shared by the LFI
+# training losses and the detection statistic. The `method` axis is the
+# no-reg / truncation / shrinkage ablation:
+#   'none'      full SVD pseudo-inverse (1/S wherever S>0) — current code; the
+#               general Eq.(5) inverse, but blows up when n < d (rank-deficient)
+#   'truncate'  drop eigenvalues below cutoff*S_max (the PUBLISHED LRao regulariser)
+#   'shrink'    Ledoit-Wolf shrinkage toward a scaled identity (data-driven,
+#               n-adaptive; the paper-faithful "structured covariance" analogue)
+# ---------------------------------------------------------------------------
+def regularized_sigma_inv_torch(centered: torch.Tensor, method: str = 'none',
+                                cutoff: float = 1e-3) -> torch.Tensor:
+    """Sigma^{-1} from CENTERED samples (n, d), torch. See module note above.
+
+    'shrink' is a fully DIFFERENTIABLE Ledoit-Wolf here (torch, matches sklearn to
+    ~1e-8): shrinking toward a scaled identity makes Sigma well-conditioned, so
+    torch.linalg.inv has a stable backward — unlike the SVD pseudo-inverse of
+    'none'/'truncate', whose backward is ill-defined at (near-)zero singular
+    values. That matters only when the gradient flows through Sigma
+    (detach_sigma=False), i.e. the signal-aware LFI loss: shrink is the reliable
+    choice there; none/truncate should be run detached."""
+    n, d = centered.shape
+    if method == 'shrink':
+        I = torch.eye(d, dtype=centered.dtype, device=centered.device)
+        S = (centered.T @ centered) / max(n, 1)            # LW convention: /n
+        m = torch.trace(S) / d
+        d2 = ((S - m * I) ** 2).sum()
+        x2 = (centered ** 2).sum(dim=1)
+        b_bar2 = ((x2 ** 2).sum() - 2.0 * ((centered @ S) * centered).sum()
+                  + n * (S * S).sum()) / (n ** 2)
+        delta = torch.clamp(torch.clamp(b_bar2, max=d2) / (d2 + 1e-30), 0.0, 1.0)
+        Sigma = (1.0 - delta) * S + delta * m * I
+        return torch.linalg.inv(Sigma)
+    Sigma = (centered.T @ centered) / max(n - 1, 1)
+    U, S, Vh = torch.linalg.svd(Sigma)
+    thr = (float(cutoff) * S[0]) if method == 'truncate' else \
+        torch.zeros((), dtype=S.dtype, device=S.device)
+    S_inv = torch.where(S > thr, 1.0 / S, torch.zeros_like(S))
+    return Vh.T @ torch.diag(S_inv) @ U.T
+
+
+def regularized_sigma_inv_np(centered: np.ndarray, method: str = 'none',
+                             cutoff: float = 1e-3) -> np.ndarray:
+    """Sigma^{-1} from CENTERED samples (n, d), numpy. See module note above."""
+    centered = np.asarray(centered, np.float64)
+    n = len(centered)
+    if method == 'shrink':
+        from sklearn.covariance import ledoit_wolf
+        cov, _lam = ledoit_wolf(centered, assume_centered=True)
+        return np.linalg.inv(cov)
+    Sigma = centered.T @ centered / max(n - 1, 1)
+    U, S, Vh = _robust_svd_np(Sigma)
+    thr = float(cutoff) * S[0] if method == 'truncate' else 0.0
+    S_inv = np.where(S > thr, 1.0 / S, 0.0)
+    return Vh.T @ np.diag(S_inv) @ U.T
+
+
+# ---------------------------------------------------------------------------
 # Global score network (DART / L-DART; also the learned-Rao backbone)
 # ---------------------------------------------------------------------------
+
+class _MixtureScoreNet(nn.Module):
+    """Mixture-of-affine-experts score net (the natural GMM-score model).
+
+    Operates in WHITENED space (d -> d). The score of a Gaussian mixture is a
+    responsibility-weighted sum of affine (per-component Gaussian) scores:
+
+        psi(w) = sum_k g_k(w) * (a_k ⊙ w + b_k),   g(w) = softmax(gate(w)),
+
+    with K diagonal-affine experts and a small MLP gate. Every expert slope is
+    initialised a_k = -1 (b_k = 0) so the net STARTS at the white Gaussian score
+    -w; the gate learns the soft cluster assignment. Lightweight (K*2d + a tiny
+    gate) and carries score magnitude (no normalisation), so it suits few-sample,
+    multimodal HSI clutter.
+    """
+
+    def __init__(self, d: int, n_experts: int, gate_hidden: int, act_cls):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(d, gate_hidden), act_cls(),
+            nn.Linear(gate_hidden, n_experts),
+        )
+        self.a = nn.Parameter(-torch.ones(n_experts, d)
+                              + 0.01 * torch.randn(n_experts, d))
+        self.b = nn.Parameter(torch.zeros(n_experts, d))
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        g = torch.softmax(self.gate(w), dim=-1)            # (B, K)
+        experts = w.unsqueeze(1) * self.a + self.b         # (B, K, d)
+        return (g.unsqueeze(-1) * experts).sum(1)          # (B, d)
+
+
+class _ResidualScoreNet(nn.Module):
+    """Pre-norm residual MLP score net with a learnable affine skip.
+
+    Runs in WHITENED space (d -> d). Pre-norm residual blocks give stable
+    gradients; a learnable global affine skip  a ⊙ w + b  (residual branch
+    zero-initialised, a=-1, b=0) starts the net at the white Gaussian score -w,
+    so it only learns the non-Gaussian correction.
+    """
+
+    def __init__(self, d: int, width: int, n_blocks: int, act_cls):
+        super().__init__()
+        self.inp = nn.Linear(d, width)
+        self.blocks = nn.ModuleList(
+            nn.Sequential(nn.LayerNorm(width),
+                          nn.Linear(width, width), act_cls(),
+                          nn.Linear(width, width))
+            for _ in range(n_blocks)
+        )
+        self.out = nn.Linear(width, d)
+        self.a = nn.Parameter(-torch.ones(d))      # affine skip: start at -w
+        self.b = nn.Parameter(torch.zeros(d))
+        nn.init.zeros_(self.out.weight)             # residual branch starts at 0
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        h = self.inp(w)
+        for blk in self.blocks:
+            h = h + blk(h)
+        return self.out(h) + (self.a * w + self.b)
+
 
 class ScoreNet(nn.Module):
     """Score network psi(x): R^d -> R^d trained by denoising score matching.
@@ -69,22 +188,38 @@ class ScoreNet(nn.Module):
 
     hidden_dims=[]    -> linear/affine score  (L-DART, L-LRao)
     hidden_dims=[h]   -> one-hidden-layer MLP (DART, LRao)
+
+    arch : score-net family (the DART-pipeline architecture ablation axis).
+      'mlp' (default)  — plain feed-forward MLP (the published DART / L-DART).
+      'mixture'/'moe'  — mixture of affine experts (_MixtureScoreNet); n_experts
+                         from `n_experts`, gate width from max(hidden_dims).
+      'resmlp'         — pre-norm residual MLP + affine skip (_ResidualScoreNet).
     """
 
     def __init__(self, input_dim: int, hidden_dims: list = None,
-                 activation: str = "silu", whitening=None):
+                 activation: str = "silu", whitening=None,
+                 arch: str = "mlp", n_experts: int = 16):
         super().__init__()
         if hidden_dims is None:
             hidden_dims = []
-        act_map = {"silu": nn.SiLU, "relu": nn.ReLU, "tanh": nn.Tanh}
+        act_map = {"silu": nn.SiLU, "relu": nn.ReLU, "tanh": nn.Tanh,
+                   "gelu": nn.GELU}
         act_cls = act_map[activation]
-        dims = [input_dim] + list(hidden_dims) + [input_dim]
-        layers = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(act_cls())
-        self.net = nn.Sequential(*layers)
+        self.arch = arch
+        gate_hidden = int(max(hidden_dims)) if len(hidden_dims) else 64
+        if arch in ("mixture", "moe"):
+            self.net = _MixtureScoreNet(input_dim, n_experts, gate_hidden, act_cls)
+        elif arch in ("resmlp", "residual") and len(hidden_dims) > 0:
+            self.net = _ResidualScoreNet(input_dim, int(max(hidden_dims)),
+                                         len(hidden_dims), act_cls)
+        else:                                       # plain MLP (default)
+            dims = [input_dim] + list(hidden_dims) + [input_dim]
+            layers = []
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1]))
+                if i < len(dims) - 2:
+                    layers.append(act_cls())
+            self.net = nn.Sequential(*layers)
         self.whitening = whitening
 
     def whiten(self, x: torch.Tensor) -> torch.Tensor:
@@ -102,18 +237,25 @@ class ScoreNet(nn.Module):
 
 
 def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma,
-             weighted: bool = False) -> torch.Tensor:
+             weighted: bool = False, noise=None) -> torch.Tensor:
     """DSM objective: E[||psi(w~) - (w - w~)/sigma^2||^2], w~ = w + sigma*eps.
 
     sigma may be a scalar (isotropic) or a (d,) per-band vector. If the net has a
     frozen whitening front-end, the noise is added in WHITENED space and the inner
     net is scored directly.
+
+    noise : optional FIXED unit-N(0,1) tensor (same shape as the whitened batch).
+        If given it is used instead of drawing fresh noise — this lets a caller
+        (e.g. validation) compute a deterministic loss WITHOUT touching the global
+        RNG, so it cannot perturb the training noise stream (matters on MPS, whose
+        RNG is not covered by get/set_rng_state).
     """
     if not torch.is_tensor(sigma):
         sigma = torch.as_tensor(sigma, dtype=batch.dtype, device=batch.device)
     w = model.whiten(batch) if hasattr(model, "whiten") else batch
     inner = model.net if hasattr(model, "net") else model
-    eps = torch.randn_like(w) * sigma
+    z = torch.randn_like(w) if noise is None else noise.to(dtype=w.dtype, device=w.device)
+    eps = z * sigma
     w_tilde = w + eps
     target = -eps / (sigma ** 2)
     se = (inner(w_tilde) - target) ** 2
@@ -128,11 +270,15 @@ def dsm_loss(model: ScoreNet, batch: torch.Tensor, sigma,
 
 def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
                    delta_theta: float = 0.01,
-                   detach_sigma: bool = False) -> torch.Tensor:
+                   detach_sigma: bool = False,
+                   sigma_reg: str = 'none',
+                   sigma_cutoff: float = 1e-3) -> torch.Tensor:
     """Signal-agnostic LFI loss: maximize tr(J*) = tr(G^T Sigma^{-1} G), where
     G = E[d psi / d x] is the full Jacobian of the mean score and Sigma the score
-    covariance (full SVD pseudo-inverse — no eigenvalue truncation).
-    `detach_sigma=True` stops the gradient through Sigma (stabilises training)."""
+    covariance. `detach_sigma=True` stops the gradient through Sigma. `sigma_reg`
+    selects the covariance-inverse regulariser (none / truncate / shrink — see
+    regularized_sigma_inv_torch); `sigma_cutoff` is the relative eigenvalue floor
+    used by 'truncate'."""
     n, d = batch.shape
     if detach_sigma:
         ctx = torch.no_grad()
@@ -140,13 +286,9 @@ def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
         import contextlib
         ctx = contextlib.nullcontext()
     with ctx:
-        psi_0    = model(batch)
-        mu_psi   = psi_0.mean(dim=0)
-        centered = psi_0 - mu_psi
-        Sigma    = (centered.T @ centered) / max(n - 1, 1)
-        U, S, Vh = torch.linalg.svd(Sigma)
-        S_inv    = torch.where(S > 0, 1.0 / S, torch.zeros_like(S))
-        Sigma_inv = Vh.T @ torch.diag(S_inv) @ U.T
+        psi_0     = model(batch)
+        centered  = psi_0 - psi_0.mean(dim=0)
+        Sigma_inv = regularized_sigma_inv_torch(centered, sigma_reg, sigma_cutoff)
 
     from torch.func import jacrev, vmap
     def _model_1d(x1d):
@@ -159,10 +301,55 @@ def lfi_loss_mode2(model: ScoreNet, batch: torch.Tensor,
     return -J_star.trace()
 
 
+def lfi_loss_mode2_signal_aware(model: ScoreNet, batch: torch.Tensor,
+                                s_dir: torch.Tensor, delta_theta: float = 0.01,
+                                detach_sigma: bool = False,
+                                sigma_reg: str = 'none',
+                                sigma_cutoff: float = 1e-3) -> torch.Tensor:
+    """Signal-AWARE LFI loss: maximize the scalar J_s = g_s^T Sigma^{-1} g_s,
+    where g_s = d mu_psi / d theta along the (unit) signal direction `s_dir`
+    (l = 1 column) — the paper's signal-aware objective specialized to the single
+    known HSI target signature. Covariance is GENERAL (no DFT); `sigma_reg`
+    selects its inverse regulariser (none / truncate / shrink).
+
+    Two things are load-bearing here (both fixed after a bug where signal-aware
+    training never improved past epoch 1, worst on multi):
+      * g_s is the EXACT directional derivative via forward-mode AD (jvp), not a
+        finite difference. `delta_theta` is unused (kept for signature compat).
+      * `detach_sigma=False` by default. J_s is scale-invariant in psi, so with
+        Sigma DETACHED the gradient only sees g_s and just tries to inflate psi
+        (which inflates Sigma too) — a useless direction, and for a single
+        column there is no trace-averaging to rescue it, so J_s never climbs.
+        Letting the gradient flow through Sigma optimises the true objective.
+
+    `s_dir` should be unit-norm: its scale cancels in the exact objective, but
+    the natural (large) signature magnitude interacts badly with grad clipping."""
+    if not torch.is_tensor(s_dir):
+        s_dir = torch.as_tensor(s_dir, dtype=batch.dtype, device=batch.device)
+    s_dir = s_dir.reshape(1, -1).to(batch.dtype)
+    if detach_sigma:
+        ctx = torch.no_grad()
+    else:
+        import contextlib
+        ctx = contextlib.nullcontext()
+    with ctx:
+        psi_0     = model(batch)
+        centered  = psi_0 - psi_0.mean(dim=0)
+        Sigma_inv = regularized_sigma_inv_torch(centered, sigma_reg, sigma_cutoff)
+    # exact d mu_psi / d theta along s_dir (forward-mode AD, l = 1)
+    from torch.func import jvp
+    _, jac_vec = jvp(lambda x: model(x), (batch,), (s_dir.expand_as(batch),))
+    g_s = jac_vec.mean(dim=0)
+    J_s = g_s @ Sigma_inv @ g_s
+    return -J_s
+
+
 @torch.no_grad()
 def compute_lfi_detector_scores_mode2(model: ScoreNet, train_data: np.ndarray,
                                        test_data: np.ndarray, s: np.ndarray,
-                                       delta_theta: float = 0.01) -> np.ndarray:
+                                       delta_theta: float = 0.01,
+                                       sigma_reg: str = 'none',
+                                       sigma_cutoff: float = 1e-3) -> np.ndarray:
     """Learned-Rao (LRao / L-LRao) one-sided LLMP statistic. The signal s enters
     only here (not during training):
         g_s = G s,   J_s = g_s^T Sigma^{-1} g_s,
@@ -179,13 +366,9 @@ def compute_lfi_detector_scores_mode2(model: ScoreNet, train_data: np.ndarray,
     d_out  = psi_tr.shape[1]
     if not np.all(np.isfinite(psi_tr)):
         return np.zeros(len(test_data), dtype=np.float32)
-    mu       = psi_tr.mean(axis=0)
-    centered = psi_tr - mu
-    n        = len(train_data)
-    Sigma    = centered.T @ centered / max(n - 1, 1)
-    U, S, Vh = _robust_svd_np(Sigma)
-    S_inv    = np.where(S > 0, 1.0 / S, 0.0)
-    Sigma_inv = Vh.T @ np.diag(S_inv) @ U.T
+    mu        = psi_tr.mean(axis=0)
+    centered  = psi_tr - mu
+    Sigma_inv = regularized_sigma_inv_np(centered, sigma_reg, sigma_cutoff)
 
     G = np.zeros((d_out, d))
     for j in range(d):

@@ -30,7 +30,7 @@ def partial_auc(labels: np.ndarray, scores: np.ndarray, fpr_max: float = 0.05) -
     mask = fpr <= fpr_max
     fpr_cut = np.append(fpr[mask], fpr_max)
     tpr_cut = np.append(tpr[mask], tpr_at_max)
-    return float(np.trapz(tpr_cut, fpr_cut)) / fpr_max
+    return float(np.trapezoid(tpr_cut, fpr_cut)) / fpr_max
 
 
 def dr_at_fpr(labels: np.ndarray, scores: np.ndarray,

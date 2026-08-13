@@ -46,11 +46,21 @@ def amf(test_data: np.ndarray, train_data: np.ndarray, s: np.ndarray,
     # vs-n experiment is designed to show is fully expressed, not masked.
     # Do NOT raise this default: any larger floor IS diagonal loading and
     # hides exactly the collapse being measured.
-
-    # eigv = np.clip(eigv, eigv.max() * float(eig_floor), None)
+    #
+    # The floor must be STRICTLY POSITIVE. Without it, the numerically-zero
+    # eigenvalues that come back NEGATIVE invert to large negative weights, so
+    # s^T Sigma^-1 s (a quadratic form that is >= 0 for any PSD Sigma) can come
+    # out negative and the sqrt below returns NaN -- which showed up as
+    # "RuntimeWarning: invalid value encountered in sqrt" and a missing AMF
+    # point for every n <= D. Clipping only removes that sign artefact: the
+    # magnitudes, and hence the collapse, are untouched.
+    lam_max = float(eigv.max())
+    if not np.isfinite(lam_max) or lam_max <= 0:      # degenerate (n == 1, or all-constant)
+        return np.zeros(len(test_data), dtype=np.float64)
+    eigv = np.clip(eigv, lam_max * float(eig_floor), None)
     Si   = eigvec @ np.diag(1.0 / eigv) @ eigvec.T
     Si_s = Si @ s
-    norm = np.sqrt(float(s @ Si_s) + 1e-18)
+    norm = np.sqrt(max(float(s @ Si_s), 0.0) + 1e-6)
     return (test_data - mu) @ Si_s / norm
 
 

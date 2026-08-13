@@ -18,6 +18,8 @@ compute_signature / generate_random_boxes / scores_to_spatial_map — spatial he
 _crop_pca_box / _crop_raw_box / make_whitening / whitened_sigma — spatial crop helpers
 """
 
+import os
+
 import numpy as np
 import scipy.io
 import torch
@@ -35,18 +37,58 @@ CLS_NAMES = {
 # Loading
 # ---------------------------------------------------------------------------
 
-def load_hsi(path: str):
+def load_hsi(path: str, gt_path: str = None):
     """Load a .mat hyperspectral dataset. Returns the RAW cube (no normalization).
+
+    The repackaged datasets in repro/data store the cube under 'data' and the
+    labels under 'map', and that fast path is unchanged. Datasets distributed in
+    their original form (Salinas, Indian Pines, ...) instead name the arrays
+    after the scene and ship the labels in a SEPARATE `*_gt.mat`, so if 'data' /
+    'map' are absent we fall back to picking the only 3-D array as the cube and
+    the only 2-D integer array as the labels, looking in `gt_path` (or a sibling
+    `<stem>_gt.mat`) when the cube file has no labels of its own.
 
     Returns
     -------
     data : (H, W, B) float64 — raw sensor values
     gt   : (H, W)    int     — ground-truth class labels (0 = unlabeled)
     """
-    mat  = scipy.io.loadmat(path)
-    data = mat['data'].astype(np.float64)
-    gt   = mat['map'].astype(int)
-    return data, gt
+    if not os.path.exists(path):          # tolerate a missing 'repro/' prefix
+        alt = os.path.join('repro', path)
+        if os.path.exists(alt):
+            path = alt
+    mat = scipy.io.loadmat(path)
+    if 'data' in mat and 'map' in mat:                       # repackaged (fast path)
+        return mat['data'].astype(np.float64), mat['map'].astype(int)
+
+    def _arrays(m, ndim):
+        return [v for k, v in m.items()
+                if not k.startswith('__') and getattr(v, 'ndim', 0) == ndim]
+
+    cubes = _arrays(mat, 3)
+    if len(cubes) != 1:
+        raise ValueError(f"{path}: expected exactly one 3-D cube, found {len(cubes)}")
+    data = cubes[0].astype(np.float64)
+
+    labels = _arrays(mat, 2)
+    if not labels:                                           # labels live elsewhere
+        if gt_path is None:
+            stem = os.path.splitext(path)[0]
+            for cand in (f'{stem}_gt.mat', f'{stem.replace("_corrected", "")}_gt.mat'):
+                if os.path.exists(cand):
+                    gt_path = cand
+                    break
+        if gt_path is None or not os.path.exists(gt_path):
+            raise ValueError(f"{path}: no label array here and no *_gt.mat alongside; "
+                             f"pass gt_path explicitly")
+        labels = _arrays(scipy.io.loadmat(gt_path), 2)
+        if not labels:
+            raise ValueError(f"{gt_path}: no 2-D label array found")
+    gt = max(labels, key=lambda a: a.size)                   # the full-scene map
+    if gt.shape != data.shape[:2]:
+        raise ValueError(f"{path}: label map {gt.shape} does not match cube "
+                         f"{data.shape[:2]}")
+    return data, gt.astype(int)
 
 
 # ---------------------------------------------------------------------------
@@ -142,25 +184,56 @@ class Whitening(nn.Module):
         return (np.asarray(s, dtype=np.float32) @ Wn.T).astype(np.float32)
 
     @classmethod
-    def from_data(cls, X: np.ndarray, eig_floor: float = 0.0, eps: float = 1e2):
-        """Fit a frozen ZCA whitener from background pixels X.
+    def from_data(cls, X: np.ndarray, eig_floor: float = 0.0, eps: float = 1e2,
+                  mode: str = 'zca'):
+        """Fit a frozen linear whitener from background pixels X.
 
         eig_floor : relative eigenvalue floor (x lambda_max). 0 -> auto 1e-5.
         eps       : absolute minimum floor (raw sensor values are large, so the
                     default is intentionally O(1e2)).
+        mode      : linear front-end (all return a square D->D Whitening, so they
+                    are drop-in for one another and carry a signature direction
+                    through transform_direction):
+                      'zca'       W = V Λ^{-1/2} Vᵀ  (symmetric; DEFAULT — closest
+                                  to the original axes; cov(output)=I).
+                      'pca'       W = Λ^{-1/2} Vᵀ    (rotate to the eigenbasis).
+                      'cholesky'  W = L^{-1}, Σ = L Lᵀ.
+                      'normalize' W = diag(1/σ_b)    (per-channel standardization
+                                  only — centers + unit-variances each band but
+                                  keeps cross-band correlations; diagonal W, so no
+                                  eigendecomposition/LAPACK is used).
         """
         X = np.asarray(X, dtype=np.float64)
         n, D = X.shape
         mu = X.mean(0)
         Xc = X - mu
+
+        if mode == 'normalize':
+            std = Xc.std(0)
+            floor = max(float(np.max(std)) * (eig_floor if eig_floor > 0 else 1e-5),
+                        np.sqrt(eps))
+            std = np.clip(std, floor, None)
+            W = np.diag(1.0 / std)                  # diagonal, no decorrelation
+            return cls(mu.astype(np.float32), W.astype(np.float32))
+
         Sigma = (Xc.T @ Xc) / max(n - 1, 1)
         Sigma = (Sigma + Sigma.T) / 2
+        if mode == 'cholesky':
+            rel = eig_floor if eig_floor > 0 else 1e-5
+            floor = max(float(np.trace(Sigma) / D) * rel, eps)
+            L = np.linalg.cholesky(Sigma + floor * np.eye(D))
+            W = np.linalg.inv(L)                    # cov(Wx) = I
+            return cls(mu.astype(np.float32), W.astype(np.float32))
+
         evals, evecs = np.linalg.eigh(Sigma)        # ascending
         rel = eig_floor if eig_floor > 0 else 1e-5
         floor = max(float(evals[-1]) * rel, eps)
         evals = np.clip(evals, floor, None)
         inv_sqrt = np.diag(1.0 / np.sqrt(evals))
-        W = evecs @ inv_sqrt @ evecs.T              # ZCA (symmetric)
+        if mode == 'pca':
+            W = inv_sqrt @ evecs.T                  # rotate to eigenbasis
+        else:                                       # 'zca' (default)
+            W = evecs @ inv_sqrt @ evecs.T          # ZCA (symmetric)
         return cls(mu.astype(np.float32), W.astype(np.float32))
 
 
