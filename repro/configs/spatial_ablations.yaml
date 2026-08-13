@@ -1,0 +1,549 @@
+# Ablation plan for the SPATIAL experiment.
+#
+# Same shape as iid_{single,multi}_ablations.yaml: this is NOT a flat spatial
+# config, it is a PLAN consumed by run_spatial_ablation.py, which loads `base`
+# and then runs the spatial protocol once per entry under `ablations`, merging
+#     {base < lean (unless --full) < common < entry}
+# and writing to results_root/<entry-name>/.
+#
+# HOW AN ENTRY IS MERGED — spatial.yaml is block-structured, so an entry key is
+# either a BLOCK name (dart / darts / lrao / deep), whose value is merged INTO
+# that block, or any other key, which is set at the TOP level:
+#
+#   my_entry:
+#     dart:              # merged into the `dart:` block
+#       dsm_variant: calibrated
+#     thetas: [0.15]     # top-level key, replaced outright
+#
+# ---------------------------------------------------------------------------
+# WHAT YOU CAN PUT IN A `dart:` / `darts:` BLOCK
+#
+#   dsm_variant     published (default, the paper's trainer)
+#                 | calibrated (repro.models.dart|darts.calibrated) — unlocks
+#                   everything below; without it the keys below are ignored.
+#   whiten_mode     zca (published) | normalize | shrink | vicreg | wmw
+#                 | pca | cholesky | mad | iqr
+#   shrink_space    corr | cov      (only for whiten_mode: shrink)
+#   shrink_lam      float           lam->0 is ZCA; for 'corr', lam->inf is
+#                                   'normalize'. lam~2 matched VICReg on IID.
+#   dsm_sigma_rho   a NUMBER (sigma = sqrt(rho)), or a rule name:
+#                   lw | eff | eff2 | n16 | dn16 | auto | auto-sm | detval
+#   dsm_auto_budget true -> derive batch/epochs/lr from n (dsm_target_steps,
+#                   dsm_min_bs, dsm_max_bs, dsm_min_epochs, dsm_max_epochs,
+#                   dsm_ref_bs). false -> use the block's batch_size/epochs/lr.
+#   dsm_val_frac    held-out fraction for the best-epoch monitor (0 = off)
+#   dsm_scheduler   cosine (default) | plateau | none
+#   dsm_arch        mlp | mixture | resmlp        (DART only)
+#
+# WHAT YOU CAN PUT IN THE `lrao:` BLOCK
+#
+#   variant           published (default) | configurable — unlocks the four axes
+#                     below (repro.models.lrao.configurable.ConfigurableLRao).
+#                     The published spatial LRao hard-codes all four.
+#   lrao_preproc      robust (published spatial per-band median/MAD)
+#                   | mad (the paper's single GLOBAL scalar)
+#                   | whiten (our ZCA) | iqr
+#                   | dart  (whatever whiten_mode the dart block uses — for a
+#                            front-end-matched DART-vs-LRao comparison)
+#   lrao_net          mlp (ours) | cnn (the paper's 1-D CNN, TrafoScore)
+#   lrao_signal_aware false (agnostic tr(J*)) | true (maximise J_s along the
+#                     known signature). When true, model selection switches to
+#                     held-out DETECTION AUC (lrao_det_val), because J_s and AUC
+#                     anti-correlate for the low-capacity CNN.
+#   lfi_sigma_reg     none (pseudo-inverse, published) | truncate | shrink
+#   lfi_sigma_cutoff  relative eigenvalue floor used by `truncate`
+#
+# These are the SAME names and semantics as the IID plans, so an entry of the
+# same name means the same thing in both protocols.
+#
+# NOTE the architecture keys (dart.hidden, darts.d_lat/K/enc_hidden/
+# score_hidden) are the MODELS' identity, not part of the calibrated recipe.
+# Change them only if the architecture is what you are ablating.
+#
+# ---------------------------------------------------------------------------
+# READ BEFORE ABLATING DARTS' FRONT-END. DARTS is measured to PREFER the
+# published ZCA front (WMW handoff Sec. 2.6): its latent-kNN conditioning already
+# carries the background's mode structure, so a front-end that leaves that
+# structure in the input corrupts the neighbour metric — harm grew monotonically
+# with it and no k beat ZCA at 5000 epochs. So unlike DART, where dropping full
+# whitening was the win, here it may be the loss. `darts_calibrated_zca` keeps
+# ZCA and changes only the TRAINING recipe, so the two effects can be separated:
+#     darts_calibrated_zca > baseline   -> the training recipe helps
+#     darts_calibrated < darts_calibrated_zca -> the front-end change hurts
+
+base: repro/configs/spatial.yaml
+results_root: results/spatial_ablation
+
+# Applied to EVERY entry (merged before the entry's own overrides).
+# `lrao.lfi_sigma_reg: shrink` mirrors the IID plans. The published spatial
+# default is 'none' (full pseudo-inverse); that is fine detached, but the
+# signal-aware objective differentiates THROUGH Sigma, where the pseudo-inverse
+# backward is ill-defined and detection AUC then swings ~+-.05 between epochs
+# with no trend. ConfigurableLRao promotes 'none' -> 'shrink' for signal-aware
+# anyway, but setting it here keeps every LRao entry on one regulariser so the
+# ablations stay comparable. The `lrao_reg_*` entries below flip it back.
+common:
+  lrao:
+    lfi_sigma_reg: shrink
+    lrao_input_norm: robust   # as in the IID plans, so `lrao_preproc: whiten`
+                              # resolves to robust-IQR in BOTH protocols
+
+# Quick-run overrides, applied unless you pass --full. Edit freely: this is the
+# knob that decides whether a sweep takes minutes or many hours.
+lean:
+  scenes: [pavia4]
+  seeds: [42, 43, 44, 45]
+  thetas: [0.075, 0.15, 0.3]
+  deep_detectors: []          # skip the checkpoint-loaded deep baselines
+
+# The calibrated recipe, kept here once and YAML-anchored so the entries below
+# stay short. Values are the IID-calibrated ones (corr-shrink lam=2, rho=0.01).
+_calibrated: &calibrated
+  dsm_variant: calibrated
+  whiten_mode: shrink
+  shrink_space: corr          # REQUIRED — the default 'cov' family is much worse
+  shrink_lam: 2
+  dsm_sigma_rho: g       # sigma = 0.50; see the note above
+  dsm_sigma_g: 0.5
+  dsm_epochs: 5000
+  dsm_auto_budget: true
+  dsm_val_frac: 0.1
+  dsm_target_steps: 40000
+  dsm_max_epochs: 5000
+
+ablations:
+  # the published DART / DARTS / LRao — the reference curves
+  baseline: {}
+
+  # calibrated DART only; DARTS and LRao stay published
+  dart_calibrated:
+    dart:
+      <<: *calibrated
+      dsm_arch: mlp
+      dsm_ref_bs: 256
+
+  # calibrated DARTS only, WITH the front-end change (the genuine test)
+  darts_calibrated:
+    darts:
+      <<: *calibrated
+      dsm_ref_bs: 512
+
+  # calibrated DARTS, published ZCA front kept -> isolates the training recipe
+  dart_darts_calibrated_zca:
+    dart:
+      dsm_variant: calibrated
+      whiten_mode: zca
+      dsm_sigma_rho: 0.1
+      dsm_auto_budget: true
+      dsm_val_frac: 0.1
+      dsm_epochs: 10000
+      dsm_target_steps: 20000
+      dsm_max_epochs: 3000
+      dsm_ref_bs: 256
+    darts:
+      dsm_variant: calibrated
+      whiten_mode: zca
+      dsm_sigma_rho: 0.1
+      dsm_auto_budget: true
+      dsm_val_frac: 0.1
+      dsm_epochs: 10000
+      dsm_target_steps: 20000
+      dsm_max_epochs: 3000
+      dsm_ref_bs: 512
+
+  # both score detectors calibrated
+  both_calibrated:
+    dart:
+      <<: *calibrated
+      dsm_ref_bs: 256
+    darts:
+      <<: *calibrated
+      dsm_ref_bs: 512
+
+  # ---- front-end sweep on DART (everything else fixed) --------------------
+  dart_normalize:
+    dart: {dsm_variant: calibrated, whiten_mode: normalize, dsm_sigma_rho: 0.01,
+           dsm_auto_budget: true, dsm_val_frac: 0.1, dsm_ref_bs: 256}
+  dart_vicreg:
+    dart: {dsm_variant: calibrated, whiten_mode: vicreg, dsm_sigma_rho: 0.01,
+           dsm_auto_budget: true, dsm_val_frac: 0.1, dsm_ref_bs: 256}
+  dart_wmw:
+    dart: {dsm_variant: calibrated, whiten_mode: wmw, wmw_k: null,
+           dsm_sigma_rho: 0.01, dsm_auto_budget: true, dsm_val_frac: 0.1,
+           dsm_ref_bs: 256}
+  dart_wmw_dn16:
+    dart: { dsm_variant: calibrated, whiten_mode: wmw, wmw_k: null,
+            dsm_sigma_rho: dn16, dsm_auto_budget: true, dsm_val_frac: 0.1,
+            dsm_ref_bs: 256 }
+    darts: { dsm_variant: calibrated, whiten_mode: wmw, wmw_k: null,
+            dsm_sigma_rho: dn16, dsm_auto_budget: true, dsm_val_frac: 0.1,
+            dsm_ref_bs: 512 }
+
+  # ---- LRao ablations (the spatial twin of the IID lrao_* entries) --------
+  # (1) faithful to the paper, general covariance: paper CNN + global MAD +
+  #     signal-aware. The reference the LRao paper's own numbers correspond to.
+  lrao_paper_general:
+    lrao: {variant: configurable, lrao_net: cnn, lrao_preproc: mad,
+           lrao_signal_aware: true}
+  # (2) = (1) but OUR preprocessing
+  lrao_paper_general_ourprep:
+    lrao: {variant: configurable, lrao_net: cnn, lrao_preproc: whiten,
+           lrao_signal_aware: true}
+  # (3) = (1) but signal-agnostic (isolates the objective)
+  lrao_paper_general_agnostic:
+    lrao: {variant: configurable, lrao_net: cnn, lrao_preproc: mad,
+           lrao_signal_aware: false}
+  # (4) = (1) but OUR net (isolates the architecture)
+  lrao_paper_general_ournet:
+    lrao: {variant: configurable, lrao_net: mlp, lrao_preproc: mad,
+           lrao_signal_aware: true}
+  # diagnostic: our MLP + our whitening + signal-aware. vs (4) it flips ONLY the
+  # preprocessing; vs the baseline it flips ONLY the objective.
+  lrao_ours_signalaware:
+    lrao: {variant: configurable, lrao_net: mlp, lrao_preproc: whiten,
+           lrao_signal_aware: true}
+  # sanity: the configurable class on the PUBLISHED settings should reproduce
+  # the baseline LRao. If it does not, the refactor is wrong, not the ablation.
+  lrao_published_check:
+    lrao: {variant: configurable, lrao_net: mlp, lrao_preproc: robust,
+           lrao_signal_aware: false, lfi_sigma_reg: none}
+
+  # ---- covariance-inverse regularisation (published = pseudo-inverse) -----
+  lrao_reg_none:
+    lrao: {variant: configurable, lfi_sigma_reg: none}          # published: pseudo-inverse
+  lrao_reg_truncate:
+    lrao: {variant: configurable, lfi_sigma_reg: truncate, lfi_sigma_cutoff: 1.0e-3}
+
+  # ---- DART and LRao on the SAME front-end (objective is the only difference)
+  dart_lrao_matched:
+    dart:
+      <<: *calibrated
+      dsm_arch: mlp
+      dsm_ref_bs: 256
+    lrao: {variant: configurable, lrao_preproc: dart, lrao_net: mlp,
+           lrao_signal_aware: false}
+
+  both_cal_lrao_ournet:
+    dart:
+      <<: *calibrated
+      dsm_ref_bs: 256
+    darts:
+      <<: *calibrated
+      dsm_ref_bs: 512
+    lrao: { variant: configurable, lrao_preproc: mad, lrao_net: mlp, lrao_signal_aware: false, detach_sigma: true}
+
+  # ---- pavia_mix geometry: boxes where a SCORE detector can beat AMF ------
+  # The published pavia4 boxes cannot separate DART from the linear matched
+  # filter — measured, every front-end/sigma combination lands within +-0.02 AUC
+  # of AMF there, because the train box is near-unimodal AND the bitumen
+  # signature is an easy direction for a linear filter. `pavia_mix` changes both
+  # (multimodal boxes + metal-sheet target, see repro/scenes/__init__.py
+  # PAVIA_MIX_*). On it DART-normalize beats AMF by +0.026/+0.052/+0.068 AUC at
+  # theta 0.075/0.15/0.30, and the front-end ordering matches the IID experiment.
+  # Use these entries to test the IID front-end/sigma conclusions spatially.
+  # SIGMA DOES NOT TRANSFER FROM pavia4 — the anchor's dsm_sigma_rho: 0.01 is
+  # sigma=0.10, and with the `normalize` front (s_bar = 1.0) that is g = 0.10,
+  # ~5x undersmoothed for this geometry. Measured on pavia_mix at the real
+  # budget (bs 256, ~20k steps, 2 seeds), DART AUC minus AMF-global:
+  #     g=0.10  -0.023 / -0.048 / -0.088   <- the anchor, LOSES to the baseline
+  #     g=0.30  +0.101 / +0.137 / +0.105
+  #     g=0.50  +0.176 / +0.254 / +0.219   <- optimum, rho = 0.25
+  #     g=0.70  +0.143 / +0.213 / +0.197
+  #     g=1.20  +0.011 / +0.002 / -0.026
+  # (theta 0.075 / 0.15 / 0.30). For reference the published zca front peaks at
+  # its own rho=0.1 (g=0.46) with +0.090 / +0.163 / +0.186 and decays above it,
+  # so normalize at g=0.5 beats the published front-end by ~+0.09 AUC — the same
+  # normalize > zca ordering the IID experiment finds.
+  mix_baseline:
+    scenes: [pavia_mix]
+  mix_dart_calibrated:
+    scenes: [pavia_mix]
+    dart:
+      <<: *calibrated
+      whiten_mode: shrink
+      shrink_space: corr          # REQUIRED — the default 'cov' family is much worse
+      shrink_lam: 2
+      dsm_sigma_rho: g       # sigma = 0.50; see the note above
+      dsm_sigma_g: 0.5
+      dsm_arch: mlp
+      dsm_ref_bs: 256
+  mix_both_calibrated:
+    scenes: [pavia_mix]
+    dart:
+      <<: *calibrated
+      dsm_ref_bs: 256
+    darts:
+      <<: *calibrated
+      dsm_ref_bs: 512
+
+  # ---- DART + DARTS + BOTH LRao objectives, one run ----------------------
+  # Four trained detectors on identical data, seeds and planting:
+  #   DART, DARTS          the calibrated recipe
+  #   LRao                 global-MAD, SIGNAL-AWARE      (maximise J_s along s)
+  #   LRao-agnostic        global-MAD, SIGNAL-AGNOSTIC   (full-Jacobian trace)
+  # so LRao vs LRao-agnostic flips ONLY the objective, with the preprocessing
+  # (the paper's single global MAD scalar) held fixed on both.
+  #
+  # ON detach_sigma — this is not symmetric, which is why it is set on only one
+  # of the two. The signal-aware branch differentiates THROUGH Sigma via a jvp
+  # (repro.models.lrao.configurable._cost) and hard-codes detach_sigma=False
+  # because the exact directional derivative is the whole point of that
+  # objective; a value set here would be ignored. It also auto-promotes
+  # lfi_sigma_reg 'none'/'truncate' -> 'shrink', since the pseudo-inverse
+  # backward is ill-defined and made held-out AUC swing ~+-.05 between epochs.
+  # The signal-agnostic branch is the one that actually reads the flag, and it
+  # wants detach_sigma: true (the published behaviour: Sigma is a plug-in
+  # estimate, not something to backprop through).
+  dart_darts_lrao_objectives:
+    dart:
+      <<: *calibrated
+      # sigma comes from the anchor (g = 0.5). transfer OFF because that g was
+      # calibrated ON the shifted test box, so delta is already inside it --
+      # adding transfer_gap here would count the shift twice.
+      dsm_sigma_transfer: true
+      dsm_arch: mlp
+      dsm_ref_bs: 256
+    darts:
+      <<: *calibrated
+      dsm_sigma_transfer: true
+      dsm_ref_bs: 512
+    lrao:                       # signal-AWARE (detach_sigma forced False)
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: true
+    lrao2:                      # signal-AGNOSTIC, same preprocessing
+      label: LRao-agnostic
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: false
+      detach_sigma: true
+
+  # the same four detectors on the pavia_mix geometry
+  mix_dart_darts_lrao_objectives:
+    scenes: [pavia_foreign] #, pavia_mix, sandiego]
+    dart:
+      <<: *calibrated
+      label: LRao-agnostic
+      dsm_sigma_transfer: true
+      dsm_arch: mlp
+      dsm_ref_bs: 256
+    darts:
+      <<: *calibrated
+      dsm_sigma_transfer: true
+      dsm_ref_bs: 512
+    lrao:
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: true
+    lrao2:
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: false
+      detach_sigma: true
+
+  # ---- pavia_foreign: the CONTROL for pavia_mix --------------------------
+  # Same image and the same kind of multi-material boxes, but the target
+  # (bitumen) appears in NONE of them, as in the published pavia4. Run it
+  # alongside the mix_* entries: the pair isolates how much of pavia_mix's
+  # advantage comes from the target material being present in training.
+  # Measured at MLP[128] (see repro/scenes/__init__.py PAVIA_FOREIGN_*):
+  # DART ties AMF here (zca +0.03 AUC) and prefers the PUBLISHED zca front,
+  # whereas pavia_mix gives +0.23 and prefers normalize.
+  foreign_baseline:
+    scenes: [pavia_foreign]
+  foreign_dart_calibrated:
+    scenes: [pavia_foreign]
+    dart:
+      <<: *calibrated
+      dsm_arch: mlp
+      dsm_ref_bs: 256
+  foreign_dart_darts_lrao_objectives:
+    scenes: [pavia_foreign]
+    dart:
+      <<: *calibrated
+      dsm_sigma_transfer: false
+      dsm_ref_bs: 512
+    darts:
+      <<: *calibrated
+      dsm_sigma_transfer: false
+      dsm_ref_bs: 512
+    lrao:
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: true
+    lrao2:
+      label: LRao-agnostic
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: false
+      detach_sigma: true
+
+  # ---- CFAR lambda ablation on pavia_foreign ------------------------------
+  # `cfar_lam` is a TOP-LEVEL key, so one value per run. These three entries are
+  # `foreign_dart_darts_lrao_objectives` with only cfar_lam changed, giving the
+  # DART-CFAR / DARTS-CFAR rows at lambda 0.1 / 0.9 / 1.0.
+  #
+  # lambda mixes the LOCAL window variance toward the GLOBAL one in
+  # local_moment_normalize: 0 = pure local, 1 = pure global. Measured at
+  # theta 0.15, 5 seeds, it barely moves detection and mostly buys calibration:
+  #     DART-CFAR   0.1 -> 0.9 : AUC 0.846 -> 0.846, Pfa 0.018 -> 0.005
+  #     DARTS-CFAR  0.1 -> 1.0 : AUC 0.926 -> 0.924, Pfa 0.021 -> 0.015
+  #
+  # REUSE THE CHECKPOINTS. lambda is applied at SCORING time, so the trained
+  # models are identical across these entries. ckpt_dir is results_root/<entry>/
+  # ckpt, so copy it across before running or every entry retrains from scratch:
+  #     src=results/spatial_ablation/foreign_dart_darts_lrao_objectives/ckpt
+  #     for e in foreign_cfar_lam09 foreign_cfar_lam10; do
+  #       mkdir -p results/spatial_ablation/$e && cp -r $src results/spatial_ablation/$e/
+  #     done
+  # With the checkpoints in place each run only re-scores (minutes, not hours).
+  foreign_cfar_lam09:
+    scenes: [pavia_foreign]
+    cfar_lam: 0.9
+    # Pinned to the SAME grid as foreign_dart_darts_lrao_objectives so the rows
+    # are directly comparable; `lean` would otherwise give 4 seeds / 3 thetas.
+    seeds: [42, 43, 44, 45, 46]
+    thetas: [0.03, 0.05, 0.075, 0.1, 0.15]
+    dart:
+      <<: *calibrated
+      dsm_sigma_transfer: false
+      dsm_ref_bs: 512
+    darts:
+      <<: *calibrated
+      dsm_sigma_transfer: false
+      dsm_ref_bs: 512
+    lrao:
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: true
+    lrao2:
+      label: LRao-agnostic
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: false
+      detach_sigma: true
+  foreign_cfar_lam10:
+    scenes: [pavia_foreign]
+    cfar_lam: 1.0
+    # Pinned to the SAME grid as foreign_dart_darts_lrao_objectives so the rows
+    # are directly comparable; `lean` would otherwise give 4 seeds / 3 thetas.
+    seeds: [42, 43, 44, 45, 46]
+    thetas: [0.03, 0.05, 0.075, 0.1, 0.15]
+    dart:
+      <<: *calibrated
+      dsm_sigma_transfer: false
+      dsm_ref_bs: 512
+    darts:
+      <<: *calibrated
+      dsm_sigma_transfer: false
+      dsm_ref_bs: 512
+    lrao:
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: true
+    lrao2:
+      label: LRao-agnostic
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: false
+      detach_sigma: true
+
+  # ---- salinas: the same three entries as pavia_foreign -------------------
+  # Identical detector configuration; only `scenes` differs, so the two are
+  # directly comparable. NOTE the thetas: Salinas is a much easier (linear)
+  # problem and the lean thetas [0.075, 0.15, 0.3] will read AUC ~1.000 for
+  # nearly every detector -- AMF alone saturates at 1.000 on 14 of 16 target
+  # signatures at theta 0.15. Add e.g. `thetas: [0.01, 0.02, 0.05]` to these
+  # entries to get a table that separates anything. See the salinas block in
+  # repro/scenes/__init__.py.
+  salinas_baseline:
+    scenes: [salinas]
+  salinas_dart_calibrated:
+    scenes: [salinas]
+    dart:
+      <<: *calibrated
+      dsm_arch: mlp
+      dsm_ref_bs: 256
+  salinas_dart_darts_lrao_objectives:
+    thetas: [0.01, 0.03, 0.05]
+    scenes: [salinas]
+    dart:
+      <<: *calibrated
+      dsm_sigma_transfer: false
+      dsm_ref_bs: 512
+    darts:
+      <<: *calibrated
+      dsm_sigma_transfer: false
+      dsm_ref_bs: 512
+    lrao:
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: true
+    lrao2:
+      label: LRao-agnostic
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: false
+      detach_sigma: true
+
+  # ---- sandiego2: the same entry, on the 189-band San Diego scene ---------
+  # Identical detector configuration to foreign_/salinas_dart_darts_lrao_objectives;
+  # only `scenes` and the amplitudes differ.
+  #
+  # THETAS. San Diego 2 saturates early: on the archived sweep every score
+  # detector is at AUC >= 0.99 by theta 0.15 and pinned at 1.000 from 0.225 up,
+  # so the published grid only separates detectors at its low end. These thetas
+  # are the informative part of that grid (theta 0.075 is where the archived run
+  # still spreads DART 0.917 .. DARTS 0.998).
+  #
+  # NOTE net_width gives sandiego2 200 (189 bands) against 512 for
+  # pavia_foreign, so cross-scene rows differ in capacity as well as in data.
+  #
+  # CHECKPOINT REUSE, if you have already run `baseline` on this scene: the
+  # trained DART/DARTS/agnostic-LRao do not depend on lambda or on the signature,
+  # so copying that entry's ckpt/ dir in first turns this into a scoring pass.
+  # The SIGNAL-AWARE LRao does depend on the signature and must train.
+  sandiego2_dart_darts_lrao_objectives:
+    scenes: [sandiego2]
+    seeds: [42, 43, 44, 45, 46]
+    thetas: [0.03, 0.05, 0.075, 0.1, 0.15]
+    dart:
+      <<: *calibrated
+      dsm_sigma_transfer: true
+      dsm_ref_bs: 512
+    darts:
+      <<: *calibrated
+      dsm_sigma_transfer: true
+      dsm_ref_bs: 512
+    lrao:
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: true
+    lrao2:
+      label: LRao-agnostic
+      variant: configurable
+      lrao_net: mlp
+      lrao_preproc: mad
+      lrao_signal_aware: false
+      detach_sigma: true
+
+  # ---- sigma-rule sweep on DART (front-end fixed at the IID winner) -------
+  dart_sigma_eff2:
+    dart: {<<: *calibrated, dsm_sigma_rho: eff2, dsm_ref_bs: 256}
+  dart_sigma_lw:
+    dart: {<<: *calibrated, dsm_sigma_rho: lw, dsm_ref_bs: 256}
+  dart_sigma_paper:
+    dart: {<<: *calibrated, dsm_sigma_rho: 0.1, dsm_ref_bs: 256}   # published rho

@@ -1,0 +1,70 @@
+# IID multi-class experiment on SALINAS (AVIRIS, agricultural).
+#
+# Same protocol as iid_multi.yaml (Pavia); only the scene and the target
+# amplitude differ. Salinas is the SECOND labelled scene, which is what makes it
+# worth running: every front-end / sigma conclusion so far comes from Pavia
+# alone, so this is the external-validity check.
+#
+# WHY amplitude = 0.02 AND NOT 0.15. Salinas is agricultural — large, very
+# homogeneous crop fields, the lowest background variability of any scene here
+# (per-band CV 0.271 vs Pavia 0.417). Planted targets are correspondingly easy.
+# Measured AMF AUC (n=1000, target vs the union of the rest):
+#
+#     theta    0.005  0.01   0.02   0.04   0.075  0.15
+#     AMF       .53    .58    .68    .83    .97   1.00
+#
+# At Pavia's theta = 0.15 EVERY one of the 16 possible target classes gives
+# AMF AUC = 1.000 — the experiment would separate nothing. theta = 0.02 puts AMF
+# at ~.68-.74, i.e. the same difficulty Pavia has at 0.15, so the detectors are
+# actually being compared. Keep this in mind before copying thetas across scenes.
+dataset: repro/data/Salinas_corrected.mat   # 204 bands (water-absorption removed)
+
+whiten_eig_floor:      0.0
+lrao_whiten_eig_floor: 0.00001
+
+# ----- target + background -----
+# target = Lettuce_romaine_5wk: the HARDEST of the 16 candidates at every theta
+# (measured), so the comparison has the most headroom. Background = the union of
+# the other 15 crop classes; class 0 (unlabeled, 51% of the scene) is excluded as
+# an unstructured grab-bag, matching the Pavia convention.
+bkg_cls: null
+target_cls: 12
+exclude_classes: [0]
+
+amplitude: 0.02                       # see the note above — NOT 0.15
+target_fraction: 0.10
+test_size: 2000
+
+n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000]
+rho_list: [0.00001, 0.001, 0.005, 0.01, 0.3, 0.5, 0.07, 0.1, 0.5, 1.0, 3.0, 10.0]
+n_fixed_for_rho: 1000
+pfa: 0.1
+pauc_fpr: 0.1
+
+hidden_dims:    [128]                 # primary  = MLP    -> DART
+activation:     relu
+dsm_label:      "DART"
+hidden_dims_2:  []                    # secondary = linear -> L-DART
+activation_2:   relu
+dsm2_label:     "L-DART"
+
+dsm_epochs:  2000
+lrao_epochs: 2000
+val_fraction:    0.0
+val_check_every: 100
+lr: 0.0005
+weight_decay: 5.0e-07
+batch_size: 512
+dsm_sigma_rho: 0.1
+lfi_delta_theta: 0.01
+lfi_detach_sigma: true
+lrao_grad_clip: 1.0
+run_lrao_mlp: true
+lrao_val_fraction: 0.1
+lrao_val_check_every: 1
+lrao_patience: 3
+lrao_min_delta: 0.005
+gmm_K: 12                             # 15 background classes; 12 keeps GMM-Levin affordable
+seed: [42, 43, 44, 45, 46]
+results_dir: results/iid_multi_salinas
+lrao_input_norm: robust

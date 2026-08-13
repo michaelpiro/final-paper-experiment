@@ -6,7 +6,10 @@
 # signature is the mean spectrum of the target class, planted additively.
 # Detectors shown: AMF, GMM-Levin, DART, LRao.
 
-dataset: data/pavia-u.mat
+dataset: repro/data/pavia-u.mat        # NOTE: was `data/Sandiego.mat`, a path that does not exist. Every
+                                      # multi result to date ran on Pavia because run_iid_ablations
+                                      # used to overwrite `dataset` unconditionally. Restored to Pavia
+                                      # to match those results — set it back if Sandiego was intended.
 
 # ----- whitening (ZCA only) -----
 whiten_eig_floor:      0.0
@@ -24,7 +27,9 @@ test_size: 2000
 
 # ----- sweep axes -----
 n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000]
-rho_list: [0.00001, 0.001, 0.005, 0.01, 0.3, 0.5, 0.07, 0.1, 0.5, 1.0, 3.0, 10.0]  # exact paper sweep
+rho_list: [ 0.005, 0.01, 0.03, 0.05, 0.07, 0.1, 0.3, 0.5, 1.0]  # exact paper sweep
+#n_train_list: [1000]
+#rho_list: [0.005, 0.01, 0.03, 0.05, 0.07, 0.1, 0.3, 0.5]  # exact paper sweep
 n_fixed_for_rho: 1000
 
 # ----- metric operating points -----

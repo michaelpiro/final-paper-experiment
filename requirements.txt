@@ -1,0 +1,16 @@
+# Runtime dependencies for the repro package and the run_*.py scripts.
+# Versions pinned to the verified-working local environment (Apple MPS, torch 2.13).
+# Relax the pins if you need a different Python/torch build.
+
+# The repo calls np.trapz (repro/core/metrics.py, repro/protocols/iid.py), which
+# NumPy DEPRECATED in 2.0 and REMOVED in 2.4.0 -> it is absent from numpy 2.4+
+# (e.g. 2.5.1). Cap below 2.4 so np.trapz still exists. Floor 2.1 is the first
+# NumPy with Python 3.13 wheels (this venv is 3.13); NumPy 1.x has no 3.13 wheel.
+numpy>=2.1,<2.4
+scipy>=1.18.0
+torch>=2.13.0
+scikit-learn>=1.9.0
+matplotlib>=3.11.1
+PyYAML>=6.0.3
+tqdm>=4.70.0
+einops>=0.7.0        # required by the TSTTD deep baseline (run_spatial.py)

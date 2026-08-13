@@ -4,7 +4,7 @@
 # ---- protocol ----
 scenes: [pavia4, sandiego, sandiego2]
 seeds: [42, 43, 44, 45, 46]
-thetas: [0.03, 0.075, 0.15, 0.225, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+thetas: [0.03, 0.05, 0.075, 0.1, 0.15]
 alpha: 0.05                 # nominal false-alarm rate (thresholds + pAUC + Pd)
 target_fraction: 0.10
 edge_guard: 3
@@ -29,13 +29,13 @@ gmm_steps: 50
 
 # Global score nets (DART, LRao): hidden width matched to the band count —
 # 128 on Pavia (103 bands), 200 on the San Diego scenes (189 bands).
-net_width: {pavia4: 128, sandiego: 200, sandiego2: 200}
-
+net_width: {pavia_foreign: 512, pavia_mix: 128, pavia4: 128, sandiego: 200, sandiego2: 200, salinas: 200}
+use_val_box: true
 dart:
   hidden: [128]             # overridden per scene by net_width
   activation: relu
   lr: 5.0e-4
-  batch_size: 256           # PAPER Table 1 value
+  batch_size: 512           # PAPER Table 1 value
   weight_decay: 1.0e-5
   epochs: 1000
   whiten_eig_floor: 1.0e-5
@@ -45,7 +45,7 @@ darts:
   d_lat: 16
   K: 7
   enc_hidden: [64, 32]
-  score_hidden: [128]
+  score_hidden: [512]
   activation: relu
   lr: 3.0e-4
   batch_size: 512
@@ -73,7 +73,7 @@ lrao:
   ckpt_every: 10
 
 # ---- deep baselines (paper recipes; budgets only — architectures are theirs) ----
-deep_detectors: [THANTD, HTDNet, TSTTD, OSVAE]
+#deep_detectors: [THANTD, HTDNet, TSTTD, OSVAE]
 deep_pretrained: repro/checkpoints/deep   # bundled published checkpoints
 retrain_deep: false                        # true -> retrain from scratch (hours)
 deep:

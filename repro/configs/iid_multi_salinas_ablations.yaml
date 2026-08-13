@@ -1,0 +1,100 @@
+# Ablation plan for the IID multi-class experiment on SALINAS.
+#
+# Identical in shape to iid_multi_ablations.yaml — only `base` and
+# `results_root` differ, so the same entries run on the second scene and the
+# Pavia conclusions can be checked for external validity.
+#
+# NOTE the base config uses amplitude = 0.02 (not Pavia's 0.15): Salinas is far
+# more homogeneous and at 0.15 every detector saturates at AUC = 1.000. See
+# iid_multi_salinas.yaml for the measured theta sweep.
+base: iid_multi_salinas.yaml
+mode: multi
+results_root: results/iid_multi_salinas_ablations
+
+common:
+  lrao_input_norm: robust
+  run_lrao_mlp: true
+  lfi_sigma_reg: shrink
+
+ablations:
+  # published DART / LRao — the reference curves
+  baseline: {}
+
+  # CalibratedDART: correlation-shrinkage front (lam=2) + rho=0.01, MLP[512].
+  # The Pavia-calibrated settings, carried over UNCHANGED on purpose — the point
+  # is to test whether they transfer to a 204-band agricultural scene, so do not
+  # re-tune them here before looking at the result.
+  dart_calibrated:
+    dsm_variant:    calibrated
+    whiten_mode:    shrink
+    shrink_space:   corr
+    shrink_lam:     2.0
+    whiten_eig_floor: 0
+    dsm_arch:       mlp
+    dsm_n_experts:  16
+    hidden_dims:    [512]
+    activation:     relu
+    dsm_sigma_rho:  0.01
+    dsm_auto_budget: true
+    dsm_val_frac:   0.1
+    weight_decay:   0.005
+    run_l_dart:     false
+    run_l_lrao:     false
+
+  # the same DART, plus the paper-general LRao on our MLP (the headline compare)
+  dart_calibrated__lrao_paper_ournet:
+    dsm_variant:    calibrated
+    whiten_mode:    shrink
+    shrink_space:   corr
+    shrink_lam:     2.0
+    whiten_eig_floor: 0
+    dsm_arch:       mlp
+    dsm_n_experts:  16
+    hidden_dims:    [512]
+    activation:     relu
+    dsm_sigma_rho:  0.01
+    dsm_auto_budget: true
+    dsm_val_frac:   0.1
+    weight_decay:   0.005
+    lrao_net:          mlp
+    lrao_preproc:      mad
+    lrao_signal_aware: true
+    run_default_lrao:  true
+    run_l_dart:     false
+    run_l_lrao:     false
+
+  # front-end check: does the corr-shrink win hold, or was it Pavia-specific?
+  dart_normalize:
+    dsm_variant: calibrated
+    whiten_mode: normalize
+    dsm_sigma_rho: 0.01
+    dsm_auto_budget: true
+    dsm_val_frac: 0.1
+    hidden_dims: [512]
+    activation: relu
+    run_l_dart: false
+    run_l_lrao: false
+  dart_zca:
+    dsm_variant: calibrated
+    whiten_mode: zca
+    dsm_sigma_rho: 0.01
+    dsm_auto_budget: true
+    dsm_val_frac: 0.1
+    hidden_dims: [512]
+    activation: relu
+    run_l_dart: false
+    run_l_lrao: false
+
+  # sigma check: does the flat-sigma / eff2 finding transfer at D=204?
+  dart_sigma_eff2:
+    dsm_variant: calibrated
+    whiten_mode: shrink
+    shrink_space: corr
+    shrink_lam: 2.0
+    dsm_sigma_rho: eff2
+    dsm_auto_budget: true
+    dsm_val_frac: 0.1
+    hidden_dims: [512]
+    activation: relu
+    run_l_dart: false
+    run_l_lrao: false

@@ -7,7 +7,7 @@
 # first layer fit on the training background. Two sweeps: vs n and vs rho.
 # Detectors shown: AMF, L-DART, DART, LRao, L-LRao.
 
-dataset: data/pavia-u.mat
+dataset: repro/data/pavia-u.mat
 
 # ----- whitening (ZCA only; frozen first layer of the score nets) -----
 whiten_eig_floor:      0.0            # 0 -> auto floor at 1e-5 x lambda_max
@@ -24,8 +24,10 @@ target_fraction: 0.10
 test_size: 2000
 
 # ----- sweep axes -----
-n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000]
-rho_list: [0.00001, 0.001, 0.005, 0.01, 0.3, 0.5, 0.07, 0.1, 0.5, 1.0, 3.0, 10.0]  # exact paper sweep
+#n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000]
+n_train_list: [4000]
+#rho_list: [0.00001, 0.001, 0.005, 0.01, 0.3, 0.5, 0.07, 0.1, 0.5, 1.0, 3.0, 10.0]  # exact paper sweep
+rho_list: [0.005, 0.03]
 n_fixed_for_rho: 400
 
 # ----- metric operating points -----

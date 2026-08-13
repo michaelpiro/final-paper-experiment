@@ -1,0 +1,60 @@
+# IID single-class experiment on SALINAS (AVIRIS, agricultural).
+#
+# Same protocol as iid_single.yaml (Pavia); scene, classes and amplitude differ.
+# See iid_multi_salinas.yaml for why the amplitude is 0.015 and not 0.15 — in
+# short, Salinas fields are so homogeneous that at Pavia's theta EVERY class pair
+# gives AMF AUC = 1.000. Measured here (bkg = Grapes, n=1000):
+#
+#     theta    0.005  0.01   0.02   0.04   0.075  0.15
+#     AMF       .60    .68    .82    .96    1.00  1.00
+#
+# 0.015 lands at ~.75, i.e. the difficulty Pavia single has at its own theta.
+dataset: repro/data/Salinas_corrected.mat
+
+whiten_eig_floor:      0.0
+lrao_whiten_eig_floor: 1.0e-10
+
+# background = Grapes_untrained (11271 px — the largest class, so n can reach
+# 2000 with a 2000-pixel test pool left over); target = Lettuce_romaine_5wk,
+# the hardest target against it in the measured sweep.
+bkg_cls: 8
+target_cls: 12
+exclude_classes: []
+
+amplitude: 0.015                      # see the note above — NOT 0.15
+target_fraction: 0.10
+test_size: 2000
+
+n_train_list: [20, 40, 60, 100, 200, 500, 1000, 2000]
+rho_list: [0.00001, 0.001, 0.005, 0.01, 0.3, 0.5, 0.07, 0.1, 0.5, 1.0, 3.0, 10.0]
+n_fixed_for_rho: 400
+pfa: 0.1
+pauc_fpr: 0.1
+
+hidden_dims:    []                    # primary  = linear  -> L-DART
+activation:     silu
+dsm_label:      "L-DART"
+hidden_dims_2:  [128]                 # secondary = MLP    -> DART
+activation_2:   relu
+dsm2_label:     "DART"
+
+dsm_epochs:  2000
+lrao_epochs: 2000
+val_fraction:    0.0
+val_check_every: 100
+lr: 0.0005
+weight_decay: 0.00005
+batch_size: 512
+dsm_sigma_rho: 0.1
+lfi_delta_theta: 0.01
+lfi_detach_sigma: true
+lrao_grad_clip: 1.0
+run_lrao_mlp: true
+lrao_val_fraction: 0.1
+lrao_val_check_every: 1
+lrao_patience: 3
+lrao_min_delta: 0.005
+gmm_K: 2
+seed: [42, 43, 44, 45, 46]
+results_dir: results/iid_single_salinas
+lrao_input_norm: robust

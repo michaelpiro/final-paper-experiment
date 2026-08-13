@@ -1,0 +1,213 @@
+# Ablation plan for the IID multi-class experiment.
+#
+# This is NOT a flat run_iid config. It is an ablation PLAN consumed by
+# run_iid_ablations.py, which loads `base`, then runs run_iid once per entry
+# under `ablations`, merging {base < common < entry-overrides} each time and
+# writing to results_root/<entry-name>/.
+#
+# The override keys are the ablation axes added to train_lrao_local /
+# train_dsm_local (see repro.protocols.iid.LRAO_ABLATIONS / DSM_ABLATIONS):
+#   lrao_net           mlp (ours) | cnn (paper 1-D CNN)
+#   lrao_preproc       whiten (ours ZCA/robust-IQR) | mad (paper global MAD)
+#   lrao_signal_aware  false (agnostic tr(J*)) | true (perturb along the target)
+#   dsm_preproc        zca (ours) | mad (paper global MAD) | wmw (within-mode
+#                      whitening — whiten only the pooled within-cluster cov)
+#   dsm_sigma_rho      <number> (sigma=sqrt(rho)) | dn16 ((D/n)^(1/6) auto rule)
+#   dsm_variant        published (ours) | calibrated (CalibratedDART (front-end + sigma + training))
+# Covariance is always general (full SVD pseudo-inverse) — the no-DFT case.
+#
+# COMPOSING TWO ABLATIONS IN ONE RUN: an entry is just a flat override dict, so
+# put BOTH the DART and the LRao ablation keys in the same entry (see
+# dart_calibrated__lrao_paper below). They apply together in a single run_iid,
+# so DART and LRao are compared on identical data/seeds.
+#
+# WHEN AN LRao ABLATION IS ACTIVE (lrao_net=cnn / lrao_preproc=mad /
+# lrao_signal_aware=true) the run trains BOTH:
+#   * 'LRao-<ablation>' (e.g. 'LRao-CNN')  the ablated LRao;
+#   * 'LRao'  a DEFAULT published LRao (MLP, signal-agnostic) that reuses the
+#             DART ablation's front-end (whiten_mode, via lrao_preproc='dart')
+#             and score architecture (hidden_dims / dsm_arch), so LRao-vs-DART
+#             differs only in the objective. Disable with run_default_lrao:false.
+#
+# LINEAR-MODEL TOGGLES: run_l_dart:false skips the linear DART (L-DART);
+# run_l_lrao:false skips the linear LRao slot (L-LRao).
+
+base: iid_multi.yaml
+mode: multi
+results_root: results/iid_multi_ablations
+
+# applied to every ablation run (merged under each entry's own overrides)
+common:
+  lrao_input_norm: robust      # the fixed-LRao front-end used in RunIID
+  run_lrao_mlp: true           # also train the headline MLP 'LRao'
+  lfi_sigma_reg: shrink        # DEFAULT covariance-inverse regulariser for all
+                               # ablations (Ledoit-Wolf; the paper-faithful,
+                               # n-adaptive choice). Override per entry below.
+
+ablations:
+  # published DART / LRao, no ablation flags — the reference curves
+  baseline:                    {}
+  # (1) faithful to the paper, general covariance: paper CNN + paper MAD + signal-aware
+  lrao_paper_general:          {lrao_net: cnn, lrao_preproc: mad,    lrao_signal_aware: true,  run_lrao_mlp: false}
+  # (2) = (1) but OUR preprocessing (ZCA / robust-IQR)
+  lrao_paper_general_ourprep:  {lrao_net: cnn, lrao_preproc: whiten, lrao_signal_aware: true,  run_lrao_mlp: false}
+  # (3) = (1) but signal-agnostic (full-Jacobian trace objective)
+  lrao_paper_general_agnostic: {lrao_net: cnn, lrao_preproc: mad,    lrao_signal_aware: false, run_lrao_mlp: false}
+  # (4) = (1) but OUR net architecture (MLP score net -> headline 'LRao')
+  lrao_paper_general_ournet:   {lrao_net: mlp, lrao_preproc: mad,    lrao_signal_aware: true}
+  # diagnostic: our MLP + our whitening + signal-aware. Isolates the global-MAD
+  # effect: vs ournet (mad) it flips ONLY the preprocessing; vs baseline it
+  # flips ONLY signal-aware. If this is good, MAD is what starves the MLP.
+  lrao_ours_signalaware:       {lrao_net: mlp, lrao_preproc: whiten, lrao_signal_aware: true}
+  # DART with the LRao paper's global-MAD preprocessing
+  dsm_paper_preproc:           {dsm_preproc: mad}
+
+  # ---- WMW front-end + (D/n)^(1/6) automatic sigma, on the PUBLISHED DART ----
+  # Within-Mode Whitening (whiten only the pooled within-cluster covariance so
+  # the between-mode geometry a score detector exploits survives) + the
+  # score-MSE-optimal sigma rule. Nothing else about DART changes (published
+  # MLP D->128->D ReLU, Adam). See WMW_HANDOFF.md. WMW helps most on the
+  # multi-class (mixture) background. wmw_k: null -> deterministic elbow rule.
+  dart_wmw:
+    dsm_preproc:   wmw
+    dsm_sigma_rho: dn16       # (D/n)^(1/6); vs-rho sweep still overrides per-rho
+    wmw_k:         null       # elbow rule (set an int, e.g. 8, to fix + speed up)
+    # WMW is for DART only; the linear L-DART tags along here (it is also a
+    # pointwise score net). Set run_l_dart:false to drop it.
+
+  # ---- CalibratedDART: front-end + sigma + training all data-driven ----
+  # dsm_variant: calibrated swaps in repro.models.dart.calibrated.
+  # These are the calibrated-DART knobs: per-channel 'normalize'
+  # front-end, data-driven KDE sigma (Parzen score-matching), MLP[512] score
+  # net, AdamW+cosine on a sample-size-adaptive budget. run_lrao_mlp stays on so
+  # the LRao references are still drawn; the ablated detector is DART.
+  dart_calibrated:
+    dsm_variant:    calibrated
+    whiten_mode:    vicreg   # calibrated multi used per-channel std
+    whiten_eig_floor: 0         # spectral-gap adaptive floor
+    dsm_arch:       mlp
+    dsm_n_experts:  16          # only used by dsm_arch: mixture
+    hidden_dims:    [512]       # DART score net (calibrated multi)
+    hidden_dims_2:  [128]       # secondary DSM also uses the calibrated arch
+    activation:     silu
+    activation_2:   relu
+    dsm_sigma_rho:  0.1     # Parzen-bandwidth LOO (score-matching) KDE sigma
+    dsm_auto_budget: true       # adaptive (batch/epochs/lr from n) — bounded runtime
+    dsm_val_frac:   0.1         # held-out best-epoch monitor (fixed val noise)
+    weight_decay:   0.005
+
+  # ---- TWO ablations in one run: calibrated DART + paper-general LRao ----
+  # Flat composition: the calibrated DART pipeline AND the paper CNN/MAD/signal-aware
+  # LRao apply together. Detectors produced: DART, L-DART, LRao-CNN (ablated),
+  # and LRao (the DEFAULT published LRao, reusing the DART front-end + arch).
+  dart_calibrated__lrao_paper:
+    # -- DART: the calibrated pipeline --
+    dsm_variant:    calibrated
+    whiten_mode:    vicreg
+    whiten_eig_floor: 0
+    dsm_arch:       mlp
+    dsm_n_experts:  16
+    hidden_dims:    [512]
+    activation:     silu
+    dsm_sigma_rho:  0.1
+    dsm_auto_budget: true
+    dsm_val_frac:   0.1
+    weight_decay:   0.005
+    # -- LRao: the paper-general ablation (runs alongside the default LRao) --
+    lrao_net:          cnn
+    lrao_preproc:      mad
+    lrao_signal_aware: true
+    run_default_lrao:  true     # also train the DART-matched default 'LRao'
+
+  # ---- TWO ablations in one run: calibrated DART + our signal-aware LRao ----
+  # Flat composition on identical data/seeds. Detectors produced: DART, L-DART
+  # (calibrated pipeline), LRao-abl (our MLP + whiten + signal-aware), and LRao (the
+  # DEFAULT published LRao, reusing the DART front-end + arch).
+  dart_calibrated__lrao_ours_signalaware:
+    # -- DART: the calibrated pipeline --
+    dsm_variant: calibrated
+    whiten_mode: zca
+    whiten_eig_floor: 0
+    dsm_arch: mlp
+    dsm_n_experts: 16
+    hidden_dims: [128]
+    activation: relu
+    dsm_sigma_rho: eff
+    dsm_auto_budget: true
+    dsm_val_frac: 0.1
+    weight_decay: 0.005
+    # -- LRao: our MLP + whitening + signal-aware (runs alongside default LRao) --
+    lrao_net:          mlp
+    lrao_preproc:      dart
+    lrao_signal_aware: true
+    run_default_lrao:  true
+    # -- switch off the linear detectors (L-DART secondary + L-LRao slot) --
+    run_l_dart:        false
+    run_l_lrao:        false
+
+  dart_calibrated__lrao_paper_ournet:
+    # -- DART: the calibrated pipeline --
+    dsm_variant: calibrated
+    whiten_mode: shrink
+    shrink_space: corr        # REQUIRED — default 'cov' is much worse
+    shrink_lam: 2
+    whiten_eig_floor: 0
+    dsm_arch: mlp
+    dsm_epochs: 10000
+    dsm_auto_budget: false
+    dsm_target_steps: 10000      # target total optimizer steps (the real budget)
+    dsm_min_bs: 16
+    dsm_max_bs: 256
+    dsm_min_epochs: 100
+    dsm_max_epochs: 10000         # epoch cap (bounds runtime; lets small n reach steps)
+    dsm_ref_bs: 64
+    dsm_n_experts: 16
+    hidden_dims: [512]
+    activation: relu
+    dsm_sigma_rho: eff
+    dsm_sigma_transfer: true
+    dsm_val_frac: 0.1
+    weight_decay: 0.005
+    # -- LRao: our MLP + whitening + signal-aware (runs alongside default LRao) --
+    lrao_net: mlp
+    lrao_preproc: mad
+    lrao_signal_aware: true
+    run_default_lrao: true
+    # -- switch off the linear detectors (L-DART secondary + L-LRao slot) --
+    run_l_dart: false
+    run_l_lrao: false
+
+  # ---- closed-form replacement for the VICReg front-end ----------------------
+  # whiten_mode: shrink + shrink_space: corr  is  W = (R + lam I)^(-1/2) diag(1/std),
+  # R the correlation matrix. lam -> inf is 'normalize', lam -> 0 is ZCA, so lam
+  # dials how much DECORRELATION happens while per-band scaling is always kept.
+  # Measured (30k steps, gelu[128], lr 1e-3, 2 seeds) against vicreg / normalize:
+  #     n= 200   .8874 / .9079 / .8918
+  #     n= 700   .9161 / .9142 / .9022     <- matches vicreg
+  #     n=2000   .9141 / .9038 / .8985     <- beats vicreg
+  # i.e. lam=2 reproduces (and at large n exceeds) the learned VICReg encoder in
+  # closed form, with no encoder training. sigma* was ~0.10 (rho ~ 0.01), flat in n.
+  dart_corrshrink:
+    dsm_variant:    calibrated
+    whiten_mode:    shrink
+    shrink_space:   corr        # REQUIRED — the default 'cov' family is much worse
+    shrink_lam:     2.0         # 2 is best at n>=700; ~10 was better at n=200
+    whiten_eig_floor: 0
+    dsm_arch:       mlp
+    dsm_n_experts:  16
+    hidden_dims:    [128]
+    activation:     gelu
+    dsm_sigma_rho:  g        # sigma ~ 0.10, measured flat in n for this front
+    dsm_sigma_g: 0.5
+    dsm_auto_budget: true
+    dsm_val_frac:   0.1
+    weight_decay:   5.0e-7
+    run_l_dart:     false
+    run_l_lrao:     false
+
+  # ---- covariance-inverse regularisation sweep (on the default LRao) ----
+  # The default is now SHRINK (set in `common`), so baseline + every ablation
+  # already use Ledoit-Wolf. These two entries flip only the regulariser back,
+  # giving the 3-way compare: baseline(shrink) vs reg_none vs reg_truncate.
+  lrao_reg_none:               {lfi_sigma_reg: none}                               # full SVD pseudo-inverse (current code)
+  lrao_reg_truncate:           {lfi_sigma_reg: truncate, lfi_sigma_cutoff: 1.0e-3}  # published multi value
