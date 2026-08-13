@@ -44,8 +44,13 @@ from repro.core.data import (
 )
 from repro.core.detectors import amf, dsm_additive, gmm_glrt_levin_additive
 from repro.core.models import (
-    ScoreNet, dsm_loss, lfi_loss_mode2, compute_lfi_detector_scores_mode2,
+    ScoreNet, dsm_loss, lfi_loss_mode2, lfi_loss_mode2_signal_aware,
+    compute_lfi_detector_scores_mode2,
 )
+from repro.core.normalization import (
+    robust_whitening_iqr, global_mad_whitening, wmw_whitening, make_frontend,
+)
+from repro.core.sigma import resolve_sigma
 
 
 def _make_whitening(train_raw, cfg):
@@ -56,6 +61,24 @@ def _make_whitening(train_raw, cfg):
     """
     return Whitening.from_data(np.asarray(train_raw, dtype=np.float32),
                                eig_floor=float(cfg.get('whiten_eig_floor', 0.0)))
+
+
+def _resolve_dsm_sigma(rho_cfg, D, n, label='', Zw=None, cfg=None,
+                       train_raw=None, s_raw=None, Zval=None):
+    """Thin adapter onto repro.core.sigma.resolve_sigma (the single source of
+    truth for every sigma rule). A numeric dsm_sigma_rho -> sqrt(rho)."""
+    c = dict(cfg or {})
+    c['dsm_sigma_rho'] = rho_cfg
+
+    def _trainer(fit_np, cc, sd, lb):          # only used by 'detval'
+        return train_dsm_local(fit_np, cc, sd, lb)[0]
+
+    def _scorer(model, fit_np, planted, s):
+        return dsm_additive(planted, fit_np, model, s)
+
+    return resolve_sigma(Zw, c, seed=(cfg or {}).get('_sigma_seed', 0), label=label,
+                         D=D, train_raw=train_raw, s_raw=s_raw,
+                         trainer=_trainer, scorer=_scorer, Zval=Zval)
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +109,7 @@ def _pauc(labels: np.ndarray, scores: np.ndarray, fpr_max: float = 0.1) -> float
         keep = fpr < fpr_max
         fpr_c = np.concatenate([fpr[keep], [fpr_max]])
         tpr_c = np.concatenate([tpr[keep], [tpr_at]])
-        return float(np.trapz(tpr_c, fpr_c) / fpr_max)
+        return float(np.trapezoid(tpr_c, fpr_c) / fpr_max)
     except Exception:
         return float('nan')
 
@@ -123,8 +146,59 @@ def _make_loader(X: np.ndarray, batch_size: int):
     return Xt
 
 
+# ---------------------------------------------------------------------------
+# Ablation presets (merge a dict into cfg to activate). Defaults reproduce the
+# published detectors; each preset flips one axis around the paper-faithful,
+# general-covariance (no-DFT) LRao reference.
+# ---------------------------------------------------------------------------
+# LRao axes:  lrao_net in {mlp(ours), cnn(paper)};
+#             lrao_preproc in {whiten(ours ZCA/IQR), mad(paper global MAD)};
+#             lrao_signal_aware in {False(ours), True(paper)}.
+# Covariance is always general (full SVD pseudo-inverse) — the "no DFT" case.
+LRAO_ABLATIONS = {
+    # (1) faithful to the paper but general-covariance for HSI: paper CNN,
+    #     paper MAD preprocessing, signal-aware.
+    'paper_general':          dict(lrao_net='cnn', lrao_preproc='mad',
+                                   lrao_signal_aware=True),
+    # (2) = (1) but with OUR preprocessing (ZCA / robust-IQR).
+    'paper_general_ourprep':  dict(lrao_net='cnn', lrao_preproc='whiten',
+                                   lrao_signal_aware=True),
+    # (3) = (1) but signal-agnostic (full-Jacobian trace objective).
+    'paper_general_agnostic': dict(lrao_net='cnn', lrao_preproc='mad',
+                                   lrao_signal_aware=False),
+    # (4) = (1) but with OUR net architecture (MLP score net).
+    'paper_general_ournet':   dict(lrao_net='mlp', lrao_preproc='mad',
+                                   lrao_signal_aware=True),
+}
+# Covariance-inverse regularisation. SHRINK (Ledoit-Wolf) is the DEFAULT for the
+# ablation plans (set in each YAML's `common`), so baseline + every ablation use
+# it. These entries flip the regulariser back for the 3-way comparison on the
+# default LRao: shrink (default) vs none (full pseudo-inverse) vs truncate.
+# lfi_sigma_cutoff is mode-specific in the YAML plans (single 1e-6, multi 1e-3).
+LRAO_REG_ABLATIONS = {
+    'reg_none':     dict(lfi_sigma_reg='none'),
+    'reg_truncate': dict(lfi_sigma_reg='truncate', lfi_sigma_cutoff=1e-3),
+}
+LRAO_ABLATIONS.update(LRAO_REG_ABLATIONS)
+# DSM (DART) axis: dsm_preproc in {zca(ours), mad(paper global MAD)}.
+# The 'calibrated' preset swaps the WHOLE DART pipeline for CalibratedDART's
+# recipe (dsm_variant='calibrated' -> repro.models.dart.calibrated): a
+# configurable front-end (whiten_mode), a data-driven sigma, and
+# AdamW/cosine/auto-budget training with a held-out best-epoch monitor. The
+# concrete per-mode knobs live in the YAML plans.
+DSM_ABLATIONS = {
+    'paper_preproc': dict(dsm_preproc='mad'),
+    'calibrated':    dict(dsm_variant='calibrated'),
+    # WMW within-mode whitening + the (D/n)^(1/6) automatic sigma rule, both on
+    # the PUBLISHED DART trainer (WMW_HANDOFF.md).
+    'wmw':           dict(dsm_preproc='wmw', dsm_sigma_rho='dn16'),
+}
+
+
 def train_dsm_local(train_raw: np.ndarray, cfg: dict,
-                    seed: int, label: str) -> Tuple[ScoreNet, List[float]]:
+                    seed: int, label: str,
+                    s_raw: np.ndarray = None,
+                    val_raw: np.ndarray = None) -> Tuple[ScoreNet, List[float]]:
     """DSM on RAW bands with a frozen ZCA whitening first layer (no PCA/AE).
 
     The net whitens internally, DSM noise is isotropic in whitened space
@@ -134,16 +208,46 @@ def train_dsm_local(train_raw: np.ndarray, cfg: dict,
     Best-epoch selection (checked every val_check_every epochs and at the final epoch):
       val_fraction = 0  (default) — use all data for training; checkpoint by train loss.
       val_fraction > 0            — hold out that fraction for validation; checkpoint by val loss.
+
+    ABLATION (dsm_variant): 'published' (default, this trainer) or 'calibrated'
+    — CalibratedDART's recipe: a configurable front-end (whiten_mode), a
+    data-driven sigma, and AdamW/cosine/auto-budget training with a held-out
+    best-epoch monitor. See repro.models.dart.calibrated.
     """
+    if str(cfg.get('dsm_variant', 'published')) in ('calibrated', 'multi'):
+        from repro.models.dart.calibrated import train_calibrated_scorenet
+        return train_calibrated_scorenet(train_raw, cfg, seed, label, s_raw=s_raw,
+                                         val_raw=val_raw)
     torch.manual_seed(seed)
     device = torch.device(cfg.get('device', 'cpu'))
     D = train_raw.shape[1]
-    W = _make_whitening(train_raw, cfg)
+    # ABLATION (dsm_preproc): 'zca' (default, our ZCA whitening); 'mad' (the LRao
+    # paper's global scalar MAD normalization); 'wmw' (Within-Mode Whitening —
+    # whiten only the pooled within-cluster covariance so between-mode geometry
+    # survives; see WMW_HANDOFF / repro.core.normalization.wmw_whitening). NOTE:
+    # with 'mad' the whitened-space covariance is no longer ~ I, so the sigma =
+    # sqrt(rho) calibration below is only nominal.
+    _preproc = str(cfg.get('dsm_preproc', 'zca'))
+    if _preproc == 'mad':
+        W = global_mad_whitening(train_raw)
+    elif _preproc == 'wmw':
+        W = wmw_whitening(train_raw, cfg, seed=seed)
+    else:
+        W = _make_whitening(train_raw, cfg)
 
     # --- DSM noise level sigma -----------------------------------------------
-    # In whitened space cov ~ I, so sigma = sqrt(rho). rho (dsm_sigma_rho) is set
-    # manually; its sensitivity is reported as the rho-sweep ablation (vs-rho).
-    sigma = float(np.sqrt(cfg['dsm_sigma_rho']))
+    # In whitened space cov ~ I, so sigma = sqrt(rho). A numeric dsm_sigma_rho is
+    # the manual paper default (its sensitivity is the vs-rho sweep); the string
+    # 'dn16' picks the (D/n)^(1/6) score-MSE-optimal scale automatically.
+    _Zw = _Zval = None
+    if isinstance(cfg['dsm_sigma_rho'], str):     # only needed by data-driven rules
+        _Zw = W(torch.tensor(np.asarray(train_raw, np.float32))).detach().cpu().numpy()
+        if val_raw is not None and len(val_raw) >= 8:
+            _Zval = W(torch.tensor(np.asarray(val_raw, np.float32))).detach().cpu().numpy()
+    sigma = _resolve_dsm_sigma(cfg['dsm_sigma_rho'], D=D, n=len(train_raw),
+                               label=label, Zw=_Zw,
+                               cfg={**cfg, '_sigma_seed': seed},
+                               train_raw=train_raw, s_raw=s_raw, Zval=_Zval)
     model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
                            weight_decay=cfg['weight_decay'])
@@ -210,12 +314,21 @@ def train_dsm_local(train_raw: np.ndarray, cfg: dict,
 
 
 def train_lrao_local(train_raw: np.ndarray, cfg: dict,
-                     seed: int, label: str) -> Tuple[ScoreNet, List[float]]:
-    """LRao Mode-2 on RAW bands with a frozen ZCA whitening first layer.
+                     seed: int, label: str,
+                     s_raw: np.ndarray = None,
+                     det_label: str = 'LRao') -> Tuple[ScoreNet, List[float]]:
+    """LRao Mode-2 on RAW bands with a frozen normalization first layer.
 
     The tr(J*) objective is invariant to the whitening reparametrization, so the
     net learns the data-space score with whitened-space conditioning.
     NaN-guarded: if the in-graph SVD blows up, abort and return what we have.
+
+    Ablation axes (defaults reproduce the published LRao; see LRAO_ABLATIONS):
+      lrao_net      'mlp' (our ScoreNet) | 'cnn' (the paper's 1-D CNN Trafo)
+      lrao_preproc  'whiten' (our ZCA / robust-IQR) | 'mad' (paper global MAD)
+      lrao_signal_aware  False (agnostic tr(J*)) | True (perturb along s_raw)
+    Covariance is always GENERAL (full SVD pseudo-inverse) — the non-stationary
+    HSI analogue of the paper's stationary DFT/PSD inverse.
     """
     torch.manual_seed(seed)
     device = torch.device(cfg.get('device', 'cpu'))
@@ -225,16 +338,65 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     # Falls back to the shared whiten_eig_floor if not set.
     lrao_cfg = cfg if 'lrao_whiten_eig_floor' not in cfg else {
         **cfg, 'whiten_eig_floor': cfg['lrao_whiten_eig_floor']}
-    if str(cfg.get('lrao_input_norm', 'zca')) == 'robust':
-        # the FIXED LRao: per-band robust normalization (median / IQR) instead
-        # of ZCA -- the published camera-ready IID configuration
-        from repro.core.normalization import robust_whitening_iqr
-        W = robust_whitening_iqr(train_raw)
+
+    net_kind     = str(cfg.get('lrao_net', 'mlp'))
+    signal_aware = bool(cfg.get('lrao_signal_aware', False))
+    # preprocessing front-end (a Whitening-compatible module either way)
+    if str(cfg.get('lrao_preproc', 'whiten')) == 'mad':
+        W = global_mad_whitening(train_raw)          # LRao paper's global MAD
+    elif str(cfg.get('lrao_preproc', 'whiten')) == 'dart':
+        # DART-matched: build the SAME front-end the DART pipeline uses
+        # (cfg['whiten_mode'] incl. normalize / vicreg). Lets a "default" LRao
+        # share the DART ablation's preprocessing for an apples-to-apples compare.
+        W = make_frontend(train_raw, lrao_cfg, seed=seed)
+    elif str(cfg.get('lrao_input_norm', 'zca')) == 'robust':
+        W = robust_whitening_iqr(train_raw)          # our camera-ready robust-IQR
     else:
-        W = _make_whitening(train_raw, lrao_cfg)
-    model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'], whitening=W).to(device)
-    opt   = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
-                              weight_decay=cfg['weight_decay'])
+        W = _make_whitening(train_raw, lrao_cfg)     # our ZCA
+    W = W.to(device)
+
+    # score net
+    if net_kind == 'cnn':                            # the paper's 1-D CNN
+        from repro.models.lrao.paper_model import TrafoScore
+        model = TrafoScore(W, cfg, D).to(device)
+    else:                                            # our MLP score net (arch axis
+        # lets a DART-matched LRao reuse the DART ablation's dsm_arch, e.g. mixture)
+        model = ScoreNet(D, list(cfg['hidden_dims']), cfg['activation'],
+                         whitening=W, arch=str(cfg.get('lrao_arch', 'mlp')),
+                         n_experts=int(cfg.get('dsm_n_experts', cfg.get('gmm_K', 16)))
+                         ).to(device)
+
+    # signal-aware target direction (unit-norm; only the direction matters)
+    s_dir = None
+    if signal_aware:
+        if s_raw is None:
+            raise ValueError('lrao_signal_aware=True requires s_raw (the target '
+                             'signature) to be passed to train_lrao_local')
+        s_np = np.asarray(s_raw, np.float32)
+        s_dir = torch.tensor(s_np / (float(np.linalg.norm(s_np)) + 1e-12),
+                             device=device)
+
+    sig_reg = str(cfg.get('lfi_sigma_reg', 'none'))     # none | truncate | shrink
+    sig_cut = float(cfg.get('lfi_sigma_cutoff', 1e-3))  # relative floor for truncate
+
+    def _lfi(b, detach):
+        """Dispatch the LFI loss for the current ablation (both return the
+        NEGATIVE tr(J*)/J_s, so lower loss is better)."""
+        if signal_aware:
+            # signal-aware MUST let the gradient flow through Sigma: the single-
+            # direction J_s is scale-invariant, so detaching Sigma yields a
+            # useless (psi-inflating) gradient and training stalls after ep 1.
+            return lfi_loss_mode2_signal_aware(model, b, s_dir,
+                                               cfg['lfi_delta_theta'],
+                                               detach_sigma=False,
+                                               sigma_reg=sig_reg,
+                                               sigma_cutoff=sig_cut)
+        return lfi_loss_mode2(model, b, cfg['lfi_delta_theta'],
+                              detach_sigma=detach,
+                              sigma_reg=sig_reg, sigma_cutoff=sig_cut)
+
+    opt = torch.optim.Adam(model.parameters(), lr=cfg['lr'],
+                           weight_decay=cfg['weight_decay'])
     # LRao is slow → validation-based early stopping (paper-style). LRao-specific
     # knobs fall back to the shared ones:
     #   lrao_val_fraction   — held-out fraction for the val tr(J*) (0 = disabled)
@@ -244,6 +406,24 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     X_all    = torch.tensor(np.asarray(train_raw, dtype=np.float32)).to(device)
     val_frac = float(cfg.get('lrao_val_fraction', cfg.get('val_fraction', 0.0)))
     use_val  = val_frac > 0.0
+    # Signal-aware selection can NOT use J_s: it is a ~1e-7 scalar and, for the
+    # low-capacity paper CNN, maximising it actively HURTS detection (J_s and AUC
+    # anti-correlate; the MLP is the opposite). So validate on DETECTION: hold out
+    # a background split, plant the known signature on it, and select / early-stop
+    # on that HELD-OUT detection AUC (not in-sample).
+    det_val = bool(signal_aware) and (s_raw is not None)
+    if det_val:
+        use_val = False
+        tr_np = np.asarray(train_raw, np.float32)
+        vf = float(cfg.get('lrao_val_fraction', 0.1)) or 0.1
+        n_hold = int(np.clip(int(len(tr_np) * vf), 4, max(4, len(tr_np) - 4)))
+        p = np.random.default_rng(seed).permutation(len(tr_np))
+        _fit_np = tr_np[p[n_hold:]]                       # LFI train + scoring ref
+        _vp, _vlab, _ = plant_targets(
+            tr_np[p[:n_hold]], s_raw, float(cfg['amplitude']),
+            float(cfg['target_fraction']), model='additive', seed=seed)
+        _vp = _vp.astype(np.float32)
+        X_all = torch.tensor(_fit_np).to(device)          # train on the fit split
     if use_val:
         n_val   = max(1, int(len(X_all) * val_frac))
         n_train = len(X_all) - n_val
@@ -262,6 +442,8 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     bad_checks = 0
     total_eps  = cfg['lrao_epochs']
     val_every  = int(cfg.get('lrao_val_check_every', cfg.get('val_check_every', 100)))
+    # detection scoring is expensive (D finite-diff passes) — check less often
+    det_every  = int(cfg.get('lrao_det_val_every', 20)) if det_val else val_every
     patience   = int(cfg.get('lrao_patience', 0))
     # Minimum RELATIVE improvement to count as "better" for the patience counter.
     # Without this, tiny noise-level gains in val tr(J*) keep resetting the counter
@@ -269,7 +451,7 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
     min_delta  = float(cfg.get('lrao_min_delta', 0.005))
 
     clip = float(cfg.get('lrao_grad_clip', 1.0))
-    pbar = tqdm(range(1, total_eps + 1), desc=f'LRao {label}',
+    pbar = tqdm(range(1, total_eps + 1), desc=f'{det_label} {label}',
                 dynamic_ncols=True, leave=False)
     for ep in pbar:
         model.train()
@@ -277,8 +459,7 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
         for i in range(0, N, bs):
             b = X_tr[perm[i:i + bs]]
             try:
-                loss = lfi_loss_mode2(model, b, cfg['lfi_delta_theta'],
-                                      detach_sigma=cfg['lfi_detach_sigma'])
+                loss = _lfi(b, cfg['lfi_detach_sigma'])
             except Exception:
                 skipped += 1; continue
             if not torch.isfinite(loss):
@@ -299,13 +480,22 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
         ep_trJ = -tot / nb          # tr(J*), higher is better
         hist.append(ep_trJ)
 
-        if ep % val_every == 0 or ep == total_eps:
-            if use_val:
+        if ep % det_every == 0 or ep == total_eps:
+            if det_val:
+                model.eval()
+                try:
+                    sc = score_lrao(model, _fit_np, _vp, s_raw, cfg)
+                    check_score = _auc(_vlab, sc)     # held-out detection AUC
+                except Exception:
+                    check_score = float('-inf')
+                model.train()
+                pbar.set_postfix(valAUC=f"{check_score:.3f}", bad=bad_checks,
+                                 skip=skipped)
+            elif use_val:
                 model.eval()
                 try:
                     with torch.no_grad():
-                        val_loss = lfi_loss_mode2(model, X_val, cfg['lfi_delta_theta'],
-                                                 detach_sigma=True)
+                        val_loss = _lfi(X_val, True)
                     check_score = -val_loss.item()
                 except Exception:
                     check_score = float('-inf')
@@ -326,10 +516,11 @@ def train_lrao_local(train_raw: np.ndarray, cfg: dict,
             else:
                 bad_checks += 1
             # validation early stopping (LRao is expensive; stop once it plateaus)
-            if use_val and patience > 0 and bad_checks >= patience:
+            if (use_val or det_val) and patience > 0 and bad_checks >= patience:
+                _m = 'val AUC' if det_val else 'val tr(J*)'
                 print(f"      [early-stop] LRao {label} at epoch {ep}/{total_eps} "
-                      f"(no >{min_delta:.1%} val gain for {patience} checks; "
-                      f"best tr(J*)={best_score:.3f})", flush=True)
+                      f"(no >{min_delta:.1%} gain for {patience} checks; "
+                      f"best {_m}={best_score:.3f})", flush=True)
                 break
         else:
             pbar.set_postfix(trJ=f"{ep_trJ:.2f}", skip=skipped)
@@ -370,7 +561,9 @@ def score_dsm_add(model, train_lat, test_lat, s_lat):
 def score_lrao(model, train_lat, test_lat, s_lat, cfg):
     return compute_lfi_detector_scores_mode2(
         model, train_lat, test_lat, s_lat,
-        delta_theta=cfg['lfi_delta_theta'])
+        delta_theta=cfg['lfi_delta_theta'],
+        sigma_reg=str(cfg.get('lfi_sigma_reg', 'none')),
+        sigma_cutoff=float(cfg.get('lfi_sigma_cutoff', 1e-3)))
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +609,7 @@ DETECTOR_COLORS = {
     'L-DART':    '#ff7f0e',   # orange — linear DART
     'L-LRao':    '#2ca02c',   # green  — linear learned Rao
     'LRao':      '#e377c2',   # pink   — MLP learned Rao (headline)
+    'LRao-CNN':  '#9467bd',   # purple — paper 1-D CNN in the LRao slot
 }
 
 # Distinct marker per detector (so the curves are also separable in grayscale).
@@ -426,6 +620,7 @@ DETECTOR_MARKERS = {
     'L-DART':    's',
     'L-LRao':    'v',
     'LRao':      'P',
+    'LRao-CNN':  'X',
 }
 
 
@@ -471,7 +666,7 @@ def _plot_vs(xvals, series: dict, xlabel: str, ylabel: str, title: str,
         if ys is None or all(v != v for v in ys):     # all-NaN
             continue
         ys = np.asarray(ys, dtype=float)
-        lw = 2.2 if det in ('DART', 'L-DART', 'LRao', 'L-LRao') else 1.4
+        lw = 2.2 if det in ('DART', 'L-DART', 'LRao', 'L-LRao', 'LRao-CNN') else 1.4
         style = dict(marker=_det_marker(det), lw=lw)
         c = _det_color(det)
         ax.plot(x, ys, color=c, label=det, **style)
@@ -497,7 +692,7 @@ def _plot_roc(det_scores: dict, labels: np.ndarray, title: str, out_pdf: str):
     ax.plot([0, 1], [0, 1], 'k--', lw=0.7, label='_no_legend_')
     for det, sc in det_scores.items():
         fpr, tpr, auc_v = _roc(labels, sc)
-        lw  = 2.2 if det in ('DART', 'L-DART', 'LRao', 'L-LRao') else 1.4
+        lw  = 2.2 if det in ('DART', 'L-DART', 'LRao', 'L-LRao', 'LRao-CNN') else 1.4
         ax.plot(fpr, tpr, color=_det_color(det), lw=lw,
                 label=f'{det}  (AUC={auc_v:.3f})')
     ax.set_xlabel('False Alarm Rate')
@@ -590,28 +785,83 @@ def run_iid(cfg: dict, mode: str):
     seed = int(_s[0] if isinstance(_s, (list, tuple)) else _s)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    data, gt = load_hsi(cfg['dataset'])
-    H, W, D_RAW = data.shape
-    gt_flat = gt.flatten()
-    print(f"Image {H}x{W}x{D_RAW}  (RAW band space, no PCA)", flush=True)
-    for cls_id in sorted(np.unique(gt_flat).tolist()):
-        print(f"  class {int(cls_id):>2}: {int((gt_flat == cls_id).sum()):>6} px", flush=True)
 
-    bkg_raw, tgt_raw = build_pools(data, gt_flat, cfg, mode)
-    s_raw = tgt_raw.mean(axis=0).astype(np.float32)
-    if cfg.get('normalize_signature', False):
-        s_raw = (s_raw / (np.linalg.norm(s_raw) + 1e-12)).astype(np.float32)
-    print(f"bkg pool: {len(bkg_raw):>6} | tgt pool: {len(tgt_raw):>6} | "
-          f"||s_raw|| = {np.linalg.norm(s_raw):.4f}", flush=True)
+    # DATA SOURCE — two options:
+    #   cfg['scene'] set  -> a spatial SCENE (pavia4 / sandiego / sandiego2):
+    #       background TRAIN pool = scene['tr'], disjoint TEST pool = scene['te'],
+    #       target signature = scene['sig'] (region-annotated targets; the same
+    #       pools the spatial protocol uses). Lets the IID sweep run on San Diego,
+    #       which has no per-pixel class GT. n_train_list is clamped to the
+    #       scene's available training pixels.
+    #   else              -> the class-labelled build_pools (Pavia GT classes;
+    #       single = one bkg class, multi = union of the rest).
+    scene_name = cfg.get('scene')
+    if scene_name:
+        from repro import scenes as _scenes
+        sc = _scenes.build(scene_name, cfg)
+        train_all = np.asarray(sc['tr'], np.float32)
+        test_all  = np.asarray(sc['te'], np.float32)
+        s_raw     = np.asarray(sc['sig'], np.float32)
+        D_RAW     = train_all.shape[1]
+        if cfg.get('normalize_signature', False):
+            s_raw = (s_raw / (np.linalg.norm(s_raw) + 1e-12)).astype(np.float32)
+        avail = len(train_all)
+        n_list  = [n for n in n_list if n <= avail] or [avail]
+        n_fixed = min(n_fixed, avail)
+        max_n   = max(max(n_list), n_fixed)
+        train_pool_raw = train_all[rng.permutation(avail)][:max_n].astype(np.float32)
+        test_size      = min(int(cfg['test_size']), len(test_all))
+        test_bkg_raw   = test_all[rng.permutation(len(test_all))][:test_size].astype(np.float32)
+        print(f"[scene {scene_name}] {avail}x{D_RAW}  train pool {len(train_pool_raw)} "
+              f"| test {len(test_bkg_raw)} | ||s_raw||={np.linalg.norm(s_raw):.1f}",
+              flush=True)
+        print(f"  (n_list clamped to <= {avail}: {n_list}, n_fixed={n_fixed})", flush=True)
+        # A scene's THIRD box: disjoint from both train and test. Only this data
+        # mode has one -- here train and test really are different regions, so
+        # sigma rules can be widened by the train->val displacement
+        # (repro.core.sigma.transfer_gap). See val_pool_raw below.
+        val_pool_raw = (np.asarray(sc['val'], np.float32)
+                        if sc.get('val') is not None else None)
+    else:
+        data, gt = load_hsi(cfg['dataset'])
+        H, W, D_RAW = data.shape
+        gt_flat = gt.flatten()
+        print(f"Image {H}x{W}x{D_RAW}  (RAW band space, no PCA)", flush=True)
+        for cls_id in sorted(np.unique(gt_flat).tolist()):
+            print(f"  class {int(cls_id):>2}: {int((gt_flat == cls_id).sum()):>6} px", flush=True)
 
-    idx = np.arange(len(bkg_raw)); rng.shuffle(idx)
-    bkg_shuf  = bkg_raw[idx]
-    max_n     = max(max(n_list), n_fixed)
-    test_size = int(cfg['test_size'])
-    assert len(bkg_shuf) >= max_n + test_size, \
-        f"need {max_n + test_size} bkg pixels, have {len(bkg_shuf)}"
-    train_pool_raw = bkg_shuf[:max_n].astype(np.float32)
-    test_bkg_raw   = bkg_shuf[-test_size:].astype(np.float32)
+        bkg_raw, tgt_raw = build_pools(data, gt_flat, cfg, mode)
+        s_raw = tgt_raw.mean(axis=0).astype(np.float32)
+        if cfg.get('normalize_signature', False):
+            s_raw = (s_raw / (np.linalg.norm(s_raw) + 1e-12)).astype(np.float32)
+        print(f"bkg pool: {len(bkg_raw):>6} | tgt pool: {len(tgt_raw):>6} | "
+              f"||s_raw|| = {np.linalg.norm(s_raw):.4f}", flush=True)
+
+        idx = np.arange(len(bkg_raw)); rng.shuffle(idx)
+        bkg_shuf  = bkg_raw[idx]
+        max_n     = max(max(n_list), n_fixed)
+        test_size = int(cfg['test_size'])
+        assert len(bkg_shuf) >= max_n + test_size, \
+            f"need {max_n + test_size} bkg pixels, have {len(bkg_shuf)}"
+        train_pool_raw = bkg_shuf[:max_n].astype(np.float32)
+        test_bkg_raw   = bkg_shuf[-test_size:].astype(np.float32)
+        # VALIDATION pool: the pixels BETWEEN the train and test slices. They are
+        # held out from both, so they can be used for selection without touching
+        # test. This is what dsm_sigma_transfer measures delta on here.
+        #
+        # EXPECT delta ~ 0.02, i.e. essentially no correction, and that is the
+        # right answer rather than a failure: train and test are two slices of
+        # ONE shuffled class-labelled pool, so they are identically distributed
+        # and there is no region shift to cover. (For comparison, disjoint image
+        # boxes give delta 0.2-0.4.) The path is wired so the knob behaves the
+        # same in both protocols and reports what it measured; it is the DATA,
+        # not the plumbing, that makes it a no-op in this mode.
+        _mid = bkg_shuf[max_n:len(bkg_shuf) - test_size]
+        _nv = int(cfg.get('iid_val_size', 2000))
+        val_pool_raw = (_mid[:_nv].astype(np.float32) if len(_mid) >= 8 else None)
+        if val_pool_raw is not None:
+            print(f"val pool: {len(val_pool_raw):>6} px (held out from train AND "
+                  f"test; used for the sigma transfer term)", flush=True)
 
     # ----- plant ADDITIVE targets -----
     test_planted, labels, _ = plant_targets(
@@ -623,21 +873,34 @@ def run_iid(cfg: dict, mode: str):
 
     _cls = CLASSICAL_DETS_MULTI if mode == 'multi' else CLASSICAL_DETS_SINGLE
 
-    # Score-net variant names come from cfg['dsm_label'] / cfg['dsm2_label'].
-    # If hidden_dims_2 is set in config, a second DSM is also run.
-    _dsm1_label = cfg.get('dsm_label', 'DART')
-    _dsm_names = [_dsm1_label]
-    if cfg.get('hidden_dims_2') is not None:
-        _h2 = list(cfg['hidden_dims_2'])
-        _dsm2_label = cfg.get('dsm2_label', 'DART' if _h2 else 'L-DART')
-        _dsm_names.append(_dsm2_label)
-
-    # LRao: always the linear model; optionally also an MLP LRao that uses the
-    # SAME architecture as the DSM-MLP. The DSM-MLP arch is whichever of the two
-    # DSM configs has non-empty hidden dims (single-class: hidden_dims_2=[64];
-    # multiclass: hidden_dims=[128]). Override with lrao_mlp_hidden if needed.
+    # ----- DSM (DART) slots --------------------------------------------------
+    # Each slot is a score net trained by DSM: the primary (cfg['hidden_dims'],
+    # label cfg['dsm_label']) and, if hidden_dims_2 is set, a secondary
+    # (cfg['hidden_dims_2'], label cfg['dsm2_label']). The LINEAR slot (empty
+    # hidden dims) is the 'L-DART'. `run_l_dart: false` switches it OFF — the
+    # linear DART is not trained (run only the nonlinear DART).
     _h1 = list(cfg.get('hidden_dims', []) or [])
-    _h2 = list(cfg.get('hidden_dims_2', []) or [])
+    _dsm_specs = [dict(label=cfg.get('dsm_label', 'DART'),
+                       hidden=_h1, act=cfg['activation'])]
+    if cfg.get('hidden_dims_2') is not None:
+        _h2 = list(cfg.get('hidden_dims_2') or [])
+        _dsm_specs.append(dict(
+            label=cfg.get('dsm2_label', 'DART' if _h2 else 'L-DART'),
+            hidden=_h2, act=cfg.get('activation_2', cfg['activation'])))
+    else:
+        _h2 = []
+    _run_l_dart = bool(cfg.get('run_l_dart', True))
+    if not _run_l_dart:                          # drop the L-DART slot(s): either
+        # truly linear (empty hidden) OR labelled 'L-*' (e.g. a second net kept
+        # under the base's 'L-DART' label even when given non-empty hidden dims).
+        _dsm_specs = [s for s in _dsm_specs
+                      if len(s['hidden']) > 0
+                      and not str(s['label']).upper().startswith('L-')]
+    _dsm_names = [s['label'] for s in _dsm_specs]
+
+    # LRao: an always-on LINEAR slot; optionally also an MLP LRao that uses the
+    # SAME architecture as the DSM-MLP (whichever of the two DSM configs has
+    # non-empty hidden dims). Override the MLP arch with lrao_mlp_hidden.
     if cfg.get('lrao_mlp_hidden') is not None:
         _lrao_mlp_hidden = list(cfg['lrao_mlp_hidden'])
         _lrao_mlp_act    = cfg.get('lrao_mlp_activation', cfg['activation'])
@@ -648,11 +911,60 @@ def run_iid(cfg: dict, mode: str):
     else:
         _lrao_mlp_hidden, _lrao_mlp_act = [], cfg['activation']
 
-    # Naming: linear LRao -> 'L-LRao'; the MLP LRao is the headline 'LRao'.
-    _lrao_names = ['L-LRao']
+    # ----- LRao slots (a list of specs; each carries its own cfg overlay) ----
+    # An LRao ABLATION is active when any LRao axis departs from the published
+    # default (paper CNN, global-MAD preproc, or signal-aware). In that case we
+    # run BOTH detectors in the same experiment:
+    #   * 'LRao-<ablation>'  the ablated LRao (the lrao_* flags as configured);
+    #   * 'LRao'             a DEFAULT published LRao (MLP, signal-agnostic) that
+    #                        borrows the DART ablation's front-end (whiten_mode,
+    #                        via lrao_preproc='dart') AND its score architecture
+    #                        (hidden_dims / dsm_arch) — so LRao-vs-DART differs
+    #                        only in the training objective. run_default_lrao:
+    #                        false drops it; run_l_lrao: false also drops it.
+    # With NO LRao ablation the behaviour is the published one: the always-on
+    # linear slot (L-LRao, run_l_lrao) + an optional MLP headline LRao
+    # (run_lrao_mlp). Each spec = dict(label, tag, overlay); `overlay` is merged
+    # into cfg for that LRao's training + scoring.
+    _lrao_lin_label = str(cfg.get('lrao_linear_label')
+                          or ('LRao-CNN' if str(cfg.get('lrao_net', 'mlp')) == 'cnn'
+                              else 'L-LRao'))
+    _lrao_mlp_label = str(cfg.get('lrao_mlp_label', 'LRao'))
+    _run_l_lrao   = bool(cfg.get('run_l_lrao', True))
     _run_lrao_mlp = bool(cfg.get('run_lrao_mlp', False)) and len(_lrao_mlp_hidden) > 0
-    if _run_lrao_mlp:
-        _lrao_names.append('LRao')
+    _lrao_abl = (str(cfg.get('lrao_net', 'mlp')) == 'cnn'
+                 or str(cfg.get('lrao_preproc', 'whiten')) == 'mad'
+                 or bool(cfg.get('lrao_signal_aware', False)))
+
+    _lrao_specs: List[dict] = []
+    if _lrao_abl:
+        _abl_label = str(cfg.get('lrao_ablation_label')
+                         or ('LRao-CNN' if str(cfg.get('lrao_net', 'mlp')) == 'cnn'
+                             else 'LRao-abl'))
+        # the ablated LRao: use the lrao_* flags exactly as configured. Its arch
+        # (when not the CNN) is the DSM-MLP arch; the CNN ignores hidden_dims.
+        _lrao_specs.append(dict(label=_abl_label, tag='abl',
+                                overlay=dict(hidden_dims=list(_lrao_mlp_hidden))))
+        # the default published LRao alongside, DART-matched front-end + arch.
+        # (This 'LRao' is an MLP, not the linear L-LRao, so it is gated by
+        # run_default_lrao only — run_l_lrao controls just the linear slot.)
+        if bool(cfg.get('run_default_lrao', True)):
+            _lrao_specs.append(dict(
+                label=_lrao_mlp_label, tag='default',
+                overlay=dict(lrao_net='mlp', lrao_signal_aware=False,
+                             lrao_preproc='dart',
+                             lrao_arch=str(cfg.get('dsm_arch', 'mlp')),
+                             hidden_dims=list(cfg.get('hidden_dims', []) or []),
+                             activation=cfg['activation'])))
+    else:
+        if _run_l_lrao:
+            _lrao_specs.append(dict(label=_lrao_lin_label, tag='lin',
+                                    overlay=dict(hidden_dims=[])))
+        if _run_lrao_mlp:
+            _lrao_specs.append(dict(label=_lrao_mlp_label, tag='mlp',
+                                    overlay=dict(hidden_dims=list(_lrao_mlp_hidden),
+                                                 activation=_lrao_mlp_act)))
+    _lrao_names = [s['label'] for s in _lrao_specs]
 
     DETS = _cls + _dsm_names + _lrao_names
     loss_curves: Dict[str, list] = {}
@@ -670,47 +982,38 @@ def run_iid(cfg: dict, mode: str):
 
     def _train_dsm_variant(train_raw_n, cfg_rho, name, tag):
         """Train one DSM variant and return its additive scores."""
-        net, h = train_dsm_local(train_raw_n, cfg_rho, seed, f'{name}_{tag}')
+        net, h = train_dsm_local(train_raw_n, cfg_rho, seed, f'{name}_{tag}',
+                                 s_raw=s_raw, val_raw=val_pool_raw)
         loss_curves[f'{name}_{tag}'] = h
         torch.save({'state_dict': net.state_dict(), 'tag': tag},
                    os.path.join(mdl_dir, f'{name}_{tag}.pt'))
         return score_dsm_add(net, train_raw_n, test_planted, s_raw)
 
+    def _train_dsm_spec(train_raw_n, cfg_rho, spec, tag):
+        """Train one DSM slot with its own hidden dims / activation."""
+        cfg_s = {**cfg_rho, 'hidden_dims': list(spec['hidden']), 'activation': spec['act']}
+        return _train_dsm_variant(train_raw_n, cfg_s, spec['label'], tag)
+
+    def _train_one_lrao(train_raw_n, tag, spec):
+        """Train + score one LRao slot (its overlay merged into cfg)."""
+        cfg_l = {**cfg, **spec['overlay']}
+        label = spec['label']
+        net, h = train_lrao_local(train_raw_n, cfg_l, seed, f"{spec['tag']}_{tag}",
+                                  s_raw=s_raw, det_label=label)
+        loss_curves[f'{label}_{tag}'] = h
+        torch.save({'state_dict': net.state_dict(), 'tag': tag},
+                   os.path.join(mdl_dir, f"lrao_{spec['tag']}_{tag}.pt"))
+        return _safe(f'{label} {tag}',
+                     lambda: score_lrao(net, train_raw_n, test_planted, s_raw, cfg_l),
+                     len(labels))
+
     def _train_score_models(train_raw_n, cfg_rho, tag):
-        """Train all DSM variants + LRao on train_raw_n; return score dict."""
+        """Train all enabled DSM slots + LRao slots; return {label: scores}."""
         scores = {}
-        # --- primary score net (label from cfg['dsm_label']) ---
-        scores[_dsm_names[0]] = _train_dsm_variant(
-            train_raw_n, cfg_rho, _dsm_names[0], tag)
-        # --- secondary DSM (if configured) ---
-        if len(_dsm_names) > 1:
-            label2 = _dsm_names[1]
-            cfg2 = {**cfg_rho,
-                    'hidden_dims': list(cfg['hidden_dims_2']),
-                    'activation':  cfg.get('activation_2', cfg_rho['activation'])}
-            scores[label2] = _train_dsm_variant(train_raw_n, cfg2, label2, tag)
-        # --- L-LRao (linear LRao) ---
-        lrao_net, h_lrao = train_lrao_local(
-            train_raw_n, {**cfg, 'hidden_dims': []}, seed, tag)  # L-LRao is linear
-        loss_curves[f'L-LRao_{tag}'] = h_lrao
-        torch.save({'state_dict': lrao_net.state_dict(), 'tag': tag},
-                   os.path.join(mdl_dir, f'lrao_{tag}.pt'))
-        scores['L-LRao'] = _safe(f'L-LRao {tag}',
-                                lambda: score_lrao(lrao_net, train_raw_n, test_planted,
-                                                   s_raw, cfg),
-                                len(labels))
-        # --- LRao (MLP, same arch as the DSM MLP; headline LRao) ---
-        if _run_lrao_mlp:
-            cfg_lm = {**cfg, 'hidden_dims': list(_lrao_mlp_hidden),
-                      'activation': _lrao_mlp_act}
-            lm_net, h_lm = train_lrao_local(train_raw_n, cfg_lm, seed, f'mlp_{tag}')
-            loss_curves[f'LRao_{tag}'] = h_lm
-            torch.save({'state_dict': lm_net.state_dict(), 'tag': tag},
-                       os.path.join(mdl_dir, f'lrao_mlp_{tag}.pt'))
-            scores['LRao'] = _safe(
-                f'LRao {tag}',
-                lambda: score_lrao(lm_net, train_raw_n, test_planted, s_raw, cfg),
-                len(labels))
+        for spec in _dsm_specs:
+            scores[spec['label']] = _train_dsm_spec(train_raw_n, cfg_rho, spec, tag)
+        for spec in _lrao_specs:
+            scores[spec['label']] = _train_one_lrao(train_raw_n, tag, spec)
         return scores
 
     # ------------------------------------------------------------------ vs n
@@ -751,35 +1054,17 @@ def run_iid(cfg: dict, mode: str):
     tr_f = train_pool_raw[:n_fixed]
     reg_sigma_f = compute_sigma_from_data(tr_f, rho_fixed)
     cl_f = run_classical_additive(tr_f, test_planted, s_raw, reg_sigma_f, cfg, mode)
-    lrao_f, h_lrao_f = train_lrao_local(
-        tr_f, {**cfg, 'hidden_dims': []}, seed, f'rhofix_n{n_fixed}')  # L-LRao is linear
-    loss_curves[f'L-LRao_rhofix_n{n_fixed}'] = h_lrao_f
-    sc_lrao_f = _safe('L-LRao vsρ ref',
-                      lambda: score_lrao(lrao_f, tr_f, test_planted, s_raw, cfg),
-                      len(labels))
-    flat = {**cl_f, 'L-LRao': sc_lrao_f}           # ρ-independent reference scores
-    if _run_lrao_mlp:
-        cfg_lm = {**cfg, 'hidden_dims': list(_lrao_mlp_hidden),
-                  'activation': _lrao_mlp_act}
-        lm_f, h_lm_f = train_lrao_local(tr_f, cfg_lm, seed, f'mlp_rhofix_n{n_fixed}')
-        loss_curves[f'LRao_rhofix_n{n_fixed}'] = h_lm_f
-        flat['LRao'] = _safe(
-            'LRao vsρ ref',
-            lambda: score_lrao(lm_f, tr_f, test_planted, s_raw, cfg),
-            len(labels))
+    # LRao (+ classical) are ρ-independent → train each LRao slot once, draw flat.
+    flat = {**cl_f}                                # ρ-independent reference scores
+    for spec in _lrao_specs:
+        flat[spec['label']] = _train_one_lrao(tr_f, f'rhofix_n{n_fixed}', spec)
 
     for rho in rho_list:
         t0 = time.time()
         cfg_rho = {**cfg, 'dsm_sigma_rho': float(rho)}
         tag_rho = f'rho{rho}_n{n_fixed}'
-        dsm_scores_rho = {_dsm_names[0]: _train_dsm_variant(
-            tr_f, cfg_rho, _dsm_names[0], tag_rho)}
-        if len(_dsm_names) > 1:
-            label2 = _dsm_names[1]
-            cfg2 = {**cfg_rho,
-                    'hidden_dims': list(cfg['hidden_dims_2']),
-                    'activation':  cfg.get('activation_2', cfg['activation'])}
-            dsm_scores_rho[label2] = _train_dsm_variant(tr_f, cfg2, label2, tag_rho)
+        dsm_scores_rho = {spec['label']: _train_dsm_spec(tr_f, cfg_rho, spec, tag_rho)
+                          for spec in _dsm_specs}
         det_scores = {**flat, **dsm_scores_rho}
         for det, sc in det_scores.items():
             au, _, pd = _mtr(sc)

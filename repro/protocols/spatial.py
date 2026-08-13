@@ -25,8 +25,32 @@ from repro.core.metrics import (cfar_threshold, dr_at_fpr, partial_auc,
 from repro.core.metrics import auc_safe
 from repro.models.classical import AMF, AMFLocal, GMMLevin
 from repro.models.dart import DART
+from repro.models.dart.calibrated import CalibratedDART
 from repro.models.darts import DARTS
+from repro.models.darts.calibrated import CalibratedDARTS
 from repro.models.lrao import LRao
+from repro.models.lrao.configurable import ConfigurableLRao
+
+# Which implementation a config block selects. `dsm_variant` (default
+# 'published') picks between the paper's trainer and the calibrated recipe
+# (configurable front-end + data-driven sigma + validated training); 'multi' is
+# accepted as a legacy alias for 'calibrated'.
+DART_IMPL  = {'published': DART,  'calibrated': CalibratedDART,  'multi': CalibratedDART}
+DARTS_IMPL = {'published': DARTS, 'calibrated': CalibratedDARTS, 'multi': CalibratedDARTS}
+# LRao's alternative exposes the paper's four ablation axes (front-end, net,
+# signal-aware objective, covariance-inverse regulariser) — see
+# repro.models.lrao.configurable.
+LRAO_IMPL  = {'published': LRao, 'configurable': ConfigurableLRao}
+
+
+def _impl(registry, block_cfg, what):
+    """`variant:` (or `dsm_variant:`, kept for the dart/darts blocks) selects the
+    implementation for a config block."""
+    key = str(block_cfg.get('variant', block_cfg.get('dsm_variant', 'published')))
+    if key not in registry:
+        raise ValueError(f"{what}: unknown dsm_variant {key!r}; "
+                         f"choose one of {sorted(registry)}")
+    return registry[key]
 from repro.models.deep import REGISTRY as DEEP
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -56,10 +80,16 @@ def _fit_all(scene, cfg, seed, ckpt_dir, device):
     if w:
         dart_cfg['hidden'] = [int(w)]
         lrao_cfg['hidden'] = [int(w)]
+    # A DISJOINT validation region (scene['val']) is handed to the calibrated
+    # trainers so best-epoch selection sees the same train->test shift the task
+    # has. The published trainers ignore it (they select on train loss).
+    _val = scene.get('val') if bool(cfg.get('use_val_box', True)) else None
     models = {}
-    models['DART'] = DART(dart_cfg).fit(
+    _DC = _impl(DART_IMPL, dart_cfg, 'dart')
+    _d_kw = {} if _DC is DART or _val is None else {'val_raw': _val}
+    models['DART'] = _DC(dart_cfg).fit(
         scene['tr'], seed, device,
-        ckpt=os.path.join(ckpt_dir, f'dart_{name}_seed{seed}.pt'))
+        ckpt=os.path.join(ckpt_dir, f'dart_{name}_seed{seed}.pt'), **_d_kw)
     if '_tr_nbr' not in scene:
         _, scene['_tr_nbr'] = _windows(scene['tr'], scene['tr_shape'],
                                        int(cfg['k']), device)
@@ -73,12 +103,34 @@ def _fit_all(scene, cfg, seed, ckpt_dir, device):
     # San Diego/sweep pipeline re-seeded before DARTS (fresh-seed draw).
     # darts_inherit_stream lists the scenes using the single-stream order.
     inherit = name in (cfg.get('darts_inherit_stream') or ['pavia4'])
-    models['DARTS'] = DARTS(cfg['darts']).fit(
+    _TC = _impl(DARTS_IMPL, cfg['darts'], 'darts')
+    _t_kw = {}
+    if _TC is not DARTS and _val is not None and 'val_shape' in scene:
+        if '_val_nbr' not in scene:
+            _, scene['_val_nbr'] = _windows(_val, scene['val_shape'],
+                                            int(cfg['k']), device)
+        _t_kw = {'val_raw': _val, 'val_nbr': scene['_val_nbr']}
+    models['DARTS'] = _TC(cfg['darts']).fit(
         scene['tr'], scene['_tr_nbr'], seed, device, ckpt=darts_ck,
-        reseed=not inherit)
-    models['LRao'] = LRao(lrao_cfg).fit(
+        reseed=not inherit, **_t_kw)
+    _LR = _impl(LRAO_IMPL, lrao_cfg, 'lrao')
+    _lr_kw = {} if _LR is LRao else {'s_raw': scene['sig'], 'val_raw': _val}
+    models['LRao'] = _LR(lrao_cfg).fit(
         scene['tr'], seed, device,
-        run_dir=os.path.join(ckpt_dir, f'lrao_{name}_seed{seed}'))
+        run_dir=os.path.join(ckpt_dir, f'lrao_{name}_seed{seed}'), **_lr_kw)
+    # Optional SECOND LRao (cfg['lrao2']) so one run can compare two LRao
+    # variants -- e.g. signal-aware vs signal-agnostic -- on identical data,
+    # seeds and planting. It INHERITS the `lrao:` block and overrides it, gets
+    # its own checkpoint directory, and is scored under cfg['lrao2']['label']
+    # (default 'LRao-2'). Absent -> nothing changes.
+    if cfg.get('lrao2'):
+        l2 = {**lrao_cfg, **dict(cfg['lrao2'])}
+        lbl = str(l2.pop('label', 'LRao-2'))
+        _LR2 = _impl(LRAO_IMPL, l2, 'lrao2')
+        _lr2_kw = {} if _LR2 is LRao else {'s_raw': scene['sig'], 'val_raw': _val}
+        models[lbl] = _LR2(l2).fit(
+            scene['tr'], seed, device,
+            run_dir=os.path.join(ckpt_dir, f'lrao2_{name}_seed{seed}'), **_lr2_kw)
     for dname in cfg.get('deep_detectors', []):
         # deep baselines: load the bundled published checkpoints unless
         # retrain_deep is set (training them takes hours)
@@ -125,8 +177,9 @@ def score_all(scene, models, planted, cfg, device, is_train_box=False):
     out['AMF-local'] = amf_local.score(planted, scene[key + '_nbr_amf'],
                                        sig, device=device)
     out['GMM-Levin'] = GMMLevin(cfg).fit(tr).score(planted, sig)
-    tr_fit = tr[models['LRao'].fit_idx]            # LRao's own fit subset
-    out['LRao'] = models['LRao'].score(planted, tr_fit, sig)
+    for lname in [k for k in models if k == 'LRao' or k.startswith('LRao-')]:
+        tr_fit = tr[models[lname].fit_idx]         # each LRao's own fit subset
+        out[lname] = models[lname].score(planted, tr_fit, sig)
     for dname in cfg.get('deep_detectors', []):
         out[dname] = models[dname].score(planted.astype(np.float64), sig,
                                          device)
@@ -143,7 +196,12 @@ def _row(labels, sc, thr, alpha, te_gt=None):
     if te_gt is not None:
         pcf = per_class_fpr(sc, y, te_gt, thr)
         vals = list(pcf.values())
+        # `pfa_cls` keeps EVERY class present in the test box; the three named
+        # keys below are pavia4's and are kept only so old readers still work.
+        # They are wrong to read on other scenes -- pavia_foreign's second
+        # largest class is meadows, not trees, and it drives pfa_max.
         r.update(pfa_avg=float(np.nanmean(vals)), pfa_max=float(np.nanmax(vals)),
+                 pfa_cls={k: float(v) for k, v in pcf.items()},
                  unlab=float(pcf.get('unlabeled', 0.0)),
                  asph=float(pcf.get('asphalt', 0.0)),
                  trees=float(pcf.get('trees', 0.0)))
@@ -158,8 +216,11 @@ def run_scene(scene_name, cfg=None, out_root='results/spatial', device=None):
     sc_dir = os.path.join(out_dir, 'scores')
     os.makedirs(sc_dir, exist_ok=True)
     scene = scenes.build(scene_name, cfg)
+    # Per-class false-alarm breakdown needs the test box's GT labels. This used
+    # to be gated on scene_name == 'pavia4', so every other scene silently wrote
+    # rows WITHOUT the pfa_* columns. Any scene carrying a gt map can have them.
     te_gt = None
-    if scene_name == 'pavia4':
+    if scene.get('gt') is not None and 'test_box' in scene:
         r0, r1, c0, c1 = scene['test_box']
         te_gt = np.asarray(scene['gt'], int)[r0:r1, c0:c1].ravel()
     alpha = float(cfg['alpha'])
