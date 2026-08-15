@@ -15,8 +15,8 @@ import numpy as np
 from . import pavia_protocol as PP
 from . import sandiego_protocol as SDP
 
-PAVIA_TRAIN_BOX = [85, 193, 207, 306]
-PAVIA_TEST_BOX = [419, 508, 250, 334]
+PAVIA_TRAIN_BOX = [94, 182, 223, 304]
+PAVIA_TEST_BOX = [428, 500, 265, 334]
 
 
 def build(name, cfg=None):
@@ -35,7 +35,7 @@ def build(name, cfg=None):
                      te_shape=(test_box[1] - test_box[0], test_box[3] - test_box[2]),
                      sig=np.asarray(sig, np.float32), data=data, gt=gt,
                      test_box=test_box)
-        assert len(scene['tr']) == 4026 and abs(np.linalg.norm(sig) - 14357.9) < 1.0, \
+        assert len(scene['tr']) == 4026 and abs(np.linalg.norm(sig) - 14114.4) < 1.0, \
             'pavia4 fingerprint mismatch'
     else:
         sc = SDP.build(name)                    # asserts its own fingerprints

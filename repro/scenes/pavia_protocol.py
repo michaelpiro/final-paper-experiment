@@ -1,7 +1,7 @@
 """paper_protocol.py — the paper's Table-1 spatial protocol, self-contained for Colab.
 
-Scene: Pavia University, scenario 4 of the paper (train box [85,193,207,306],
-test box [419,508,250,334]); training pixels = contiguous centered side-crop of
+Scene: Pavia University, scenario 4 of the paper (train box [94,182,223,304],
+test box [428,500,265,334]; the reviewer-release boxes); training pixels = contiguous centered side-crop of
 the train box to ~4000 px (n_budget=4000, the PAPER value); prior signature =
 foreign class 7 (bitumen): global class mean scaled to the mean test-patch pixel
 norm; planting: additive theta in {0.075, 0.15, 0.225} into 10% of test pixels
@@ -17,8 +17,8 @@ import os, json, zipfile, urllib.request
 import numpy as np
 import scipy.io as sio
 
-TRAIN_BOX = [85, 193, 207, 306]
-TEST_BOX = [419, 508, 250, 334]
+TRAIN_BOX = [94, 182, 223, 304]
+TEST_BOX = [428, 500, 265, 334]
 FOREIGN_CLS = 7
 N_BUDGET = 4000
 THETAS_ADD = [0.075, 0.15, 0.225]
